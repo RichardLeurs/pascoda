@@ -1,0 +1,1847 @@
+mod about;
+mod assistant;
+mod bottom;
+mod chrome;
+mod debugger;
+mod designer;
+mod external;
+mod highlight;
+mod hints;
+mod icons;
+mod lsp;
+mod migrate;
+mod shell;
+mod style;
+mod terminal;
+mod terminal_view;
+mod theme;
+mod watch;
+
+use eframe::egui;
+use egui::text::{CCursor, CCursorRange};
+use pascoda_fpc::{BuildResult, Diagnostic, Severity};
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::mpsc::{Receiver, channel};
+
+const SOURCE_EXTENSIONS: &[&str] = &["pas", "pp", "lpr", "dpr", "inc"];
+const EDITOR_FONT_SIZE: f32 = 13.0;
+
+struct Doc {
+    path: PathBuf,
+    text: String,
+    saved: String,
+    editor_id: egui::Id,
+    /// 1-based lines with a breakpoint.
+    breakpoints: BTreeSet<u32>,
+}
+
+impl Doc {
+    fn dirty(&self) -> bool {
+        self.text != self.saved
+    }
+}
+
+struct App {
+    docs: Vec<Doc>,
+    active: usize,
+    next_editor_id: u32,
+    root: PathBuf,
+    diagnostics: Vec<Diagnostic>,
+    build_dir: PathBuf,
+    console: String,
+    building: Option<Receiver<(BuildResult, String)>>,
+    /// Progress messages of the build in flight, the latest one, and how many units each
+    /// program compiled last time (sizes the next bar).
+    build_progress_rx: Option<Receiver<pascoda_fpc::Progress>>,
+    build_progress: Option<pascoda_fpc::Progress>,
+    unit_counts: std::collections::HashMap<PathBuf, usize>,
+    build_source: PathBuf,
+    debug_after_build: bool,
+    session: Option<debugger::Handle>,
+    paused: Option<debugger::Paused>,
+    /// Variable paths (see `debugger::PATH_SEP`) shown open in the Variables pane.
+    var_open: std::collections::HashSet<String>,
+    /// Initial height of the debug area (the user can drag it).
+    debug_height: f32,
+    /// The tabbed pane under the editor: selected tab and the terminal.
+    bottom: bottom::BottomPane,
+    lsp: Option<lsp::Handle>,
+    /// The folder the language server was last started for (it follows the project folder).
+    lsp_root: Option<PathBuf>,
+    lsp_ready: bool,
+    menu: Option<NativeMenu>,
+    /// Waiting for the server: (file, text at request time, word start, cursor), in chars.
+    pending_completion: Option<(PathBuf, String, usize, usize)>,
+    completion: Option<Completion>,
+    /// The pending completion was started by typing, so an empty answer is not worth a message.
+    completion_auto: bool,
+    /// Counts typed characters; `typing` waits for a pause after the latest one.
+    typed: u64,
+    typing: hints::Dwell<u64>,
+    hover: hints::Hover,
+    /// Diagnostics of the last build placed in the open files; dropped when a file changes.
+    marks: Vec<hints::FileMarks>,
+    /// Open files' text as the last build started, to place `marks`.
+    build_texts: Vec<(PathBuf, String)>,
+    designers: Vec<designer::Designer>,
+    /// Show the form designer instead of the code for the active unit.
+    form_view: bool,
+    designer_ui: designer::ui::UiState,
+    native: Option<designer::native::Native>,
+    selftest: Option<SelfTest>,
+    show_navigator: bool,
+    /// The path bar (folder > file) above the editor; hidden by default to leave room for code.
+    show_jump_bar: bool,
+    nav_tab: shell::NavTab,
+    expanded: std::collections::HashSet<PathBuf>,
+    file_filter: String,
+    /// 1-based line and column of the caret in the code editor.
+    cursor_pos: (usize, usize),
+    /// Where a hover popup for the current target goes (screen position).
+    hover_pos: egui::Pos2,
+    assistant: assistant::Assistant,
+    /// An assistant build is running; its result goes back to the waiting agent.
+    assistant_build_reply: Option<std::sync::mpsc::Sender<String>>,
+    /// Run the program after a successful build (false for builds the assistant asked for).
+    run_after_build: bool,
+    /// Changes made to open files by other programs, and the watcher that notices them.
+    external: external::External,
+}
+
+/// `PASCODA_SELFTEST=<dir>`: open the form, exercise the designer, write snapshots, quit.
+struct SelfTest {
+    dir: PathBuf,
+    frame: u32,
+    /// `PASCODA_SELFTEST_SCROLL=1`: instead of the designer sequence, show a form larger than
+    /// the canvas at the default window size and snapshot it at the top and scrolled to the end.
+    scroll: bool,
+}
+
+struct Completion {
+    /// Text the request was made against; the popup closes when it changes.
+    text: String,
+    start: usize,
+    cursor: usize,
+    items: Vec<pascoda_lsp::CompletionItem>,
+    selected: usize,
+    /// Enter/Tab accept only an item the user picked (arrows or click), or any item when the
+    /// popup was asked for with Ctrl+Space. Auto popups leave Enter and Tab alone.
+    chosen: bool,
+}
+
+impl App {
+    /// The app without a window, menu bar or language server: all state, no side effects.
+    /// `new` builds on it; tests use it to draw the UI offscreen.
+    fn bare(path: Option<PathBuf>) -> Self {
+        let root = path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        // Absolute, so tree rows compare equal to the (absolute) paths of open files.
+        let root = root.canonicalize().unwrap_or(root);
+        let mut app = Self {
+            docs: Vec::new(),
+            active: 0,
+            next_editor_id: 0,
+            build_dir: root.clone(),
+            root,
+            diagnostics: Vec::new(),
+            console: String::new(),
+            building: None,
+            build_progress_rx: None,
+            build_progress: None,
+            unit_counts: Default::default(),
+            build_source: PathBuf::new(),
+            debug_after_build: false,
+            session: None,
+            paused: None,
+            var_open: Default::default(),
+            debug_height: 190.0,
+            bottom: Default::default(),
+            lsp: None,
+            lsp_root: None,
+            lsp_ready: false,
+            menu: None,
+            pending_completion: None,
+            completion: None,
+            completion_auto: false,
+            typed: 0,
+            typing: Default::default(),
+            hover: Default::default(),
+            marks: Vec::new(),
+            build_texts: Vec::new(),
+            designers: Vec::new(),
+            form_view: false,
+            designer_ui: designer::ui::UiState::default(),
+            native: None,
+            selftest: None,
+            show_navigator: true,
+            show_jump_bar: false,
+            nav_tab: shell::NavTab::default(),
+            expanded: Default::default(),
+            file_filter: String::new(),
+            cursor_pos: (1, 1),
+            hover_pos: egui::Pos2::ZERO,
+            assistant: Default::default(),
+            assistant_build_reply: None,
+            run_after_build: true,
+            external: Default::default(),
+        };
+        if let Some(p) = path {
+            app.open_path(p);
+        }
+        app
+    }
+
+    fn new(path: Option<PathBuf>, ctx: &egui::Context) -> Self {
+        let mut app = Self::bare(path);
+        app.menu = NativeMenu::install(ctx);
+        app.start_watching(ctx);
+        app.selftest = std::env::var_os("PASCODA_SELFTEST").map(|d| SelfTest {
+            dir: d.into(),
+            frame: 0,
+            scroll: std::env::var_os("PASCODA_SELFTEST_SCROLL").is_some(),
+        });
+        app
+    }
+
+    /// Opens `path` in a tab, or switches to it if it is already open.
+    fn open_path(&mut self, path: PathBuf) {
+        // Absolute, so it matches the paths the debugger reports.
+        let path = path.canonicalize().unwrap_or(path);
+        if let Some(i) = self.docs.iter().position(|d| d.path == path) {
+            self.active = i;
+            return;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            self.console = format!("could not read {}\n", path.display());
+            return;
+        };
+        self.next_editor_id += 1;
+        self.docs.push(Doc {
+            path,
+            saved: text.clone(),
+            text,
+            editor_id: egui::Id::unique(("pascoda-editor", self.next_editor_id)),
+            breakpoints: BTreeSet::new(),
+        });
+        self.active = self.docs.len() - 1;
+    }
+
+    fn pick_file(&mut self) {
+        if let Some(p) = rfd::FileDialog::new()
+            .add_filter("Pascal", SOURCE_EXTENSIONS)
+            .pick_file()
+        {
+            if let Some(dir) = p.parent() {
+                self.root = dir.to_path_buf();
+            }
+            self.open_path(p);
+        }
+    }
+
+    fn save_doc(&mut self, i: usize) {
+        let Some(d) = self.docs.get_mut(i) else {
+            return;
+        };
+        let wrote = std::fs::write(&d.path, &d.text).is_ok();
+        if wrote {
+            d.saved = d.text.clone();
+        }
+        let path = d.path.clone();
+        if let Some(form) = self.designers.iter_mut().find(|f| f.pas_path == path) {
+            let _ = form.save();
+        }
+        if wrote {
+            // An answer to "changed on disk" is settled by overwriting it.
+            self.forget_external(&path);
+        }
+    }
+
+    fn save_all(&mut self) {
+        for i in 0..self.docs.len() {
+            self.save_doc(i);
+        }
+    }
+
+    fn close_doc(&mut self, i: usize) {
+        self.save_doc_form(i);
+        self.docs.remove(i);
+        self.active = self.active.min(self.docs.len().saturating_sub(1));
+        if !self.active_is_unit_with_form() {
+            self.form_view = false;
+        }
+    }
+
+    /// Writes the form of the unit in tab `i` (closing a tab must not lose form edits).
+    fn save_doc_form(&mut self, i: usize) {
+        let Some(path) = self.docs.get(i).map(|d| d.path.clone()) else {
+            return;
+        };
+        if let Some(form) = self.designers.iter_mut().find(|f| f.pas_path == path) {
+            let _ = form.save();
+        }
+        self.designers.retain(|f| f.pas_path != path);
+    }
+
+    /// The active tab is half of a unit/form pair: the `.pas` or its `.lfm`.
+    fn has_form(&self) -> bool {
+        self.docs
+            .get(self.active)
+            .is_some_and(|d| designer::form_unit(&d.path).is_some())
+    }
+
+    /// The active tab is a unit that has a form, the only tab the designer can show.
+    fn active_is_unit_with_form(&self) -> bool {
+        self.docs
+            .get(self.active)
+            .is_some_and(|d| designer::sibling_lfm(&d.path).is_some())
+    }
+
+    /// The designer is what the window is showing right now.
+    fn form_showing(&self) -> bool {
+        self.form_view
+            && self
+                .docs
+                .get(self.active)
+                .is_some_and(|d| self.designers.iter().any(|f| f.pas_path == d.path))
+    }
+
+    /// While the `.lfm` is open as text, keep it in step with the designer: changes made in
+    /// the designer are written to disk and the text tab reloads them (unless the text itself
+    /// has unsaved edits).
+    fn sync_lfm_tab(&mut self) {
+        let Some(doc) = self.docs.get(self.active) else {
+            return;
+        };
+        let Some(unit) = designer::sibling_pas(&doc.path) else {
+            return;
+        };
+        let Some(form) = self.designers.iter_mut().find(|f| f.pas_path == unit) else {
+            return;
+        };
+        if !form.dirty() || form.save().is_err() {
+            return;
+        }
+        let path = doc.path.clone();
+        if let (false, Ok(text)) = (doc.dirty(), std::fs::read_to_string(&path))
+            && let Some(doc) = self.docs.get_mut(self.active)
+        {
+            doc.saved = text.clone();
+            doc.text = text;
+        }
+    }
+
+    /// Shows the form designer for the active unit, or for the unit that the active `.lfm`
+    /// belongs to. Coming from the `.lfm` text, that text is what the user means: it is saved
+    /// and the designer reloads from it.
+    fn show_form(&mut self) {
+        let Some(active) = self.docs.get(self.active).map(|d| d.path.clone()) else {
+            return;
+        };
+        let Some(unit) = designer::form_unit(&active) else {
+            return;
+        };
+        if unit != active {
+            self.save_doc(self.active);
+            self.designers.retain(|f| f.pas_path != unit);
+            self.open_path(unit.clone());
+        }
+        if !self.designers.iter().any(|f| f.pas_path == unit) {
+            match designer::Designer::open(&unit) {
+                Ok(f) => self.designers.push(f),
+                Err(e) => {
+                    self.console.push_str(&format!("form designer: {e}\n"));
+                    return;
+                }
+            }
+        }
+        self.form_view = true;
+    }
+
+    /// File > New GUI Application: a project folder with a program and one form.
+    fn new_gui_app(&mut self) {
+        let Some(parent) = rfd::FileDialog::new()
+            .set_title("Choose where to create the project")
+            .pick_folder()
+        else {
+            return;
+        };
+        let name = pascoda_project::free_project_name(&parent);
+        match pascoda_project::create_gui_app(&parent, &name) {
+            Ok(lpr) => {
+                let dir = lpr.parent().map(Path::to_path_buf).unwrap_or_default();
+                self.root = dir.clone();
+                self.open_path(lpr);
+                self.open_path(dir.join("unit1.pas"));
+                self.show_form();
+            }
+            Err(e) => self.console = format!("could not create the project: {e}\n"),
+        }
+    }
+
+    /// Saves everything, then compiles and runs the active file on a background thread
+    /// so the UI never blocks.
+    fn build_and_run(&mut self, ctx: &egui::Context, debug: bool) {
+        self.start_build(ctx, debug, true);
+    }
+
+    /// `run`: start the program after a successful build (not when debugging).
+    fn start_build(&mut self, ctx: &egui::Context, debug: bool, run_after: bool) {
+        let Some(path) = self.docs.get(self.active).map(|d| program_for(&d.path)) else {
+            return;
+        };
+        self.save_all();
+        self.build_texts = self
+            .docs
+            .iter()
+            .map(|d| (d.path.clone(), d.text.clone()))
+            .collect();
+        self.debug_after_build = debug;
+        self.run_after_build = run_after;
+        self.build_source = path.clone();
+        self.build_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        self.console = "Building...\n".into();
+        self.auto_tab(ctx, bottom::BottomTab::Output);
+        let (tx, rx) = channel();
+        let (ptx, prx) = channel();
+        let total = self.unit_counts.get(&path).copied();
+        self.build_progress = None;
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let gui = is_gui_program(&path);
+            let repaint = ctx.clone();
+            let mut on = move |p: pascoda_fpc::Progress| {
+                let _ = ptx.send(p);
+                repaint.request_repaint();
+            };
+            let mode = pascoda_fpc::Mode::default();
+            let built = if gui {
+                match pascoda_fpc::lcl::Lcl::find(&path) {
+                    Some(lcl) => {
+                        pascoda_fpc::lcl::build_gui_progress(&path, mode, &lcl, total, &mut on)
+                    }
+                    None => Err(std::io::Error::other(
+                        "vendor/lazarus not found (needed for GUI programs)",
+                    )),
+                }
+            } else {
+                pascoda_fpc::build_progress(&path, mode, total, &mut on)
+            };
+            let result = built.unwrap_or_else(|e| BuildResult {
+                success: false,
+                diagnostics: Vec::new(),
+                raw_output: format!("build failed: {e}"),
+            });
+            let run_output = if result.success && !debug && run_after {
+                if gui { launch_app(&path) } else { run(&path) }
+            } else {
+                String::new()
+            };
+            let _ = tx.send((result, run_output));
+            ctx.request_repaint();
+        });
+        self.building = Some(rx);
+        self.build_progress_rx = Some(prx);
+    }
+
+    fn poll_build(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.building else { return };
+        if let Some(prx) = &self.build_progress_rx {
+            while let Ok(p) = prx.try_recv() {
+                self.build_progress = Some(p);
+            }
+        }
+        if let Ok((result, run_output)) = rx.try_recv() {
+            if result.success
+                && let Some(p) = self.build_progress.as_ref().filter(|p| p.done > 0)
+            {
+                self.unit_counts.insert(self.build_source.clone(), p.done);
+            }
+            self.build_progress = None;
+            self.build_progress_rx = None;
+            self.console = result.raw_output.clone();
+            if result.success && !self.debug_after_build && self.run_after_build {
+                self.console.push_str("\n--- program output ---\n");
+                self.console.push_str(&run_output);
+            }
+            if !result.success {
+                self.auto_tab(ctx, bottom::BottomTab::Problems);
+            } else if self.run_after_build || self.debug_after_build {
+                self.auto_tab(ctx, bottom::BottomTab::Output);
+            }
+            if result.success && self.debug_after_build {
+                self.start_debug(ctx);
+            }
+            self.marks = self.place_marks(&result.diagnostics);
+            self.diagnostics = result.diagnostics.clone();
+            self.building = None;
+            self.assistant_build_done(&result);
+        }
+    }
+
+    /// Puts build diagnostics into the open files they belong to (fpc lines and columns are
+    /// 1-based).
+    fn place_marks(&self, diagnostics: &[Diagnostic]) -> Vec<hints::FileMarks> {
+        let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        self.build_texts
+            .iter()
+            .filter_map(|(path, text)| {
+                let items: Vec<_> = diagnostics
+                    .iter()
+                    .filter(|d| {
+                        matches!(
+                            d.severity,
+                            Severity::Fatal | Severity::Error | Severity::Warning
+                        ) && canon(&self.build_dir.join(&d.file)) == canon(path)
+                    })
+                    .map(|d| hints::Mark {
+                        line: d.line.saturating_sub(1),
+                        col: d.col.saturating_sub(1),
+                        severity: d.severity,
+                        message: d.message.clone(),
+                    })
+                    .collect();
+                (!items.is_empty()).then(|| hints::FileMarks {
+                    path: path.clone(),
+                    text: text.clone(),
+                    items,
+                })
+            })
+            .collect()
+    }
+
+    fn start_debug(&mut self, ctx: &egui::Context) {
+        let exe = self.build_source.with_extension("");
+        let cwd = self.build_dir.clone();
+        let breakpoints = self
+            .docs
+            .iter()
+            .filter(|d| !d.breakpoints.is_empty())
+            .map(|d| (d.path.clone(), d.breakpoints.iter().copied().collect()))
+            .collect();
+        self.console.push_str("\n--- debugging ---\n");
+        self.auto_tab(ctx, bottom::BottomTab::Output);
+        self.var_open.clear();
+        self.session = Some(debugger::spawn(exe, cwd, breakpoints, ctx.clone()));
+    }
+
+    fn send(&self, cmd: debugger::Cmd) {
+        if let Some(s) = &self.session {
+            let _ = s.cmds.send(cmd);
+        }
+    }
+
+    fn poll_debug(&mut self, ctx: &egui::Context) {
+        let Some(session) = &self.session else { return };
+        let events: Vec<_> = session.events.try_iter().collect();
+        for event in events {
+            match event {
+                debugger::Event::Output(text) => self.console.push_str(&text),
+                debugger::Event::Children(path, kids) => {
+                    if let Some(v) = self.paused.as_mut().and_then(|p| p.var_mut(&path)) {
+                        v.children = Some(kids);
+                    }
+                }
+                debugger::Event::Stopped(p) => {
+                    self.auto_tab(ctx, bottom::BottomTab::Debug);
+                    if let Some((file, line)) = p.location() {
+                        let file = file.to_path_buf();
+                        self.paused = Some(p);
+                        self.goto(ctx, &file, line, 1);
+                    } else {
+                        self.paused = Some(p);
+                    }
+                }
+                debugger::Event::Ended(reason) => {
+                    self.console.push_str(&format!("\n--- {reason} ---\n"));
+                    self.session = None;
+                    self.paused = None;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Shows `tab` in the bottom pane unless the user is using it (see `BottomPane::auto`).
+    fn auto_tab(&mut self, ctx: &egui::Context, tab: bottom::BottomTab) {
+        let now = ctx.input(|i| i.time);
+        self.bottom.auto(tab, now);
+    }
+
+    fn cursor_index(&self, ctx: &egui::Context) -> Option<usize> {
+        let doc = self.docs.get(self.active)?;
+        let state = egui::TextEdit::load_state(ctx, doc.editor_id)?;
+        state.cursor.char_range().map(|r| r.primary.index.0)
+    }
+
+    /// `auto` is completion started by typing: it stays silent when it cannot help.
+    fn request_completion(&mut self, ctx: &egui::Context, auto: bool) {
+        let Some(lsp) = self.lsp.as_ref().filter(|_| !auto || self.lsp_ready) else {
+            if !auto {
+                self.console
+                    .push_str("completion: language server is off\n");
+            }
+            return;
+        };
+        let (Some(doc), Some(cursor)) = (self.docs.get(self.active), self.cursor_index(ctx)) else {
+            if !auto {
+                self.console
+                    .push_str("completion: click inside the editor first\n");
+            }
+            return;
+        };
+        if auto && !hints::should_complete(&doc.text, cursor) {
+            return;
+        }
+        self.completion_auto = auto;
+        let (line, col) = line_col(&doc.text, cursor);
+        let start = word_start(&doc.text, cursor);
+        let _ = lsp.requests.send(lsp::Req::Complete {
+            path: doc.path.clone(),
+            text: doc.text.clone(),
+            line,
+            col,
+        });
+        self.pending_completion = Some((doc.path.clone(), doc.text.clone(), start, cursor));
+    }
+
+    fn request_hover(&mut self, path: PathBuf, text: String, line: u32, col: u32) {
+        let Some(lsp) = self.lsp.as_ref().filter(|_| self.lsp_ready) else {
+            return;
+        };
+        self.hover.requested = Some((line, col));
+        let _ = lsp.requests.send(lsp::Req::Hover {
+            path,
+            text,
+            line,
+            col,
+        });
+    }
+
+    fn request_definition(&mut self, ctx: &egui::Context) {
+        let (Some(lsp), Some(doc), Some(cursor)) = (
+            &self.lsp,
+            self.docs.get(self.active),
+            self.cursor_index(ctx),
+        ) else {
+            return;
+        };
+        let (line, col) = line_col(&doc.text, cursor);
+        let _ = lsp.requests.send(lsp::Req::Definition {
+            path: doc.path.clone(),
+            text: doc.text.clone(),
+            line,
+            col,
+        });
+    }
+
+    /// Starts the language server for the project folder, and again when the folder changes.
+    /// Not for `/` or the home folder (a Finder launch has no project; pasls would index it all).
+    fn follow_project_with_lsp(&mut self, ctx: &egui::Context) {
+        if self.lsp_root.as_deref() == Some(self.root.as_path()) || !lsp_worthy(&self.root) {
+            return;
+        }
+        self.lsp_root = Some(self.root.clone());
+        self.lsp_ready = false;
+        self.lsp = root_abs(&self.root).and_then(|r| lsp::spawn(&r, ctx.clone()));
+        if self.lsp.is_none() {
+            self.console
+                .push_str("language server off: vendor/pasls not found\n");
+        }
+    }
+
+    fn poll_lsp(&mut self, ctx: &egui::Context) {
+        self.follow_project_with_lsp(ctx);
+        let Some(lsp) = &self.lsp else { return };
+        let responses: Vec<_> = lsp.responses.try_iter().collect();
+        for resp in responses {
+            match resp {
+                lsp::Resp::Ready => self.lsp_ready = true,
+                lsp::Resp::Completion(items) => {
+                    let pending = self.pending_completion.take();
+                    let auto = self.completion_auto;
+                    // An answer for text that has since changed is stale.
+                    let current = pending.filter(|(path, text, ..)| {
+                        self.docs
+                            .get(self.active)
+                            .is_some_and(|d| d.path == *path && d.text == *text)
+                    });
+                    match current {
+                        Some((_, text, start, cursor)) if !items.is_empty() => {
+                            // Typing `foo` with only `foo` on offer needs no popup.
+                            let word: String =
+                                text.chars().skip(start).take(cursor - start).collect();
+                            if !(auto && items.iter().all(|i| i.label.eq_ignore_ascii_case(&word)))
+                            {
+                                self.completion = Some(Completion {
+                                    text,
+                                    start,
+                                    cursor,
+                                    items,
+                                    selected: 0,
+                                    chosen: !auto,
+                                });
+                            }
+                        }
+                        Some(_) if !auto => self
+                            .console
+                            .push_str("completion: nothing to suggest here\n"),
+                        _ => {}
+                    }
+                }
+                lsp::Resp::Definition(Some(loc)) => {
+                    self.goto(ctx, &loc.path, loc.line + 1, loc.col + 1);
+                }
+                lsp::Resp::Definition(None) => {}
+                lsp::Resp::Hover(line, col, text) => {
+                    let pos = self.hover_pos;
+                    self.hover.accept(line, col, text, pos);
+                }
+                lsp::Resp::Error(e) => {
+                    self.console.push_str(&format!("language server: {e}\n"));
+                    self.lsp = None;
+                    self.lsp_ready = false;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Replaces the word being typed with completion `index`.
+    fn accept_completion(&mut self, ctx: &egui::Context, index: usize) {
+        let Some(c) = self.completion.take() else {
+            return;
+        };
+        let (Some(item), Some(doc)) = (c.items.get(index), self.docs.get_mut(self.active)) else {
+            return;
+        };
+        let chars: Vec<char> = doc.text.chars().collect();
+        let (start, cursor) = (c.start.min(chars.len()), c.cursor.min(chars.len()));
+        let mut text: String = chars[..start].iter().collect();
+        text.push_str(&item.label);
+        text.extend(&chars[cursor..]);
+        doc.text = text;
+        let id = doc.editor_id;
+        let at = start + item.label.chars().count();
+        let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::one(CCursor::new(at))));
+        state.store(ctx, id);
+    }
+
+    fn handle_editor_keys(&mut self, ctx: &egui::Context, accept: &mut Option<usize>) {
+        use egui::{Key, Modifiers};
+        if self.bottom.tab == bottom::BottomTab::Terminal && self.bottom.terminal_focused {
+            // The terminal owns the keyboard (Ctrl+Space, arrows, Esc are the shell's).
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Space)) {
+            self.request_completion(ctx, false);
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F12)) {
+            self.request_definition(ctx);
+        }
+        let Some(c) = &mut self.completion else {
+            return;
+        };
+        let (down, up, enter, tab, esc) = ctx.input_mut(|i| {
+            // Enter and Tab belong to the editor until an item has been picked.
+            (
+                i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                i.consume_key(Modifiers::NONE, Key::ArrowUp),
+                c.chosen && i.consume_key(Modifiers::NONE, Key::Enter),
+                c.chosen && i.consume_key(Modifiers::NONE, Key::Tab),
+                i.consume_key(Modifiers::NONE, Key::Escape),
+            )
+        });
+        let last = c.items.len().saturating_sub(1);
+        if down {
+            // The first press picks the first item rather than skipping it.
+            c.selected = if c.chosen {
+                (c.selected + 1).min(last)
+            } else {
+                0
+            };
+            c.chosen = true;
+        }
+        if up {
+            c.selected = c.selected.saturating_sub(1);
+            c.chosen = true;
+        }
+        if enter || tab {
+            *accept = Some(c.selected);
+        }
+        if esc {
+            self.completion = None;
+            self.pending_completion = None;
+        }
+    }
+
+    /// Opens the unit and puts the cursor in the body of `handler`.
+    fn show_handler(&mut self, ctx: &egui::Context, path: &Path, handler: &str) {
+        let Some(doc) = self.docs.iter().find(|d| d.path == path) else {
+            return;
+        };
+        let lower = doc.text.to_ascii_lowercase();
+        // The implementation header is `procedure TForm1.Name(`; the declaration has no dot.
+        let Some(header) = lower.find(&format!(".{}(", handler.to_ascii_lowercase())) else {
+            return;
+        };
+        let Some(begin) = lower[header..].find("begin").map(|i| header + i) else {
+            return;
+        };
+        let line = doc.text[..begin].matches('\n').count() as u32 + 2; // the line after `begin`
+        self.goto(ctx, path, line, 1);
+    }
+
+    /// Drives the designer through a fixed sequence and writes what it saw to `PASCODA_SELFTEST`.
+    fn selftest_step(&mut self, ctx: &egui::Context) {
+        let Some(st) = &mut self.selftest else { return };
+        st.frame += 1;
+        let (frame, dir) = (st.frame, st.dir.clone());
+        ctx.request_repaint();
+        let out = |name: &str| dir.join(name);
+        if st.scroll {
+            self.selftest_scroll(ctx, frame, &dir);
+            return;
+        }
+        match frame {
+            1 => {
+                if self.has_form() {
+                    self.show_form();
+                } else {
+                    eprintln!("selftest: the opened file has no form");
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+            3 => {
+                if let Some(n) = &self.native {
+                    for (class, text) in [
+                        ("TButton", "OK"),
+                        ("TButton", "Hello world"),
+                        ("TButton", "A much longer caption here"),
+                        ("TLabel", "OK"),
+                        ("TLabel", "Some label text"),
+                        ("TLabel", "A much longer caption here"),
+                        ("TCheckBox", "OK"),
+                        ("TCheckBox", "Check me"),
+                        ("TCheckBox", "A much longer caption here"),
+                        ("TRadioButton", "OK"),
+                        ("TRadioButton", "Pick me"),
+                        ("TRadioButton", "A much longer caption here"),
+                        ("TEdit", "abc"),
+                    ] {
+                        let got = n.preferred_size(class, text);
+                        // Sizes the real LCL gives (autosize_truth test).
+                        let want = match (class, text) {
+                            ("TButton", "OK") => (41, 26),
+                            ("TButton", "Hello world") => (90, 26),
+                            ("TButton", _) => (189, 26),
+                            ("TLabel", "OK") => (18, 16),
+                            ("TLabel", "Some label text") => (93, 16),
+                            ("TLabel", _) => (167, 16),
+                            ("TCheckBox", "OK") | ("TRadioButton", "OK") => (44, 18),
+                            ("TCheckBox", "Check me") => (83, 18),
+                            ("TRadioButton", "Pick me") => (71, 18),
+                            ("TCheckBox", _) | ("TRadioButton", _) => (182, 18),
+                            _ => (0, 20), // TEdit: only the height is auto-sized
+                        };
+                        let ok = got.is_some_and(|(w, h)| {
+                            h == want.1 && (want.0 == 0 || (w - want.0).abs() <= 1)
+                        });
+                        eprintln!(
+                            "selftest: preferred {class} {text:?} = {got:?} (LCL {want:?}) {}",
+                            if ok { "ok" } else { "MISMATCH" }
+                        );
+                    }
+                }
+            }
+            8 => {
+                if let Some(n) = &self.native {
+                    let r = n.snapshot(&out("designer-1.png"));
+                    eprintln!(
+                        "selftest: {} native controls, snapshot 1: {r:?}",
+                        n.control_count()
+                    );
+                } else {
+                    eprintln!(
+                        "selftest: no native layer ({:?})",
+                        self.designer_ui.native_error
+                    );
+                }
+            }
+            9 => {
+                let Some(doc) = self.docs.get_mut(self.active) else {
+                    return;
+                };
+                let Some(form) = self.designers.iter_mut().find(|f| f.pas_path == doc.path) else {
+                    return;
+                };
+                let _ = form.add_component("TButton", &[], 16, 16);
+                let _ = form.ensure_handler("OnClick");
+                let _ = form.add_component("TEdit", &[], 16, 64);
+                let _ = form.add_component("TCheckBox", &[], 16, 104);
+                // A multi-selection: handles on Button1, outlines on Edit1 and CheckBox1.
+                form.select_paths(vec![vec![0], vec![4], vec![5]]);
+                form.sync_unit(&mut doc.text);
+                eprintln!("selftest: sync error: {:?}", form.sync_error);
+            }
+            10 => {
+                let Some(doc) = self.docs.get(self.active) else {
+                    return;
+                };
+                let Some(form) = self.designers.iter_mut().find(|f| f.pas_path == doc.path) else {
+                    return;
+                };
+                // Label1 is auto-sized by default: a longer text must widen it.
+                let _ = form.set_prop(
+                    &[1],
+                    "Caption",
+                    pascoda_forms::PropValue::Str("A longer label text".into()),
+                );
+            }
+            11 => {
+                if let Some(n) = &self.native {
+                    let r = n.snapshot(&out("designer-multi.png"));
+                    eprintln!("selftest: multi-selection overlay: {r:?}");
+                }
+            }
+            12 => {
+                let Some(doc) = self.docs.get(self.active) else {
+                    return;
+                };
+                let Some(form) = self.designers.iter_mut().find(|f| f.pas_path == doc.path) else {
+                    return;
+                };
+                let b = |f: &designer::Designer, p: &[usize]| {
+                    f.doc.component(p).map(designer::geometry::bounds)
+                };
+                eprintln!(
+                    "selftest: before resize: label {:?} edit {:?}",
+                    b(form, &[1]),
+                    b(form, &[3])
+                );
+                // Edit1 stretches with the form; the check box follows the bottom edge.
+                let _ = form.set_anchors(
+                    &[3],
+                    designer::geometry::Anchors {
+                        left: true,
+                        top: true,
+                        right: true,
+                        bottom: false,
+                    },
+                );
+                let _ = form.set_anchors(
+                    &[4],
+                    designer::geometry::Anchors {
+                        left: true,
+                        top: false,
+                        right: false,
+                        bottom: true,
+                    },
+                );
+                let _ = form.resize_container(&[], 520, 260);
+                eprintln!(
+                    "selftest: after resize 320x160 -> 520x260: edit {:?} checkbox {:?}",
+                    b(form, &[3]),
+                    b(form, &[4])
+                );
+            }
+            13 => {
+                let Some(doc) = self.docs.get(self.active) else {
+                    return;
+                };
+                let Some(form) = self.designers.iter_mut().find(|f| f.pas_path == doc.path) else {
+                    return;
+                };
+                // One of every palette class, for the look of the native previews.
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1500.0, 1000.0)));
+                let _ = form.resize_container(&[], 540, 400);
+                for (i, en) in designer::PALETTE.iter().enumerate() {
+                    let _ = form.add_component(
+                        en.class,
+                        &[],
+                        8 + (i as i64 % 6) * 88,
+                        100 + (i as i64 / 6) * 48,
+                    );
+                }
+            }
+            22 => {
+                if let Some(n) = &self.native {
+                    let r = n.snapshot(&out("designer-3.png"));
+                    eprintln!(
+                        "selftest: {} native controls, all classes: {r:?}",
+                        n.control_count()
+                    );
+                }
+            }
+            16 => {
+                if let Some(n) = &self.native {
+                    let r = n.snapshot(&out("designer-2.png"));
+                    eprintln!(
+                        "selftest: {} native controls, snapshot 2: {r:?}",
+                        n.control_count()
+                    );
+                }
+                if let Some(doc) = self.docs.get(self.active) {
+                    let _ = std::fs::write(out("unit1.pas.txt"), &doc.text);
+                    if let Some(f) = self.designers.iter().find(|f| f.pas_path == doc.path) {
+                        let _ = std::fs::write(out("unit1.lfm.txt"), f.doc.source());
+                    }
+                }
+            }
+            20 => {
+                // Where the toolchain comes from, and whether it can build a form from there.
+                let lpr = self.docs.get(self.active).and_then(|d| {
+                    std::fs::read_dir(d.path.parent()?)
+                        .ok()?
+                        .flatten()
+                        .map(|e| e.path())
+                        .find(|p| p.extension().is_some_and(|x| x == "lpr"))
+                });
+                let start = lpr.clone().unwrap_or_default();
+                let lcl = pascoda_fpc::lcl::Lcl::find(&start);
+                eprintln!(
+                    "selftest: LCL from {:?}",
+                    lcl.as_ref().map(|l| &l.lazarus_dir)
+                );
+                eprintln!(
+                    "selftest: pasls from {:?}",
+                    pascoda_lsp::Config::find(&start).map(|c| c.pasls)
+                );
+                if let (Some(lcl), Some(lpr)) = (lcl, lpr) {
+                    let r = pascoda_fpc::lcl::build_gui(&lpr, pascoda_fpc::Mode::default(), &lcl);
+                    eprintln!(
+                        "selftest: GUI build: {:?}",
+                        r.map(|b| (b.success, b.diagnostics.len()))
+                    );
+                }
+            }
+            5 => {
+                // The window buttons sit on the toolbar's centre line; a second call has
+                // nothing left to move (so the move is not oscillating).
+                let first = chrome::align_window_buttons(44.0);
+                let second = chrome::align_window_buttons(44.0);
+                eprintln!(
+                    "selftest: window buttons moved {first} pt, then {second} pt; close button centre {:?} pt from the top (toolbar centre 22)",
+                    chrome::close_button_center_from_top()
+                );
+            }
+            18 => eprintln!(
+                "selftest: About menu item found and chosen: {}",
+                about::open_via_menu()
+            ),
+            24 => eprintln!(
+                "selftest: about panel: {:?}",
+                about::snapshot_key_window(&out("about.png"))
+            ),
+            28 => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            _ => {}
+        }
+    }
+
+    /// The scrolling self-test (see `SelfTest::scroll`).
+    fn selftest_scroll(&mut self, ctx: &egui::Context, frame: u32, dir: &Path) {
+        let out = |name: &str| dir.join(name);
+        let report = |app: &Self, label: &str| {
+            let v = app.designer_ui.view;
+            eprintln!(
+                "selftest: {label}: view {:?} max scroll {:?} clip {:?}",
+                v,
+                v.map(|v| v.max_scroll()),
+                app.native.as_ref().map(|n| n.clip_frame())
+            );
+        };
+        let snap = |app: &Self, name: &str| {
+            if let Some(n) = &app.native {
+                eprintln!(
+                    "selftest: {name}: {} native controls, canvas {:?}, window {:?}",
+                    n.control_count(),
+                    n.snapshot(&out(&format!("{name}.png"))),
+                    n.snapshot_window(&out(&format!("{name}-window.png")))
+                );
+            } else {
+                eprintln!(
+                    "selftest: no native layer ({:?})",
+                    app.designer_ui.native_error
+                );
+            }
+        };
+        match frame {
+            1 => {
+                if self.has_form() {
+                    self.show_form();
+                } else {
+                    eprintln!("selftest: the opened file has no form");
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+            8 => {
+                report(self, "top");
+                snap(self, "scroll-top");
+            }
+            9 => {
+                // Select the bottom-most control and scroll to the end of both axes.
+                let Some(path) = self.docs.get(self.active).map(|d| d.path.clone()) else {
+                    return;
+                };
+                if let Some(form) = self.designers.iter_mut().find(|f| f.pas_path == path) {
+                    let root = form.doc.root();
+                    let bottom = (0..root.children.len())
+                        .filter_map(|i| {
+                            designer::geometry::absolute(root, &[i]).map(|b| (i, b.top + b.height))
+                        })
+                        .max_by_key(|(_, bottom)| *bottom)
+                        .map(|(i, _)| i);
+                    if let Some(i) = bottom {
+                        eprintln!("selftest: selecting {}", root.children[i].name);
+                        form.select(vec![i]);
+                    }
+                }
+                self.designer_ui.scroll.insert(path, egui::vec2(1e6, 1e6));
+            }
+            14 => {
+                report(self, "end");
+                snap(self, "scroll-end");
+            }
+            16 => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            _ => {}
+        }
+    }
+
+    /// The Variables pane opened or closed rows: tell the debugger which paths to keep fetching
+    /// and ask for the children it has not sent yet.
+    fn sync_var_open(&mut self, fetch: Vec<(String, i64)>) {
+        self.send(debugger::Cmd::Expanded(self.var_open.clone()));
+        for (path, reference) in fetch {
+            self.send(debugger::Cmd::Fetch(path, reference));
+        }
+    }
+
+    fn resume_with(&mut self, cmd: debugger::Cmd) {
+        self.paused = None;
+        self.send(cmd);
+    }
+
+    /// Opens the diagnostic's file and moves the cursor to its 1-based line/column.
+    fn goto(&mut self, ctx: &egui::Context, file: &Path, line: u32, col: u32) {
+        self.open_path(self.build_dir.join(file));
+        let Some(doc) = self.docs.get(self.active) else {
+            return;
+        };
+        let mut offset = 0;
+        for (i, l) in doc.text.split_inclusive('\n').enumerate() {
+            if i + 1 == line as usize {
+                offset += l.chars().take(col.saturating_sub(1) as usize).count();
+                break;
+            }
+            offset += l.chars().count();
+        }
+        let id = doc.editor_id;
+        let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::one(CCursor::new(offset))));
+        state.store(ctx, id);
+        ctx.memory_mut(|m| m.request_focus(id));
+    }
+}
+
+/// When `path` is a unit and its folder holds exactly one program file, that program is what
+/// Build & Run should compile.
+fn program_for(path: &Path) -> PathBuf {
+    let is_unit = path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("pas"));
+    let Some(dir) = path.parent().filter(|_| is_unit) else {
+        return path.to_path_buf();
+    };
+    let programs: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("lpr")))
+        .collect();
+    match programs.as_slice() {
+        [only] => only.clone(),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// A program that uses the LCL (`Interfaces` unit) needs the GUI build.
+fn is_gui_program(source: &Path) -> bool {
+    std::fs::read_to_string(source)
+        .map(|t| t.to_ascii_lowercase().contains("interfaces"))
+        .unwrap_or(false)
+}
+
+/// Wraps the built program in a `.app` and starts it; GUI apps run on their own, so this
+/// does not wait for them to quit.
+fn launch_app(source: &Path) -> String {
+    let dir = source.parent().unwrap_or(Path::new("."));
+    let stem = source
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    match pascoda_fpc::lcl::make_bundle(&dir.join(&stem), &stem) {
+        Ok(bundle) => match Command::new(bundle.join("Contents/MacOS").join(&stem)).spawn() {
+            Ok(_) => format!("started {}\n", bundle.display()),
+            Err(e) => format!("could not start {}: {e}\n", bundle.display()),
+        },
+        Err(e) => format!("could not create the app bundle: {e}\n"),
+    }
+}
+
+fn run(source: &Path) -> String {
+    let dir = source
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    // Absolute, because the child starts in `dir` and a relative path would resolve twice.
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let exe = dir.join(source.file_stem().unwrap_or_default());
+    match Command::new(&exe).current_dir(dir).output() {
+        Ok(o) => format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        ),
+        Err(e) => format!("could not run {}: {e}", exe.display()),
+    }
+}
+
+/// The macOS menu bar. Its key equivalents are handled by AppKit, so they never reach egui.
+struct NativeMenu {
+    _menu: muda::Menu,
+    new_gui: muda::MenuId,
+    toggle_view: muda::MenuId,
+    jump_bar: muda::CheckMenuItem,
+    assistant: muda::CheckMenuItem,
+    open: muda::MenuId,
+    save: muda::MenuId,
+    run: muda::MenuId,
+    debug: muda::MenuId,
+    edit: Vec<(muda::MenuItem, EditCmd)>,
+    appearance: Vec<(muda::CheckMenuItem, theme::Appearance)>,
+    events: Receiver<muda::MenuId>,
+}
+
+#[derive(Clone, Copy)]
+enum MenuAction {
+    NewGui,
+    ToggleView,
+    ToggleJumpBar,
+    ToggleAssistant,
+    Open,
+    Save,
+    Run,
+    Debug,
+    Appearance(theme::Appearance),
+    Edit(EditCmd),
+}
+
+/// Edit-menu commands. AppKit's own Cut/Copy/Paste items would send selectors winit's view does
+/// not implement, and their key equivalents would never reach egui, so these are plain items
+/// that `edit_events` turns back into the events egui's text fields and the designer expect.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum EditCmd {
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
+}
+
+impl EditCmd {
+    /// The input events a focused egui widget would have received for this command.
+    fn events(self, clipboard: impl FnOnce() -> String) -> Vec<egui::Event> {
+        let key = |key, shift| egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                command: true,
+                mac_cmd: true,
+                shift,
+                ..Default::default()
+            },
+        };
+        match self {
+            Self::Undo => vec![key(egui::Key::Z, false)],
+            Self::Redo => vec![key(egui::Key::Z, true)],
+            Self::SelectAll => vec![key(egui::Key::A, false)],
+            Self::Cut => vec![egui::Event::Cut],
+            Self::Copy => vec![egui::Event::Copy],
+            Self::Paste => vec![egui::Event::Paste(clipboard())],
+        }
+    }
+}
+
+/// The text on the system clipboard (empty when there is none).
+fn clipboard_text() -> String {
+    std::process::Command::new("pbpaste")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+impl NativeMenu {
+    fn install(ctx: &egui::Context) -> Option<Self> {
+        use muda::accelerator::{Accelerator, Code, Modifiers};
+        use muda::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
+        let cmd = |code| Some(Accelerator::new(Modifiers::META, code));
+        let new_gui = MenuItem::new("New GUI Application...", true, cmd(Code::KeyN));
+        let toggle_view = MenuItem::new(
+            "Switch Between Code and Form",
+            true,
+            Some(Accelerator::new(
+                Modifiers::META | Modifiers::SHIFT,
+                Code::KeyF,
+            )),
+        );
+        let jump_bar = CheckMenuItem::new("Show Path Bar", true, false, None);
+        let assistant = CheckMenuItem::new(
+            "Show Assistant",
+            true,
+            false,
+            Some(Accelerator::new(
+                Modifiers::META | Modifiers::ALT,
+                Code::KeyA,
+            )),
+        );
+        let open = MenuItem::new("Open...", true, cmd(Code::KeyO));
+        let save = MenuItem::new("Save", true, cmd(Code::KeyS));
+        let run = MenuItem::new("Build & Run", true, cmd(Code::KeyR));
+        let debug = MenuItem::new(
+            "Debug",
+            true,
+            Some(Accelerator::new(
+                Modifiers::META | Modifiers::SHIFT,
+                Code::KeyR,
+            )),
+        );
+        let edit: Vec<_> = [
+            ("Undo", EditCmd::Undo, Code::KeyZ, Modifiers::META),
+            (
+                "Redo",
+                EditCmd::Redo,
+                Code::KeyZ,
+                Modifiers::META | Modifiers::SHIFT,
+            ),
+            ("Cut", EditCmd::Cut, Code::KeyX, Modifiers::META),
+            ("Copy", EditCmd::Copy, Code::KeyC, Modifiers::META),
+            ("Paste", EditCmd::Paste, Code::KeyV, Modifiers::META),
+            (
+                "Select All",
+                EditCmd::SelectAll,
+                Code::KeyA,
+                Modifiers::META,
+            ),
+        ]
+        .into_iter()
+        .map(|(label, c, code, m)| {
+            (
+                MenuItem::new(label, true, Some(Accelerator::new(m, code))),
+                c,
+            )
+        })
+        .collect();
+        let edit_menu = Submenu::new("Edit", true);
+        for (i, (item, _)) in edit.iter().enumerate() {
+            if i == 2 || i == 5 {
+                edit_menu.append(&PredefinedMenuItem::separator()).ok()?;
+            }
+            edit_menu.append(item).ok()?;
+        }
+        let menu = Menu::new();
+        let app = Submenu::with_items(
+            "Pascoda",
+            true,
+            &[
+                &PredefinedMenuItem::about(Some("About Pascoda"), Some(about::metadata())),
+                &PredefinedMenuItem::separator(),
+                &PredefinedMenuItem::hide(None),
+                &PredefinedMenuItem::hide_others(None),
+                &PredefinedMenuItem::separator(),
+                &PredefinedMenuItem::quit(None),
+            ],
+        )
+        .ok()?;
+        let file = Submenu::with_items("File", true, &[&new_gui, &open, &save]).ok()?;
+        let build = Submenu::with_items("Build", true, &[&run, &debug]).ok()?;
+        let current = theme::Appearance::load();
+        let appearance: Vec<_> = theme::Appearance::ALL
+            .into_iter()
+            .map(|a| (CheckMenuItem::new(a.label(), true, a == current, None), a))
+            .collect();
+        let appearance_menu = Submenu::new("Appearance", true);
+        for (item, _) in &appearance {
+            appearance_menu.append(item).ok()?;
+        }
+        let view = Submenu::with_items(
+            "View",
+            true,
+            &[&toggle_view, &jump_bar, &assistant, &appearance_menu],
+        )
+        .ok()?;
+        menu.append_items(&[&app, &file, &edit_menu, &view, &build])
+            .ok()?;
+        menu.init_for_nsapp();
+
+        let (tx, events) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        muda::MenuEvent::set_event_handler(Some(move |e: muda::MenuEvent| {
+            let _ = tx.send(e.id);
+            ctx.request_repaint();
+        }));
+        Some(Self {
+            _menu: menu,
+            new_gui: new_gui.id().clone(),
+            toggle_view: toggle_view.id().clone(),
+            jump_bar,
+            assistant,
+            open: open.id().clone(),
+            save: save.id().clone(),
+            run: run.id().clone(),
+            debug: debug.id().clone(),
+            edit,
+            appearance,
+            events,
+        })
+    }
+
+    /// Ticks the chosen appearance, and only that one.
+    fn show_appearance(&self, chosen: theme::Appearance) {
+        for (item, a) in &self.appearance {
+            item.set_checked(*a == chosen);
+        }
+    }
+
+    fn poll(&self) -> Vec<MenuAction> {
+        self.events
+            .try_iter()
+            .filter_map(|id| {
+                [
+                    (&self.new_gui, MenuAction::NewGui),
+                    (&self.toggle_view, MenuAction::ToggleView),
+                    (&self.open, MenuAction::Open),
+                    (&self.save, MenuAction::Save),
+                    (&self.run, MenuAction::Run),
+                    (&self.debug, MenuAction::Debug),
+                ]
+                .into_iter()
+                .find(|(i, _)| **i == id)
+                .map(|(_, a)| a)
+                .or_else(|| (*self.jump_bar.id() == id).then_some(MenuAction::ToggleJumpBar))
+                .or_else(|| (*self.assistant.id() == id).then_some(MenuAction::ToggleAssistant))
+                .or_else(|| {
+                    self.edit
+                        .iter()
+                        .find(|(item, _)| *item.id() == id)
+                        .map(|(_, c)| MenuAction::Edit(*c))
+                })
+                .or_else(|| {
+                    self.appearance
+                        .iter()
+                        .find(|(item, _)| *item.id() == id)
+                        .map(|(_, a)| MenuAction::Appearance(*a))
+                })
+            })
+            .collect()
+    }
+}
+
+fn root_abs(root: &Path) -> Option<PathBuf> {
+    root.canonicalize().ok()
+}
+
+/// 0-based (line, column) of the char index `idx` in `text`.
+fn line_col(text: &str, idx: usize) -> (u32, u32) {
+    let before: Vec<char> = text.chars().take(idx).collect();
+    let line = before.iter().filter(|c| **c == '\n').count() as u32;
+    let col = before.iter().rev().take_while(|c| **c != '\n').count() as u32;
+    (line, col)
+}
+
+/// Char index where the identifier ending at `idx` begins.
+fn word_start(text: &str, idx: usize) -> usize {
+    let chars: Vec<char> = text.chars().take(idx).collect();
+    let word = chars
+        .iter()
+        .rev()
+        .take_while(|c| c.is_alphanumeric() || **c == '_')
+        .count();
+    chars.len() - word
+}
+
+/// Draws the completion list at `pos`; returns the item the user clicked.
+fn completion_popup(ctx: &egui::Context, pos: egui::Pos2, c: &Completion) -> Option<usize> {
+    let mut clicked = None;
+    egui::Area::new(egui::Id::unique("completion"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(pos)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_max_height(220.0);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for (i, item) in c.items.iter().enumerate() {
+                        let text = if item.detail.is_empty() {
+                            item.label.clone()
+                        } else {
+                            format!("{}  {}", item.label, item.detail)
+                        };
+                        let r = ui.selectable_label(
+                            i == c.selected,
+                            egui::RichText::new(text).monospace(),
+                        );
+                        if i == c.selected {
+                            r.scroll_to_me(None);
+                        }
+                        if r.clicked() {
+                            clicked = Some(i);
+                        }
+                    }
+                });
+            });
+        });
+    clicked
+}
+
+fn editor_font() -> egui::FontId {
+    egui::FontId::monospace(EDITOR_FONT_SIZE)
+}
+
+impl eframe::App for App {
+    fn on_exit(&mut self) {
+        // Hang up the shell (and its jobs) instead of leaving them behind.
+        self.bottom.terminal = None;
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.draw(ui, Some(frame));
+    }
+}
+
+/// The self-test edits the form it opens, so it works on a copy of the project folder under the
+/// output folder instead of the user's files.
+fn selftest_copy(path: PathBuf, out: &Path) -> PathBuf {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return path;
+    };
+    let copy = out.join("project");
+    let _ = std::fs::remove_dir_all(&copy);
+    let copied = std::fs::create_dir_all(&copy).is_ok()
+        && std::fs::read_dir(dir).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().is_file())
+                .all(|e| std::fs::copy(e.path(), copy.join(e.file_name())).is_ok())
+        });
+    if copied { copy.join(name) } else { path }
+}
+
+/// A project folder worth indexing: not the file system root and not the home folder.
+fn lsp_worthy(root: &Path) -> bool {
+    root.parent().is_some() && std::env::var_os("HOME").is_none_or(|h| Path::new(&h) != root)
+}
+
+/// Apps started from Finder get a minimal `PATH`; Free Pascal normally lives in Homebrew's.
+fn extend_path() {
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(&current).collect();
+    for extra in ["/opt/homebrew/bin", "/usr/local/bin"] {
+        if !dirs.iter().any(|d| d == Path::new(extra)) {
+            dirs.push(extra.into());
+        }
+    }
+    if let Ok(joined) = std::env::join_paths(dirs) {
+        // SAFETY: called first thing in `main`, before any thread is started.
+        unsafe { std::env::set_var("PATH", joined) };
+    }
+}
+
+fn main() -> eframe::Result {
+    migrate::run();
+    extend_path();
+    let mut path = std::env::args().nth(1).map(PathBuf::from);
+    if let Some(out) = std::env::var_os("PASCODA_SELFTEST") {
+        path = path.map(|p| selftest_copy(p, Path::new(&out)));
+    }
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1200.0, 800.0])
+            .with_fullsize_content_view(true)
+            .with_titlebar_shown(false)
+            .with_title_shown(false),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "Pascoda",
+        options,
+        Box::new(|cc| {
+            theme::apply(&cc.egui_ctx);
+            theme::Appearance::restore(&cc.egui_ctx);
+            Ok(Box::new(App::new(path, &cc.egui_ctx)))
+        }),
+    )
+}
+
+/// fpc writes scratch files (`link.res`, `ppas.sh`) into its working directory, so tests that
+/// compile in the shared fixtures folder must not overlap.
+#[cfg(test)]
+static FPC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+mod render_tests;
+
+/// `<target dir>/tmp`, where tests put scratch projects and renders. Found from the test
+/// executable (`<target>/debug/deps/x`) because cargo's target dir is configurable.
+#[cfg(test)]
+pub(crate) fn target_tmp() -> PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    let target = exe.ancestors().nth(3).unwrap();
+    let dir = target.join("tmp");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn edit_commands_become_the_events_egui_expects() {
+        use super::EditCmd::*;
+        let ev = |c: super::EditCmd| c.events(|| "clip".into());
+        assert!(matches!(ev(Copy)[..], [egui::Event::Copy]));
+        assert!(matches!(ev(Cut)[..], [egui::Event::Cut]));
+        assert!(matches!(&ev(Paste)[..], [egui::Event::Paste(t)] if t == "clip"));
+        assert!(matches!(
+            &ev(Redo)[..],
+            [egui::Event::Key { key: egui::Key::Z, modifiers, .. }] if modifiers.shift && modifiers.command
+        ));
+        assert!(matches!(
+            &ev(SelectAll)[..],
+            [egui::Event::Key {
+                key: egui::Key::A,
+                ..
+            }]
+        ));
+    }
+
+    use super::*;
+
+    /// A copy of the GUI fixture that a test may write to.
+    fn scratch_project(name: &str) -> PathBuf {
+        let dir = target_tmp().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["hello.lpr", "unit1.pas", "unit1.lfm"] {
+            std::fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/fixtures/gui")
+                    .join(f),
+                dir.join(f),
+            )
+            .unwrap();
+        }
+        dir.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn the_lfm_tab_offers_the_form_and_opens_it() {
+        let dir = scratch_project("lfm-tab");
+        let mut app = App::bare(Some(dir.join("unit1.lfm")));
+        assert!(app.has_form(), "the .lfm of a unit is half of a form pair");
+        assert!(!app.active_is_unit_with_form() && !app.form_showing());
+
+        app.show_form(); // what clicking "Form" does
+        assert!(app.form_showing(), "the designer is showing");
+        assert_eq!(
+            app.docs[app.active].path,
+            dir.join("unit1.pas"),
+            "it switched to the unit's tab"
+        );
+        assert_eq!(app.designers.len(), 1);
+
+        // Going back to the .lfm text shows code, not the designer.
+        let lfm = app
+            .docs
+            .iter()
+            .position(|d| d.path == dir.join("unit1.lfm"))
+            .unwrap();
+        app.active = lfm;
+        assert!(!app.form_showing());
+    }
+
+    #[test]
+    fn text_edits_to_the_lfm_reach_the_designer_and_designer_edits_reach_the_text_tab() {
+        let dir = scratch_project("lfm-sync");
+        let mut app = App::bare(Some(dir.join("unit1.lfm")));
+        // The user retitles the form in the text, then asks for the form.
+        app.docs[app.active].text = app.docs[app.active]
+            .text
+            .replace("Caption = 'Form1'", "Caption = 'From text'");
+        app.show_form();
+        assert_eq!(
+            app.designers[0]
+                .doc
+                .root()
+                .prop("Caption")
+                .and_then(pascoda_forms::PropValue::as_str),
+            Some("From text")
+        );
+
+        // The designer changes something; the text tab must show it, not a stale copy.
+        app.designers[0]
+            .add_component("TButton", &[], 8, 8)
+            .unwrap();
+        let lfm = app
+            .docs
+            .iter()
+            .position(|d| d.path == dir.join("unit1.lfm"))
+            .unwrap();
+        app.active = lfm;
+        app.sync_lfm_tab();
+        assert!(
+            app.docs[lfm].text.contains("object Button2: TButton")
+                || app.docs[lfm].text.contains("object Button")
+        );
+        assert!(
+            !app.designers[0].dirty(),
+            "the designer's change was written to disk"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("unit1.lfm")).unwrap(),
+            app.docs[lfm].text
+        );
+    }
+
+    #[test]
+    fn tells_gui_programs_from_console_programs() {
+        assert!(is_gui_program(Path::new(
+            "../../tests/fixtures/gui/hello.lpr"
+        )));
+        assert!(!is_gui_program(Path::new("../../tests/fixtures/hello.pas")));
+    }
+
+    #[test]
+    fn maps_char_index_to_line_and_word() {
+        let text = "begin\n  total := tot";
+        assert_eq!(line_col(text, 0), (0, 0));
+        assert_eq!(line_col(text, 6), (1, 0));
+        assert_eq!(line_col(text, text.chars().count()), (1, 14));
+        assert_eq!(word_start(text, text.chars().count()), 17);
+        assert_eq!(word_start("a b", 1), 0);
+    }
+
+    fn popup(chosen: bool) -> Completion {
+        Completion {
+            text: String::new(),
+            start: 0,
+            cursor: 0,
+            items: vec![
+                pascoda_lsp::CompletionItem {
+                    label: "total".into(),
+                    detail: String::new(),
+                },
+                pascoda_lsp::CompletionItem {
+                    label: "tool".into(),
+                    detail: String::new(),
+                },
+            ],
+            selected: 0,
+            chosen,
+        }
+    }
+
+    /// Runs `handle_editor_keys` for one frame in which `key` is pressed.
+    fn press(app: &mut App, key: egui::Key) -> Option<usize> {
+        let ctx = egui::Context::default();
+        let mut accept = None;
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        ctx.run_pass(input, |ctx| app.handle_editor_keys(ctx, &mut accept))
+            .drop_without_applying_deltas();
+        accept
+    }
+
+    #[test]
+    fn an_auto_popup_leaves_enter_and_tab_alone_until_an_item_is_picked() {
+        let mut app = App::bare(None);
+        app.completion = Some(popup(false));
+        assert_eq!(press(&mut app, egui::Key::Enter), None);
+        assert_eq!(press(&mut app, egui::Key::Tab), None);
+        assert!(app.completion.is_some());
+        // The first Down picks the first item; Enter then takes it.
+        assert_eq!(press(&mut app, egui::Key::ArrowDown), None);
+        assert_eq!(app.completion.as_ref().unwrap().selected, 0);
+        assert_eq!(press(&mut app, egui::Key::Enter), Some(0));
+        assert_eq!(press(&mut app, egui::Key::ArrowDown), None);
+        assert_eq!(app.completion.as_ref().unwrap().selected, 1);
+        assert_eq!(press(&mut app, egui::Key::Tab), Some(1));
+        // Esc dismisses.
+        assert_eq!(press(&mut app, egui::Key::Escape), None);
+        assert!(app.completion.is_none());
+    }
+
+    #[test]
+    fn a_ctrl_space_popup_accepts_enter_straight_away() {
+        let mut app = App::bare(None);
+        app.completion = Some(popup(true));
+        assert_eq!(press(&mut app, egui::Key::Enter), Some(0));
+    }
+
+    #[test]
+    fn build_diagnostics_become_marks_in_the_matching_open_file() {
+        let dir = crate::target_tmp().join("marks");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("m.pas");
+        std::fs::write(&file, "program m;\nbegin\n  nope;\nend.\n").unwrap();
+        let mut app = App::bare(Some(file.clone()));
+        app.build_dir = dir.clone();
+        app.build_texts = vec![(app.docs[0].path.clone(), app.docs[0].text.clone())];
+        let d = |name: &str, severity| Diagnostic {
+            file: PathBuf::from(name),
+            line: 3,
+            col: 3,
+            severity,
+            message: "Identifier not found".into(),
+        };
+        let marks = app.place_marks(&[
+            d("m.pas", Severity::Error),
+            d("other.pas", Severity::Error),
+            d("m.pas", Severity::Note),
+        ]);
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].items.len(), 1);
+        let m = &marks[0].items[0];
+        assert_eq!((m.line, m.col), (2, 2));
+        assert_eq!(m.range(&marks[0].text), 19..23);
+    }
+
+    /// Regression: a relative source path used to resolve twice and fail to launch.
+    #[test]
+    fn runs_program_from_relative_path() {
+        let _fpc = crate::FPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let src = Path::new("../../tests/fixtures/hello.pas");
+        let built =
+            pascoda_fpc::build(src, pascoda_fpc::Mode::default()).expect("fpc should start");
+        assert!(built.success, "{}", built.raw_output);
+        assert!(run(src).contains("Hello from Pascora"));
+    }
+}

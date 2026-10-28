@@ -1,0 +1,149 @@
+object MainForm: TMainForm
+  Left = 300
+  Height = 508
+  Top = 160
+  Width = 640
+  Caption = 'Notes'
+  ClientHeight = 480
+  ClientWidth = 640
+  Menu = MainMenu1
+  OnCloseQuery = MainFormCloseQuery
+  OnShow = MainFormShow
+  Position = poScreenCenter
+  object ActionList1: TActionList
+    Left = 16
+    Top = 16
+    object ActionSelectAll: TAction
+      Caption = 'Select &All'
+      ShortCut = 4161
+      OnExecute = ActionSelectAllExecute
+    end
+    object ActionInsertTime: TAction
+      Caption = '&Insert Time'
+      ShortCut = 12372
+      OnExecute = ActionInsertTimeExecute
+    end
+  end
+  object MainMenu1: TMainMenu
+    Left = 56
+    Top = 16
+    object FileMenu: TMenuItem
+      Caption = '&File'
+      object FileNewItem: TMenuItem
+        Caption = '&New'
+        ShortCut = 4174
+        OnClick = FileNewItemClick
+      end
+      object FileOpenItem: TMenuItem
+        Caption = '&Open...'
+        ShortCut = 4175
+        OnClick = FileOpenItemClick
+      end
+      object FileSaveItem: TMenuItem
+        Caption = '&Save'
+        ShortCut = 4179
+        OnClick = FileSaveItemClick
+      end
+      object FileSaveAsItem: TMenuItem
+        Caption = 'Save &As...'
+        ShortCut = 12371
+        OnClick = FileSaveAsItemClick
+      end
+      object FileSep1: TMenuItem
+        Caption = '-'
+      end
+      object FileQuitItem: TMenuItem
+        Caption = '&Quit'
+        ShortCut = 4177
+        OnClick = FileQuitItemClick
+      end
+    end
+    object EditMenu: TMenuItem
+      Caption = '&Edit'
+      object EditSelectAllItem: TMenuItem
+        Action = ActionSelectAll
+      end
+      object EditInsertTimeItem: TMenuItem
+        Action = ActionInsertTime
+      end
+      object EditSep1: TMenuItem
+        Caption = '-'
+      end
+      object EditClearItem: TMenuItem
+        Caption = 'Cl&ear'
+        OnClick = EditClearItemClick
+      end
+    end
+    object ToolsMenu: TMenuItem
+      Caption = '&Tools'
+      object ToolsSettingsItem: TMenuItem
+        Caption = '&Settings...'
+        ShortCut = 4140
+        OnClick = ToolsSettingsItemClick
+      end
+    end
+    object HelpMenu: TMenuItem
+      Caption = '&Help'
+      object HelpAboutItem: TMenuItem
+        Caption = '&About Notes'
+        OnClick = HelpAboutItemClick
+      end
+    end
+  end
+  object MemoPopup: TPopupMenu
+    Left = 96
+    Top = 16
+    object PopupSelectAllItem: TMenuItem
+      Action = ActionSelectAll
+    end
+    object PopupClearItem: TMenuItem
+      Caption = 'Cl&ear'
+      OnClick = EditClearItemClick
+    end
+  end
+  object Memo1: TMemo
+    Left = 0
+    Height = 456
+    Top = 0
+    Width = 640
+    Align = alClient
+    OnChange = Memo1Change
+    PopupMenu = MemoPopup
+    ScrollBars = ssAutoVertical
+    TabOrder = 0
+  end
+  object StatusBar1: TStatusBar
+    Left = 0
+    Height = 24
+    Top = 456
+    Width = 640
+    Align = alBottom
+    Panels = <
+      item
+        Width = 320
+      end
+      item
+        Alignment = taRightJustify
+        Width = 120
+      end>
+  end
+  object Timer1: TTimer
+    Left = 216
+    Top = 16
+    Interval = 1000
+    OnTimer = Timer1Timer
+  end
+  object OpenDialog1: TOpenDialog
+    Left = 136
+    Top = 16
+    Filter = 'Text files (*.txt)|*.txt|All files (*.*)|*.*'
+    Title = 'Open Note'
+  end
+  object SaveDialog1: TSaveDialog
+    Left = 176
+    Top = 16
+    DefaultExt = 'txt'
+    Filter = 'Text files (*.txt)|*.txt|All files (*.*)|*.*'
+    Title = 'Save Note'
+  end
+end

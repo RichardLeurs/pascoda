@@ -1,0 +1,3 @@
+[workspace]
+resolver = "2"
+members = ["crates/pascoda-ai", "crates/pascoda-app", "crates/pascoda-dap", "crates/pascoda-forms", "crates/pascoda-fpc", "crates/pascoda-lsp", "crates/pascoda-project"]

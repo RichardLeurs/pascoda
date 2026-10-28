@@ -1,0 +1,60 @@
+object AboutForm: TAboutForm
+  Left = 300
+  Height = 258
+  Top = 200
+  Width = 340
+  BorderStyle = bsDialog
+  Caption = 'About Notes'
+  ClientHeight = 230
+  ClientWidth = 340
+  Position = poMainFormCenter
+  object IconPanel: TPanel
+    Left = 24
+    Height = 72
+    Top = 24
+    Width = 72
+    BevelOuter = bvNone
+    Caption = ''
+    Color = clSkyBlue
+    ParentColor = False
+    TabOrder = 0
+  end
+  object TitleLabel: TLabel
+    Left = 116
+    Height = 30
+    Top = 28
+    Width = 56
+    Caption = 'Notes'
+    Font.Height = -21
+    Font.Style = [fsBold]
+    ParentFont = False
+  end
+  object VersionLabel: TLabel
+    Left = 116
+    Height = 17
+    Top = 62
+    Width = 73
+    Caption = 'Version 1.0'
+  end
+  object DescriptionLabel: TLabel
+    Anchors = [akTop, akLeft, akRight]
+    AutoSize = False
+    Left = 24
+    Height = 48
+    Top = 116
+    Width = 292
+    Caption = 'A small plain-text notes editor written in Free Pascal with the Lazarus Component Library.'
+    WordWrap = True
+  end
+  object CloseButton: TButton
+    Anchors = [akRight, akBottom]
+    Left = 241
+    Height = 30
+    Top = 180
+    Width = 75
+    Caption = 'Close'
+    Default = True
+    ModalResult = 1
+    TabOrder = 1
+  end
+end

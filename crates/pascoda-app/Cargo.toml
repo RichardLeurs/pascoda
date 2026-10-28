@@ -1,0 +1,28 @@
+[package]
+name = "pascoda-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pascoda-dap = { version = "0.1.0", path = "../pascoda-dap" }
+pascoda-ai = { version = "0.1.0", path = "../pascoda-ai" }
+pascoda-fpc = { path = "../pascoda-fpc" }
+pascoda-lsp = { version = "0.1.0", path = "../pascoda-lsp" }
+pascoda-project = { path = "../pascoda-project" }
+eframe = "0.37.0"
+muda = "0.21.2"
+rfd = "0.17.2"
+serde_json = "1.0.154"
+pascoda-forms = { version = "0.1.0", path = "../pascoda-forms" }
+objc2 = "0.6.5"
+objc2-app-kit = "0.3.2"
+objc2-foundation = "0.3.2"
+raw-window-handle = "0.6.2"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+portable-pty = "0.9.0"
+vt100 = "0.18.1"
+libc = "0.2.191"
+notify = "8.2.1"
+
+[dev-dependencies]
+egui_kittest = { version = "0.37.0", features = ["wgpu", "snapshot"] }

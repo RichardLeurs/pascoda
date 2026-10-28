@@ -1,0 +1,10 @@
+[package]
+name = "pascoda-forms"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[dev-dependencies]
+pascoda-fpc = { path = "../pascoda-fpc" }
+pascoda-project = { path = "../pascoda-project" }
