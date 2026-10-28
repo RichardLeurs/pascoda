@@ -5,6 +5,7 @@ mod chrome;
 mod debugger;
 mod designer;
 mod export_dialog;
+mod files;
 mod external;
 mod highlight;
 mod hints;
@@ -123,6 +124,15 @@ struct App {
     run_after_build: bool,
     /// Changes made to open files by other programs, and the watcher that notices them.
     external: external::External,
+    /// Project tree: the selected file or folder, a name being typed for a new item, and an
+    /// item waiting for the user to confirm its deletion.
+    tree_sel: Option<PathBuf>,
+    tree_new: Option<shell::TreeNew>,
+    tree_delete: Option<PathBuf>,
+    tree_rename: Option<shell::TreeRename>,
+    /// The project's custom components, and the project (and file-tree revision) they were read for.
+    custom_units: std::sync::Arc<designer::ClassUnits>,
+    custom_scan: Option<(PathBuf, u64)>,
 }
 
 /// `PASCODA_SELFTEST=<dir>`: open the form, exercise the designer, write snapshots, quit.
@@ -213,6 +223,12 @@ impl App {
             assistant_build_reply: None,
             run_after_build: true,
             external: Default::default(),
+            tree_sel: None,
+            tree_new: None,
+            tree_delete: None,
+            tree_rename: None,
+            custom_units: Default::default(),
+            custom_scan: None,
         };
         if let Some(p) = path {
             app.open_path(p);
@@ -245,8 +261,19 @@ impl App {
             self.active = i;
             return;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(bytes) = std::fs::read(&path) else {
             self.console = format!("could not read {}\n", path.display());
+            return;
+        };
+        if pascoda_forms::lfm::is_binary(&bytes) {
+            self.console = format!(
+                "{} is a binary Delphi form, which Pascoda does not read (only text .dfm files)\n",
+                path.display()
+            );
+            return;
+        }
+        let Ok(text) = String::from_utf8(bytes) else {
+            self.console = format!("could not read {} as text\n", path.display());
             return;
         };
         self.next_editor_id += 1;
@@ -468,6 +495,9 @@ impl App {
         self.build_source = path.clone();
         self.build_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
         self.console = "Building...\n".into();
+        // A Lazarus or Delphi project in the program's folder adds its search paths and defines.
+        let (project_args, project_note) = project_args(path.parent());
+        self.console.push_str(&project_note);
         self.auto_tab(ctx, bottom::BottomTab::Output);
         let (tx, rx) = channel();
         let (ptx, prx) = channel();
@@ -484,14 +514,21 @@ impl App {
             let built = if gui {
                 match pascoda_fpc::lcl::Lcl::find(&path) {
                     Some(lcl) => {
-                        pascoda_fpc::lcl::build_gui_progress(&path, mode, &lcl, total, &mut on)
+                        pascoda_fpc::lcl::build_gui_progress_with(
+                            &path,
+                            mode,
+                            &lcl,
+                            &project_args,
+                            total,
+                            &mut on,
+                        )
                     }
                     None => Err(std::io::Error::other(
                         "vendor/lazarus not found (needed for GUI programs)",
                     )),
                 }
             } else {
-                pascoda_fpc::build_progress(&path, mode, total, &mut on)
+                pascoda_fpc::build_progress_with(&path, mode, &project_args, total, &mut on)
             };
             let result = built.unwrap_or_else(|e| BuildResult {
                 success: false,
@@ -499,7 +536,11 @@ impl App {
                 raw_output: format!("build failed: {e}"),
             });
             let run_output = if result.success && !debug && run_after {
-                if gui { launch_app(&path) } else { run(&path) }
+                if gui {
+                    launch_app(&path)
+                } else {
+                    run(&pascoda_project::foreign::executable_of(&path))
+                }
             } else {
                 String::new()
             };
@@ -834,7 +875,7 @@ impl App {
     fn sync_mode(&mut self) {
         if self.mode_root != self.root {
             self.mode_root = self.root.clone();
-            self.mode = pascoda_project::load_mode(&self.root);
+            self.mode = pascoda_project::mode_for(&self.root);
         }
     }
 
@@ -918,7 +959,7 @@ impl App {
     }
 
     fn start_debug(&mut self, ctx: &egui::Context) {
-        let exe = self.build_source.with_extension("");
+        let exe = pascoda_project::foreign::executable_of(&self.build_source);
         let cwd = self.build_dir.clone();
         let breakpoints = self
             .docs
@@ -1026,14 +1067,17 @@ impl App {
     }
 
     fn request_definition(&mut self, ctx: &egui::Context) {
-        let (Some(lsp), Some(doc), Some(cursor)) = (
-            &self.lsp,
-            self.docs.get(self.active),
-            self.cursor_index(ctx),
-        ) else {
+        if let Some(cursor) = self.cursor_index(ctx) {
+            self.request_definition_at(cursor);
+        }
+    }
+
+    /// Asks the server where the symbol at char `index` of the active tab is defined.
+    fn request_definition_at(&mut self, index: usize) {
+        let (Some(lsp), Some(doc)) = (&self.lsp, self.docs.get(self.active)) else {
             return;
         };
-        let (line, col) = line_col(&doc.text, cursor);
+        let (line, col) = line_col(&doc.text, index);
         let _ = lsp.requests.send(lsp::Req::Definition {
             path: doc.path.clone(),
             text: doc.text.clone(),
@@ -1575,13 +1619,38 @@ fn export_key(program: &Path) -> PathBuf {
     program.with_extension("export")
 }
 
+/// The compiler arguments of the Lazarus or Delphi project file in `folder`, and a console note
+/// when that file cannot be read.
+fn project_args(folder: Option<&Path>) -> (Vec<std::ffi::OsString>, String) {
+    let Some(file) = folder.and_then(pascoda_project::foreign::find) else {
+        return (Vec::new(), String::new());
+    };
+    match pascoda_project::foreign::read(&file) {
+        Ok(project) => (project.compiler_args(), String::new()),
+        Err(e) => (Vec::new(), format!("project file not used: {e}\n")),
+    }
+}
+
+/// The main program of the Lazarus or Delphi project file in `dir`, if it exists.
+fn project_main(dir: &Path) -> Option<PathBuf> {
+    let file = pascoda_project::foreign::find(dir)?;
+    pascoda_project::foreign::read(&file)
+        .ok()?
+        .main
+        .filter(|m| m.is_file())
+}
+
 fn program_for(path: &Path) -> PathBuf {
-    let is_unit = path
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("pas"));
-    let Some(dir) = path.parent().filter(|_| is_unit) else {
+    let Some(dir) = path
+        .parent()
+        .filter(|_| designer::is_unit_file(path))
+    else {
         return path.to_path_buf();
     };
+    // A Lazarus or Delphi project in the folder names its main program.
+    if let Some(main) = project_main(dir) {
+        return main;
+    }
     let programs: Vec<PathBuf> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -1605,9 +1674,10 @@ fn is_gui_program(source: &Path) -> bool {
 /// Wraps the built program in a `.app` and starts it; GUI apps run on their own, so this
 /// does not wait for them to quit.
 fn launch_app(source: &Path) -> String {
-    let dir = source.parent().unwrap_or(Path::new("."));
-    let stem = source
-        .file_stem()
+    let exe = pascoda_project::foreign::executable_of(source);
+    let dir = exe.parent().unwrap_or(Path::new("."));
+    let stem = exe
+        .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
@@ -1620,14 +1690,14 @@ fn launch_app(source: &Path) -> String {
     }
 }
 
-fn run(source: &Path) -> String {
-    let dir = source
+fn run(exe: &Path) -> String {
+    let dir = exe
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     // Absolute, because the child starts in `dir` and a relative path would resolve twice.
     let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    let exe = dir.join(source.file_stem().unwrap_or_default());
+    let exe = dir.join(exe.file_name().unwrap_or_default());
     match Command::new(&exe).current_dir(dir).output() {
         Ok(o) => format!(
             "{}{}",
@@ -2505,6 +2575,34 @@ mod tests {
         let built =
             pascoda_fpc::build(src, pascoda_fpc::Mode::default()).expect("fpc should start");
         assert!(built.success, "{}", built.raw_output);
-        assert!(run(src).contains("Hello from Pascora"));
+        // The app runs the executable the build writes, which is what `executable_of` names.
+        let exe = pascoda_project::foreign::executable_of(src);
+        assert!(run(&exe).contains("Hello from Pascora"));
+    }
+}
+
+#[cfg(test)]
+mod project_main_tests {
+    use super::*;
+
+    /// A unit in a folder with two programs: the project file decides which one builds.
+    #[test]
+    fn the_project_file_names_the_main_program() {
+        let dir = std::env::temp_dir().join(format!("pascoda-main-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("unit1.pas"), "unit unit1;\n").unwrap();
+        std::fs::write(dir.join("hello.lpr"), "program hello;\nbegin end.\n").unwrap();
+        std::fs::write(dir.join("other.lpr"), "program other;\nbegin end.\n").unwrap();
+        let unit = dir.join("unit1.pas");
+        assert_eq!(program_for(&unit), unit, "two programs and no project: nothing is chosen");
+
+        std::fs::write(
+            dir.join("app.lpi"),
+            "<CONFIG><ProjectOptions><Units><Unit0><Filename Value=\"other.lpr\"/></Unit0></Units></ProjectOptions></CONFIG>",
+        )
+        .unwrap();
+        assert_eq!(program_for(&unit), dir.join("other.lpr"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

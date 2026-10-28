@@ -1,6 +1,6 @@
 # Pascoda
 
-A modern Pascal IDE with coding agents for MacOS ARM | Pascal reimagined with AI
+A modern Pascal IDE with coding agents for macOS ARM | Pascal reimagined with AI
 
 A modern IDE for Pascal (macOS ARM for now), written in Rust. It wraps the
 Free Pascal compiler and aims at apps with a macOS-native look and feel.
@@ -8,6 +8,20 @@ Supports coding agents (OpenAI API and compatible, OpenAI Codex CLI, Claude Cons
 OpenAI Codex CLI and Claude Code CLI (and other CLI's) also run in the Pascoda terminal inside the IDE.
 
 > ** Status: early work in progress. The Pascoda IDE app builds and runs Pascal code ** 
+
+## Specs
+
+| Area | Status | Notes |
+|---|---|---|
+| Debugger | working | lldb through `lldb-dap`: breakpoints, step, call stack, variables; Pascal sets are not shown |
+| Code completion | working | `pasls`: Ctrl+Space and as-you-type completion, hover, F12 and Cmd-click go-to-definition; packages are not on its search path yet |
+| Build and run | working | console and GUI programs, progress bar, Problems pane, export to `.app` and `.dmg` |
+| Project files | partly | `.lpi` and `.dproj` give the main program, search paths, defines, target and switches; `.dfm` opens in the designer; `.lpk` and `.dpk` are not read yet |
+| Form designer | working | native controls, palette, menus, action lists, anchors; the project's own components appear on a "Project" palette page |
+| File tree | partly | new file, new folder, rename, delete to the Trash; move is not done |
+| Terminal | working | a real login shell in the bottom pane |
+| AI assistant | working | OpenAI-compatible and Anthropic Claude providers  |
+| Packaging | partly | `Pascoda.app` and `Pascoda.dmg` build; the notarization path has not been run |
 
 ## Requirements
 
@@ -254,6 +268,7 @@ for Claude Code).
     the edit left; after any other change the button is disabled and says so. Claude Code will
     see a reverted or reloaded file as "changed since read" and re-read it.
 - A packaged `Pascoda.app` and `Pascoda.dmg` that carry the toolchain sources they need
+
 
 ## Not done yet
 

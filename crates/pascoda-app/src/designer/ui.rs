@@ -136,6 +136,12 @@ pub fn show(
                 pages.push(en.page);
             }
         }
+        // The project's own components, when there are any, on a page of their own.
+        let mut custom: Vec<&'static str> = d.custom_units.keys().copied().collect();
+        custom.sort_unstable_by_key(|c| c.to_ascii_lowercase());
+        if !custom.is_empty() {
+            pages.push("Project");
+        }
         let page_index = state.page.min(pages.len() - 1);
         let page = pages[page_index];
         Frame::new()
@@ -166,15 +172,22 @@ pub fn show(
             .inner_margin(Margin::symmetric(10, 6))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
+                let classes: Vec<&'static str> = if page == "Project" {
+                    custom.clone()
+                } else {
+                    PALETTE
+                        .iter()
+                        .filter(|en| en.page == page)
+                        .map(|en| en.class)
+                        .collect()
+                };
                 ui.horizontal_wrapped(|ui| {
-                    for en in PALETTE.iter().filter(|en| en.page == page) {
-                        if palette_button(ui, &pal, en.class, state.tool == Some(en.class))
-                            .clicked()
-                        {
-                            state.tool = if state.tool == Some(en.class) {
+                    for class in classes {
+                        if palette_button(ui, &pal, class, state.tool == Some(class)).clicked() {
+                            state.tool = if state.tool == Some(class) {
                                 None
                             } else {
-                                Some(en.class)
+                                Some(class)
                             };
                         }
                     }

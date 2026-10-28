@@ -137,6 +137,8 @@ pub enum Icon {
     Gear,
     Send,
     Trash,
+    NewFile,
+    NewFolder,
 }
 
 /// Draws `icon` inside `rect` (about 14 points square) with `color`.
@@ -289,6 +291,22 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             line(p(0.0, 0.7), p(0.0, -0.7));
             line(p(-0.5, -0.2), p(0.0, -0.7));
             line(p(0.5, -0.2), p(0.0, -0.7));
+        }
+        Icon::NewFile => {
+            let page = Rect::from_min_max(p(-0.75, -0.9), p(0.35, 0.9));
+            painter.rect_stroke(page, 1.5, s, egui::StrokeKind::Inside);
+            line(p(0.35, 0.9), p(0.35, 0.0));
+            line(p(0.85, 0.5), p(0.85, 0.9));
+            line(p(0.6, 0.7), p(1.0, 0.7));
+        }
+        Icon::NewFolder => {
+            let body = Rect::from_min_max(p(-0.9, -0.45), p(0.4, 0.8));
+            painter.rect_stroke(body, 2.0, s, egui::StrokeKind::Inside);
+            line(p(-0.9, -0.45), p(-0.9, -0.75));
+            line(p(-0.9, -0.75), p(-0.2, -0.75));
+            line(p(-0.2, -0.75), p(0.0, -0.45));
+            line(p(0.7, 0.3), p(0.7, 0.9));
+            line(p(0.4, 0.6), p(1.0, 0.6));
         }
         Icon::Trash => {
             line(p(-0.8, -0.5), p(0.8, -0.5));

@@ -560,6 +560,77 @@ pub fn plan(unit: &str, class: &str, w: &Wanted) -> Result<SyncPlan, SyncError> 
 /// Adds the units in `units` that the interface `uses` clause lacks (a component's class lives
 /// in a unit such as `ExtCtrls`). Creates the clause when there is none. Names already there
 /// are matched case-insensitively and left alone.
+/// The classes a unit declares in its interface section, as `(name, base class)`. Only the plain
+/// form `TName = class(TBase)` is read; forward declarations and dotted base names are skipped.
+pub fn declared_classes(unit: &str) -> Vec<(String, String)> {
+    let scan = Scan::new(unit);
+    let Some(iface) = (0..scan.toks.len()).find(|&i| scan.is_word(i, "interface")) else {
+        return Vec::new();
+    };
+    let end = (iface..scan.toks.len())
+        .find(|&i| scan.is_word(i, "implementation"))
+        .unwrap_or(scan.toks.len());
+    let mut out = Vec::new();
+    for i in iface..end {
+        if scan.toks[i].kind == Kind::Word
+            && scan.is_sym(i + 1, b'=')
+            && scan.is_word(i + 2, "class")
+            && scan.is_sym(i + 3, b'(')
+            && scan.toks.get(i + 4).is_some_and(|t| t.kind == Kind::Word)
+        {
+            out.push((scan.text(i).to_string(), scan.text(i + 4).to_string()));
+        }
+    }
+    out
+}
+
+/// Makes sure each class is registered with `RegisterClass`, which a form that names it in a
+/// `.lfm` needs before it loads. The calls go into the `initialization` section (created before
+/// `finalization` or the final `end.` when the unit has none). Classes already registered are
+/// left alone, so running this again changes nothing.
+pub fn plan_register(unit: &str, classes: &[&str]) -> Result<SyncPlan, SyncError> {
+    let scan = Scan::new(unit);
+    let registered = |class: &str| {
+        (0..scan.toks.len()).any(|i| {
+            scan.is_word(i, "RegisterClass")
+                && scan.is_sym(i + 1, b'(')
+                && scan.is_word(i + 2, class)
+        })
+    };
+    let missing: Vec<&str> = classes
+        .iter()
+        .copied()
+        .filter(|c| !registered(c))
+        .collect();
+    let mut out = SyncPlan::default();
+    if missing.is_empty() {
+        return Ok(out);
+    }
+    let nl = scan.nl();
+    let calls: String = missing
+        .iter()
+        .map(|c| format!("{nl}  RegisterClass({c});"))
+        .collect();
+    if let Some(i) = (0..scan.toks.len()).find(|&i| scan.is_word(i, "initialization")) {
+        let at = scan.after_trailing_comments(scan.toks[i].end);
+        out.edits.push(TextEdit {
+            range: at..at,
+            text: calls,
+        });
+        return Ok(out);
+    }
+    let before = (0..scan.toks.len())
+        .find(|&i| scan.is_word(i, "finalization"))
+        .or_else(|| (0..scan.toks.len()).rev().find(|&i| scan.is_word(i, "end")))
+        .ok_or_else(|| SyncError::Unsupported("no `end.` to put the registration before".into()))?;
+    let at = scan.toks[before].start;
+    out.edits.push(TextEdit {
+        range: at..at,
+        text: format!("initialization{calls}{nl}{nl}"),
+    });
+    Ok(out)
+}
+
 pub fn plan_uses(unit: &str, units: &[&str]) -> Result<SyncPlan, SyncError> {
     let scan = Scan::new(unit);
     let iface = (0..scan.toks.len())
@@ -924,5 +995,42 @@ mod tests {
                 "Sender: TObject"
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod register_tests {
+    use super::*;
+
+    const UNIT: &str = "unit unit1;\n\ninterface\n\ntype\n  TMyLabel = class(TLabel)\n  end;\n  TForm1 = class(TForm)\n  end;\n\nimplementation\n\nend.\n";
+
+    #[test]
+    fn declared_classes_are_read_from_the_interface_only() {
+        let text = format!("{UNIT}\n"); // the implementation has no class declarations
+        let classes = declared_classes(&text);
+        assert_eq!(
+            classes,
+            vec![
+                ("TMyLabel".to_string(), "TLabel".to_string()),
+                ("TForm1".to_string(), "TForm".to_string()),
+            ]
+        );
+        assert!(declared_classes("unit u;\ninterface\ntype\n  TFwd = class;\nimplementation\nend.\n").is_empty());
+    }
+
+    #[test]
+    fn registration_goes_into_a_new_initialization_section_once() {
+        let plan = plan_register(UNIT, &["TMyLabel"]).unwrap();
+        let got = apply_edits(UNIT, &plan.edits);
+        assert!(got.contains("initialization\n  RegisterClass(TMyLabel);\n\nend."), "{got}");
+        assert!(plan_register(&got, &["TMyLabel"]).unwrap().edits.is_empty(), "idempotent");
+    }
+
+    #[test]
+    fn registration_joins_an_existing_initialization_section() {
+        let unit = UNIT.replace("implementation\n\nend.", "implementation\n\ninitialization\n  Randomize;\nend.");
+        let got = apply_edits(&unit, &plan_register(&unit, &["TMyLabel", "TForm1"]).unwrap().edits);
+        let at = got.find("initialization").unwrap();
+        assert!(got[at..].starts_with("initialization\n  RegisterClass(TMyLabel);\n  RegisterClass(TForm1);\n  Randomize;"), "{got}");
     }
 }

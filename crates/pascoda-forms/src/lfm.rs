@@ -23,6 +23,13 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// Whether `bytes` is a binary Delphi form (`.dfm` written as a binary stream). Those start
+/// with `0xFF` (Delphi 2 onwards, then the `TFORM1` header of Delphi 1) or with `TPF0`. Text
+/// forms start with `object` or `inherited`.
+pub fn is_binary(bytes: &[u8]) -> bool {
+    bytes.first() == Some(&0xFF) || bytes.starts_with(b"TPF0") || bytes.starts_with(b"TFORM1")
+}
+
 pub fn parse(source: &str) -> Result<Component, ParseError> {
     let mut p = Parser {
         src: source,

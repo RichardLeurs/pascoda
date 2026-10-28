@@ -1691,3 +1691,38 @@ fn the_toolbar_shows_export_progress() {
     let (text, _) = app.activity(&style::Palette::LIGHT);
     assert_eq!(text, "Exporting...");
 }
+
+/// The inline name field under the project, and the delete prompt above the file list.
+#[test]
+fn renders_the_project_tree_actions() {
+    let root = std::env::temp_dir().join(format!("pascoda-tree-render-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("debug.pas"), "program debug;\nbegin\nend.\n").unwrap();
+    std::fs::write(root.join("sub/inner.pas"), "unit inner;\n").unwrap();
+    let mut app = App::bare(Some(root.join("debug.pas")));
+    // The app's root is canonical (`/private/var` on macOS); the new row must match it.
+    let canonical = app.root.clone();
+    app.tree_new = Some(shell::TreeNew::new(canonical, false));
+    render(app, false, (1368.0, 800.0), "ui-tree-new-file");
+
+    let mut app = App::bare(Some(root.join("debug.pas")));
+    app.tree_delete = Some(root.join("sub"));
+    render(app, true, (1368.0, 800.0), "ui-tree-delete-dark");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The name field that replaces a row while it is renamed.
+#[test]
+fn renders_the_rename_field() {
+    let root = std::env::temp_dir().join(format!("pascoda-rename-render-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("debug.pas"), "program debug;\nbegin\nend.\n").unwrap();
+    let mut app = App::bare(Some(root.join("debug.pas")));
+    let canonical = app.root.clone();
+    app.tree_rename = Some(shell::TreeRename::new(canonical.join("debug.pas"), "debug.pas"));
+    render(app, false, (1368.0, 800.0), "ui-tree-rename");
+    let _ = std::fs::remove_dir_all(&root);
+}
+

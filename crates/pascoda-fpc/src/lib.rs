@@ -219,10 +219,21 @@ pub fn build_progress(
     total: Option<usize>,
     on: &mut dyn FnMut(Progress),
 ) -> std::io::Result<BuildResult> {
+    build_progress_with(source, mode, &[], total, on)
+}
+
+/// [`build_progress`] with extra compiler arguments, such as those a project file gives.
+pub fn build_progress_with(
+    source: &Path,
+    mode: Mode,
+    extra: &[std::ffi::OsString],
+    total: Option<usize>,
+    on: &mut dyn FnMut(Progress),
+) -> std::io::Result<BuildResult> {
     build_streaming(
         source,
         mode,
-        &[],
+        extra,
         Plan {
             total,
             ..Plan::WHOLE
@@ -314,7 +325,13 @@ pub(crate) fn build_streaming_as(
             fraction: Some(plan.at(0.98)),
             done,
         });
-        if let Err(e) = allow_debugging(&dir.join(Path::new(file).with_extension(""))) {
+        // The executable is the `-o` target of the project when there is one.
+        let exe = extra
+            .iter()
+            .find_map(|a| a.to_str()?.strip_prefix("-o"))
+            .map(|target| dir.join(target))
+            .unwrap_or_else(|| dir.join(Path::new(file).with_extension("")));
+        if let Err(e) = allow_debugging(&exe) {
             raw_output.push_str(&format!("warning: could not sign for debugging: {e}\n"));
         }
     }

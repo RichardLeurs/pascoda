@@ -11,6 +11,7 @@ use geometry::Bounds;
 use pascoda_forms::sync::{self, SyncError};
 use pascoda_forms::{Component, EditError, FormDoc, PropValue};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::path::{Path, PathBuf};
 
 /// One class on the palette.
@@ -120,8 +121,101 @@ const TRAY_LEFT: i64 = 16;
 const TRAY_TOP: i64 = 16;
 const TRAY_STEP: i64 = 40;
 
-/// The units a form needs `uses`d for the classes it contains (Controls/Forms are always there).
-pub fn units_for(form: &Component) -> Vec<&'static str> {
+/// Project classes (custom components) and the unit each is declared in.
+pub type ClassUnits = HashMap<&'static str, &'static str>;
+
+/// Class and unit names found in the project live as long as the program, so they are interned
+/// once: the palette and the designer hold them as `&'static str`, like the built-in classes.
+fn intern(name: &str) -> &'static str {
+    use std::sync::{Mutex, OnceLock};
+    static POOL: OnceLock<Mutex<std::collections::HashSet<&'static str>>> = OnceLock::new();
+    let mut pool = POOL
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(&known) = pool.get(name) {
+        return known;
+    }
+    let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+    pool.insert(leaked);
+    leaked
+}
+
+/// The project's custom components: classes declared in the project's units, except forms and
+/// frames (their base class is a form) and built-in classes. Units are read from the folder and
+/// its subfolders, as the file tree shows them.
+pub fn custom_classes(root: &Path) -> ClassUnits {
+    fn collect(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if name.starts_with('.') {
+                continue;
+            }
+            if path.is_dir() {
+                if depth < 6
+                    && !crate::files::HIDDEN_DIRS.contains(&name.as_str())
+                    && !name.ends_with(".app")
+                {
+                    collect(&path, depth + 1, out);
+                }
+            } else if matches!(path.extension().and_then(|e| e.to_str()), Some("pas" | "pp")) {
+                out.push(path);
+            }
+        }
+    }
+    const FORM_BASES: &[&str] = &["tform", "tframe", "tcustomform", "tcustomframe", "tdatamodule"];
+    let mut files = Vec::new();
+    collect(root, 0, &mut files);
+    let mut out = ClassUnits::new();
+    for file in files {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let Some(unit) = file.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        for (class, base) in pascoda_forms::sync::declared_classes(&text) {
+            let is_form = FORM_BASES.contains(&base.to_ascii_lowercase().as_str());
+            if is_form || is_builtin(&class) {
+                continue;
+            }
+            out.insert(intern(&class), intern(unit));
+        }
+    }
+    out
+}
+
+/// Whether the class is one of the palette's built-in classes.
+fn is_builtin(class: &str) -> bool {
+    PALETTE.iter().any(|en| en.class.eq_ignore_ascii_case(class))
+}
+
+/// The custom classes a form uses, found in its component tree.
+fn custom_used(form: &Component, custom: &ClassUnits) -> Vec<&'static str> {
+    fn walk(c: &Component, custom: &ClassUnits, out: &mut Vec<&'static str>) {
+        for child in &c.children {
+            if let Some((&class, _)) = custom
+                .iter()
+                .find(|(class, _)| class.eq_ignore_ascii_case(&child.class))
+                && !out.contains(&class)
+            {
+                out.push(class);
+            }
+            walk(child, custom, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(form, custom, &mut out);
+    out
+}
+
+/// The units a form needs `uses`d for the classes it contains (Controls/Forms are always there):
+/// the palette's units, and the unit of each custom class. The form's own unit is never listed.
+pub fn units_for(form: &Component, own_unit: &str, custom: &ClassUnits) -> Vec<&'static str> {
     fn walk(c: &Component, out: &mut Vec<&'static str>) {
         for child in &c.children {
             if let Some(en) = PALETTE
@@ -136,6 +230,12 @@ pub fn units_for(form: &Component) -> Vec<&'static str> {
     }
     let mut out = Vec::new();
     walk(form, &mut out);
+    for class in custom_used(form, custom) {
+        let unit = custom[class];
+        if !unit.eq_ignore_ascii_case(own_unit) && !out.contains(&unit) {
+            out.push(unit);
+        }
+    }
     out
 }
 
@@ -240,6 +340,8 @@ pub fn default_event(class: &str) -> &'static str {
 pub struct Designer {
     pub lfm_path: PathBuf,
     pub pas_path: PathBuf,
+    /// The project's custom components, set by the app whenever the project changes.
+    pub custom_units: Arc<ClassUnits>,
     pub doc: FormDoc,
     saved: String,
     undo: Vec<String>,
@@ -285,13 +387,48 @@ impl From<EditError> for DesignerError {
     }
 }
 
-/// The unit (`.pas`) a form file (`.lfm`) belongs to, if there is one.
-pub fn sibling_pas(lfm: &Path) -> Option<PathBuf> {
-    let pas = lfm.with_extension("pas");
-    (lfm.extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("lfm"))
-        && pas.is_file())
-    .then_some(pas)
+/// Whether `path` is a Pascal unit: `.pas`, or `.pp`, which Free Pascal and Lazarus use too.
+pub fn is_unit_file(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("pas") || e.eq_ignore_ascii_case("pp"))
+}
+
+/// Whether `path` is a form file the designer can read: a `.lfm`, or a `.dfm` in text form.
+/// Binary Delphi forms are not supported.
+pub fn is_form_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
+    if ext.eq_ignore_ascii_case("lfm") {
+        true
+    } else if ext.eq_ignore_ascii_case("dfm") {
+        !is_binary_form(path)
+    } else {
+        false
+    }
+}
+
+/// Whether the file at `path` starts like a binary Delphi form (reads its first bytes only).
+fn is_binary_form(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 8];
+    let read = std::fs::File::open(path)
+        .and_then(|mut f| f.read(&mut head))
+        .unwrap_or(0);
+    pascoda_forms::lfm::is_binary(&head[..read])
+}
+
+/// The unit (`.pas` or `.pp`) a form file (`.lfm` or `.dfm`) belongs to, if there is one.
+pub fn sibling_pas(form: &Path) -> Option<PathBuf> {
+    let ext = form.extension().and_then(|e| e.to_str()).unwrap_or_default();
+    if !(ext.eq_ignore_ascii_case("lfm") || ext.eq_ignore_ascii_case("dfm")) || !is_form_file(form) {
+        return None;
+    }
+    ["pas", "pp"]
+        .iter()
+        .map(|ext| form.with_extension(ext))
+        .find(|p| p.is_file())
 }
 
 /// For either file of a unit/form pair, the unit.
@@ -303,13 +440,15 @@ pub fn form_unit(path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// The `.lfm` next to a unit, if there is one.
+/// The form file next to a unit: its `.lfm`, else its text `.dfm`.
 pub fn sibling_lfm(pas: &Path) -> Option<PathBuf> {
-    let lfm = pas.with_extension("lfm");
-    (pas.extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("pas"))
-        && lfm.is_file())
-    .then_some(lfm)
+    if !is_unit_file(pas) {
+        return None;
+    }
+    ["lfm", "dfm"]
+        .iter()
+        .map(|ext| pas.with_extension(ext))
+        .find(|p| is_form_file(p))
 }
 
 impl Designer {
@@ -330,6 +469,7 @@ impl Designer {
             saved: doc.source().to_string(),
             doc,
             undo: Vec::new(),
+            custom_units: Arc::default(),
             redo: Vec::new(),
             selected: Vec::new(),
             also: Vec::new(),
@@ -804,7 +944,9 @@ impl Designer {
             .with_prop("Height", PropValue::Int(h))
             .with_prop("Top", PropValue::Int(geometry::snap(y, geometry::GRID)))
             .with_prop("Width", PropValue::Int(w));
-        let comp = match text_prop(class) {
+        // Only built-in classes are known to have the text property (a custom class may not).
+        let text = if is_builtin(class) { text_prop(class) } else { "" };
+        let comp = match text {
             "" => comp,
             text => comp.with_prop(text, PropValue::Str(name.clone())),
         };
@@ -1710,7 +1852,20 @@ impl Designer {
             let plan = sync::plan_remove_fields(&text, &class, &removed)?;
             text = sync::apply_edits(&text, &plan.edits);
         }
-        let plan = sync::plan_uses(&text, &units_for(self.doc.root()))?;
+        let own_unit = self
+            .pas_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let custom = self.custom_units.clone();
+        let units = units_for(self.doc.root(), &own_unit, &custom);
+        let units: Vec<&str> = units.into_iter().collect();
+        let plan = sync::plan_uses(&text, &units)?;
+        text = sync::apply_edits(&text, &plan.edits);
+        // A custom class must be registered before a form that names it in a `.lfm` loads.
+        let used = custom_used(self.doc.root(), &custom);
+        let plan = sync::plan_register(&text, &used)?;
         text = sync::apply_edits(&text, &plan.edits);
         let plan = sync::plan(&text, &class, &wanted)?;
         text = sync::apply_edits(&text, &plan.edits);
@@ -1768,6 +1923,7 @@ mod tests {
             saved: LFM.to_string(),
             doc,
             undo: vec![],
+            custom_units: Arc::default(),
             redo: vec![],
             selected: vec![],
             also: vec![],
@@ -2933,5 +3089,117 @@ mod tests {
         d.sync_unit(&mut unit);
         assert_eq!(d.sync_error, None);
         build_and_start(&mut d, &unit, &dir, &lcl);
+    }
+}
+
+#[cfg(test)]
+mod pairing_tests {
+    use super::*;
+
+    /// `.pp` units pair with their `.lfm` the same way `.pas` units do.
+    /// A text `.dfm` pairs with its unit; a binary one does not, and is not read as a form.
+    #[test]
+    fn a_dfm_pairs_only_in_text_form() {
+        let d = std::env::temp_dir().join(format!("pascoda-dfm-pair-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let (pas, dfm) = (d.join("main.pas"), d.join("main.dfm"));
+        std::fs::write(&pas, "unit main;\n").unwrap();
+        std::fs::write(&dfm, "object Form1: TForm1\nend\n").unwrap();
+        assert_eq!(sibling_lfm(&pas).as_deref(), Some(dfm.as_path()));
+        assert_eq!(sibling_pas(&dfm).as_deref(), Some(pas.as_path()));
+        assert!(is_form_file(&dfm));
+        // The designer opens the text form and saves back to the same `.dfm`.
+        let form = Designer::open(&pas).expect("a text .dfm opens in the designer");
+        assert_eq!(form.lfm_path, dfm);
+
+        std::fs::write(&dfm, b"\xff\x0a\x00TPF0\x06TForm").unwrap();
+        assert_eq!(sibling_lfm(&pas), None, "binary forms do not pair");
+        assert!(!is_form_file(&dfm));
+        assert_eq!(sibling_pas(&dfm), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_pp_unit_pairs_with_its_form() {
+        let d = std::env::temp_dir().join(format!("pascoda-pp-pair-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let (pp, lfm) = (d.join("unit1.pp"), d.join("unit1.lfm"));
+        std::fs::write(&pp, "unit unit1;\n").unwrap();
+        std::fs::write(&lfm, "object Form1: TForm1\nend\n").unwrap();
+
+        assert!(is_unit_file(&pp) && !is_unit_file(&lfm));
+        assert_eq!(sibling_lfm(&pp).as_deref(), Some(lfm.as_path()));
+        assert_eq!(sibling_pas(&lfm).as_deref(), Some(pp.as_path()));
+        assert_eq!(form_unit(&lfm).as_deref(), Some(pp.as_path()));
+        assert_eq!(form_unit(&pp).as_deref(), Some(pp.as_path()));
+
+        // A `.pas` next to the form wins over a `.pp` (no pairing is lost either way).
+        let pas = d.join("unit1.pas");
+        std::fs::write(&pas, "unit unit1;\n").unwrap();
+        assert_eq!(sibling_pas(&lfm).as_deref(), Some(pas.as_path()));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod custom_tests {
+    use super::*;
+
+    /// A project with the gui fixture's form and a custom component in its own unit.
+    fn project(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pascoda-custom-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["unit1.pas", "unit1.lfm"] {
+            std::fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/fixtures/gui")
+                    .join(f),
+                dir.join(f),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            dir.join("mylabel.pas"),
+            "unit mylabel;\n\n{$mode objfpc}{$H+}\n\ninterface\n\nuses\n  Classes, Controls, StdCtrls;\n\ntype\n  TMyLabel = class(TLabel)\n  end;\n\nimplementation\n\nend.\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_scan_finds_custom_components_but_not_forms() {
+        let dir = project("scan");
+        let found = custom_classes(&dir);
+        assert_eq!(found.get("TMyLabel"), Some(&"mylabel"));
+        assert!(!found.contains_key("TForm1"), "a form is not a component");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_custom_component_is_placed_without_a_caption_and_synced_with_its_unit() {
+        let dir = project("place");
+        let mut d = Designer::open(&dir.join("unit1.pas")).unwrap();
+        let mut custom = ClassUnits::new();
+        custom.insert("TMyLabel", "mylabel");
+        d.custom_units = Arc::new(custom);
+
+        let path = d.add_component("TMyLabel", &[], 16, 16).unwrap();
+        assert_eq!(d.doc.component(&path).unwrap().class, "TMyLabel");
+        assert!(
+            !d.doc.source().contains("Caption = 'MyLabel"),
+            "the class may have no Caption: {}",
+            d.doc.source()
+        );
+
+        let mut unit = std::fs::read_to_string(dir.join("unit1.pas")).unwrap();
+        d.sync_unit(&mut unit);
+        assert!(d.sync_error.is_none(), "{:?}", d.sync_error);
+        assert!(unit.contains("mylabel"), "the unit is used:\n{unit}");
+        assert!(unit.contains("RegisterClass(TMyLabel)"), "and registered:\n{unit}");
+        let once = unit.clone();
+        d.sync_unit(&mut unit);
+        assert_eq!(unit, once, "syncing again changes nothing");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

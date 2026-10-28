@@ -164,6 +164,34 @@ fn nth_line(text: &str, line: u32) -> &str {
         .trim_end_matches('\r')
 }
 
+/// Compiler switches for the server's CodeTools: the default mode, plus the LCL's defines and
+/// search paths when the Lazarus tree is there, so GUI units resolve.
+fn fpc_options(lazarus: &Path, root: &Path) -> Vec<String> {
+    let mut options = vec!["-Mobjfpc".to_string()];
+    if lazarus.join("lcl").is_dir() {
+        options.extend(pascoda_fpc::lcl::pasls_options(lazarus));
+    }
+    options.extend(project_options(root));
+    options
+}
+
+/// The `-Fu`, `-Fi` and `-d` switches of the Lazarus or Delphi project file in `root`, the same
+/// ones builds use. The server reads them when it starts, so a changed project needs a restart.
+fn project_options(root: &Path) -> Vec<String> {
+    let Some(file) = pascoda_project::foreign::find(root) else {
+        return Vec::new();
+    };
+    let Ok(project) = pascoda_project::foreign::read(&file) else {
+        return Vec::new();
+    };
+    project
+        .compiler_args()
+        .into_iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .filter(|a| a.starts_with("-d") || a.starts_with("-Fu") || a.starts_with("-Fi"))
+        .collect()
+}
+
 impl Client {
     /// Starts the server for the workspace at `root` and completes the handshake.
     pub fn start(config: &Config, root: &Path) -> Result<Self, String> {
@@ -208,7 +236,7 @@ impl Client {
                 "rootUri": uri(root),
                 "workspaceFolders": [{"uri": uri(root), "name": "workspace"}],
                 "capabilities": {"textDocument": {"completion": {"completionItem": {"snippetSupport": false}}}},
-                "initializationOptions": {"fpcOptions": ["-Mobjfpc"]},
+                "initializationOptions": {"fpcOptions": fpc_options(&config.lazarus_src, root)},
             }),
         )?;
         client.notify("initialized", json!({}))?;
@@ -508,5 +536,29 @@ mod tests {
                        "severity": 2, "message": "m"});
         let got = parse_diagnostic(&d, "x\n😀ab\n", Encoding::Utf16);
         assert_eq!((got.col, got.end_col, got.severity), (1, 3, 2));
+    }
+}
+
+#[cfg(test)]
+mod project_tests {
+    use super::*;
+
+    /// The language server gets the project's unit folders and defines, as builds do.
+    #[test]
+    fn the_project_file_gives_the_server_its_units_and_defines() {
+        let dir = std::env::temp_dir().join(format!("pascoda-lsp-opts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(
+            dir.join("app.lpi"),
+            "<CONFIG><CompilerOptions><SearchPaths><OtherUnitFiles Value=\"lib\"/></SearchPaths><Other><CustomOptions Value=\"-dFOO -O2\"/></Other></CompilerOptions></CONFIG>",
+        )
+        .unwrap();
+        let options = project_options(&dir);
+        assert!(options.contains(&format!("-Fu{}", dir.join("lib").display())));
+        assert!(options.contains(&"-dFOO".to_string()));
+        assert!(!options.iter().any(|o| o.starts_with("-O")), "switches stay with builds");
+        assert!(project_options(&dir.join("lib")).is_empty(), "no project, no options");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

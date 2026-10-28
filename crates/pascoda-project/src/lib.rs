@@ -1,5 +1,7 @@
 //! Project model and templates for Pascoda.
 
+pub mod foreign;
+
 use pascoda_fpc::Mode;
 use std::path::{Path, PathBuf};
 
@@ -48,6 +50,18 @@ fn set_key(root: &Path, key: &str, value: &str) -> std::io::Result<()> {
         return Ok(());
     }
     std::fs::write(path, lines.join("\n") + "\n")
+}
+
+/// The language mode for the project in `root`: `pascoda.toml`'s mode when it sets one, else the
+/// mode the project file asks for, else ObjFPC.
+pub fn mode_for(root: &Path) -> Mode {
+    if get_key(root, "mode").is_some() {
+        return load_mode(root);
+    }
+    foreign::find(root)
+        .and_then(|file| foreign::read(&file).ok())
+        .and_then(|project| project.mode)
+        .unwrap_or_default()
 }
 
 /// The language mode of the project in `root`: `mode = "objfpc"` or `"delphi"` in
@@ -157,6 +171,28 @@ mod tests {
                 && !is_valid_name("my app")
                 && !is_valid_name("a/b")
         );
+    }
+}
+
+#[cfg(test)]
+mod project_mode_tests {
+    use super::*;
+
+    /// `pascoda.toml` wins; without it the project file's syntax mode decides.
+    #[test]
+    fn the_mode_comes_from_the_settings_then_the_project_file() {
+        let d = std::env::temp_dir().join(format!("pascoda-mode-for-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("app.lpi"),
+            r#"<CONFIG><CompilerOptions><Parsing><SyntaxOptions><SyntaxMode Value="Delphi"/></SyntaxOptions></Parsing></CompilerOptions></CONFIG>"#,
+        )
+        .unwrap();
+        assert_eq!(mode_for(&d), Mode::Delphi);
+        std::fs::write(d.join(SETTINGS_FILE), "mode = \"objfpc\"\n").unwrap();
+        assert_eq!(mode_for(&d), Mode::ObjFpc, "pascoda.toml wins");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
 

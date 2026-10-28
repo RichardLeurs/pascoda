@@ -39,6 +39,8 @@ struct Pending {
     auto_complete: bool,
     /// File, text and 0-based position to ask the server about.
     hover_request: Option<(PathBuf, String, u32, u32)>,
+    /// Cmd-click on an identifier: char index to look up the definition of.
+    definition_at: Option<usize>,
     /// Variables rows were opened or closed; children not fetched yet are `var_fetch`.
     var_changed: bool,
     var_fetch: Vec<(String, i64)>,
@@ -54,6 +56,7 @@ impl App {
         self.poll_build(ctx);
         self.poll_debug(ctx);
         self.poll_lsp(ctx);
+        self.refresh_custom_classes();
         self.poll_live_check(ctx);
         self.poll_export(ctx);
         self.handle_close_request(ctx);
@@ -103,6 +106,9 @@ impl App {
         }
         if let Some((path, text, line, col)) = p.hover_request {
             self.request_hover(path, text, line, col);
+        }
+        if let Some(index) = p.definition_at {
+            self.request_definition_at(index);
         }
         if let Some((path, outcome)) = p.designer_outcome
             && let Some(handler) = outcome.open_handler
@@ -473,6 +479,7 @@ impl App {
     // ---- navigator --------------------------------------------------------------------
 
     fn navigator(&mut self, ui: &mut egui::Ui, pal: &Palette, p: &mut Pending) {
+        let mut actions = Vec::new();
         egui::Panel::left("navigator")
             .resizable(true)
             .default_size(250.0)
@@ -492,6 +499,33 @@ impl App {
                         {
                             self.nav_tab = tab;
                         }
+                    }
+                    if self.nav_tab == NavTab::Files {
+                        // Right to left: the first button added is the rightmost.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let sel = self.tree_sel.clone();
+                            let deletable = sel.clone().filter(|s| *s != self.root);
+                            if icon_button(ui, pal, Icon::Trash, deletable.is_some(), false)
+                                .on_hover_text("Move to Trash")
+                                .clicked()
+                                && let Some(s) = deletable
+                            {
+                                actions.push(TreeAction::AskDelete(s));
+                            }
+                            let target = self.tree_target_dir();
+                            if icon_button(ui, pal, Icon::NewFolder, true, false)
+                                .on_hover_text("New Folder")
+                                .clicked()
+                            {
+                                actions.push(TreeAction::NewIn { dir: target.clone(), is_dir: true });
+                            }
+                            if icon_button(ui, pal, Icon::NewFile, true, false)
+                                .on_hover_text("New File")
+                                .clicked()
+                            {
+                                actions.push(TreeAction::NewIn { dir: target, is_dir: false });
+                            }
+                        });
                     }
                 });
                 ui.add_space(4.0);
@@ -518,37 +552,85 @@ impl App {
                         });
                     });
 
+                if let Some(path) = self.tree_delete.clone() {
+                    self.delete_prompt(ui, pal, &path, &mut actions);
+                }
+
                 egui::ScrollArea::vertical()
                     .auto_shrink(false)
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         match self.nav_tab {
-                            NavTab::Files => self.file_rows(ui, pal, p),
+                            NavTab::Files => actions.extend(self.file_rows(ui, pal, p)),
                             NavTab::Debug => self.stack_rows(ui, pal, p),
                         }
                     });
             });
+        self.apply_tree_actions(actions, p);
     }
 
-    fn file_rows(&mut self, ui: &mut egui::Ui, pal: &Palette, p: &mut Pending) {
+    /// The "Delete ...?" strip above the file list. Unsaved edits in the item are named.
+    fn delete_prompt(&mut self, ui: &mut egui::Ui, pal: &Palette, path: &Path, actions: &mut Vec<TreeAction>) {
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let inside = files::count_items(path).saturating_sub(1);
+        let dirty = self.docs.iter().any(|d| d.path.starts_with(path) && d.dirty());
+        let mut text = format!("Move “{name}” to the Trash?");
+        if inside > 0 {
+            text += &format!(" It holds {inside} more {}.", if inside == 1 { "item" } else { "items" });
+        }
+        if dirty {
+            text += " Unsaved changes will be lost.";
+        }
+        Frame::new()
+            .fill(pal.row_selected)
+            .inner_margin(Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.add(egui::Label::new(RichText::new(text).size(12.0).color(pal.text)).wrap());
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::Button::new(RichText::new("Move to Trash").color(pal.error)))
+                        .clicked()
+                    {
+                        actions.push(TreeAction::ConfirmDelete(path.to_path_buf()));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.tree_delete = None;
+                    }
+                });
+            });
+    }
+
+    fn file_rows(&mut self, ui: &mut egui::Ui, pal: &Palette, p: &mut Pending) -> Vec<TreeAction> {
         if self.expanded.is_empty() {
             self.expanded.insert(self.root.clone());
         }
         let active = self.docs.get(self.active).map(|d| d.path.clone());
-        let mut toggles = Vec::new();
+        let mut actions = Vec::new();
         if self.file_filter.trim().is_empty() {
             let root = self.root.clone();
-            tree_rows(
-                ui,
-                pal,
-                &root,
-                0,
-                true,
-                active.as_deref(),
-                &self.expanded,
-                &mut toggles,
-                &mut p.open,
-            );
+            let mut view = TreeView {
+                active: active.as_deref(),
+                sel: self.tree_sel.as_deref(),
+                expanded: &self.expanded,
+                new: &mut self.tree_new,
+                rename: &mut self.tree_rename,
+                toggles: Vec::new(),
+                actions: Vec::new(),
+                open: None,
+            };
+            tree_rows(ui, pal, &root, 0, true, &mut view);
+            let TreeView { toggles, open, actions: drawn, .. } = view;
+            actions.extend(drawn);
+            if open.is_some() {
+                p.open = open;
+            }
+            for t in toggles {
+                if !self.expanded.remove(&t) {
+                    self.expanded.insert(t);
+                }
+            }
         } else {
             let needle = self.file_filter.trim().to_lowercase();
             let mut hits = Vec::new();
@@ -568,14 +650,167 @@ impl App {
                 )
                 .clicked()
                 {
+                    actions.push(TreeAction::Select(path.clone()));
                     p.open = Some(path);
                 }
             }
         }
-        for t in toggles {
-            if !self.expanded.remove(&t) {
-                self.expanded.insert(t);
+        actions
+    }
+
+    /// The folder new items go into: the selected folder, the selected file's folder, or the
+    /// project folder.
+    fn tree_target_dir(&self) -> PathBuf {
+        match &self.tree_sel {
+            Some(sel) if sel.is_dir() => sel.clone(),
+            Some(sel) => sel.parent().map_or_else(|| self.root.clone(), Path::to_path_buf),
+            None => self.root.clone(),
+        }
+    }
+
+    /// Reads the project's custom components again when the project or its files change, and
+    /// gives every open designer the current list.
+    fn refresh_custom_classes(&mut self) {
+        let key = (self.root.clone(), self.external.tree_rev);
+        if self.custom_scan.as_ref() != Some(&key) {
+            self.custom_units = std::sync::Arc::new(designer::custom_classes(&self.root));
+            self.custom_scan = Some(key);
+        }
+        for d in &mut self.designers {
+            d.custom_units = self.custom_units.clone();
+        }
+    }
+
+    /// Applies what the tree asked for this frame.
+    fn apply_tree_actions(&mut self, actions: Vec<TreeAction>, p: &mut Pending) {
+        for action in actions {
+            match action {
+                TreeAction::Select(path) => self.tree_sel = Some(path),
+                TreeAction::NewIn { dir, is_dir } => {
+                    self.expanded.insert(dir.clone());
+                    self.tree_new = Some(TreeNew {
+                        dir,
+                        is_dir,
+                        name: String::new(),
+                        focus: true,
+                    });
+                }
+                TreeAction::CancelNew => self.tree_new = None,
+                TreeAction::Create { dir, is_dir, name } => {
+                    self.tree_new = None;
+                    let made = if is_dir {
+                        files::new_folder(&dir, &name)
+                    } else {
+                        files::new_file(&dir, &name)
+                    };
+                    match made {
+                        Ok(path) => {
+                            self.expanded.insert(dir);
+                            if !is_dir {
+                                p.open = Some(path.clone());
+                            }
+                            self.tree_sel = Some(path);
+                        }
+                        Err(e) => self.note(e),
+                    }
+                }
+                TreeAction::AskDelete(path) => self.tree_delete = Some(path),
+                TreeAction::ConfirmDelete(path) => {
+                    self.tree_delete = None;
+                    self.delete_in_tree(&path);
+                }
+                TreeAction::AskRename(path) => {
+                    self.tree_new = None;
+                    self.tree_delete = None;
+                    let name = path
+                        .file_name()
+                        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                    self.tree_rename = Some(TreeRename {
+                        path,
+                        name,
+                        focus: true,
+                    });
+                }
+                TreeAction::CancelRename => self.tree_rename = None,
+                TreeAction::RenameTo { path, name } => {
+                    self.tree_rename = None;
+                    self.rename_in_tree(&path, &name);
+                }
             }
+        }
+    }
+
+    /// Renames an item in the tree. Open tabs, forms and the selection follow it.
+    fn rename_in_tree(&mut self, path: &Path, name: &str) {
+        match files::rename(path, name, &self.root) {
+            Ok(moves) => {
+                let Some(to) = moves.first().map(|(_, to)| to.clone()) else {
+                    return;
+                };
+                for (from, to) in &moves {
+                    self.follow_move(from, to);
+                }
+                let shown = to
+                    .file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                let is_unit = matches!(to.extension().and_then(|e| e.to_str()), Some("pas" | "pp"));
+                let note = if is_unit {
+                    format!("Renamed to “{shown}”. The unit line and the uses clauses that name it are not changed.")
+                } else {
+                    format!("Renamed to “{shown}”")
+                };
+                self.tree_sel = Some(to);
+                self.note(note);
+            }
+            Err(e) => self.note(format!("Could not rename “{name}”: {e}")),
+        }
+    }
+
+    /// Points everything that names `from` (or a path inside it) at `to` instead.
+    fn follow_move(&mut self, from: &Path, to: &Path) {
+        for d in &mut self.docs {
+            if let Some(p) = files::moved(&d.path, from, to) {
+                d.path = p;
+            }
+        }
+        for f in &mut self.designers {
+            if let Some(p) = files::moved(&f.pas_path, from, to) {
+                f.pas_path = p;
+            }
+            if let Some(p) = files::moved(&f.lfm_path, from, to) {
+                f.lfm_path = p;
+            }
+        }
+        self.expanded = self
+            .expanded
+            .iter()
+            .map(|d| files::moved(d, from, to).unwrap_or_else(|| d.clone()))
+            .collect::<HashSet<PathBuf>>();
+        if let Some(sel) = self.tree_sel.as_deref().and_then(|s| files::moved(s, from, to)) {
+            self.tree_sel = Some(sel);
+        }
+    }
+
+    /// Deletes an item from disk. Tabs and forms inside it go too; the caller has asked first.
+    fn delete_in_tree(&mut self, path: &Path) {
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        match files::delete(path, &self.root) {
+            Ok(()) => {
+                for i in (0..self.docs.len()).rev() {
+                    if self.docs[i].path.starts_with(path) {
+                        self.discard_doc(i);
+                    }
+                }
+                self.designers.retain(|f| !f.pas_path.starts_with(path));
+                self.expanded.retain(|d| !d.starts_with(path));
+                if self.tree_sel.as_deref().is_some_and(|s| s.starts_with(path)) {
+                    self.tree_sel = None;
+                }
+                self.note(format!("Moved “{name}” to the Trash"));
+            }
+            Err(e) => self.note(format!("Could not move “{name}” to the Trash: {e}")),
         }
     }
 
@@ -981,6 +1216,16 @@ impl App {
                     ui.painter()
                         .add(egui::Shape::line(points, egui::Stroke::new(1.0, color)));
                 }
+                // Cmd-click on a name goes to its definition (marks are not symbols).
+                if output.response.clicked() && ui.input(|i| i.modifiers.command) {
+                    let pointer = ctx.pointer_interact_pos().unwrap_or_default();
+                    let local = pointer - output.galley_pos;
+                    if let Some(t) = hints::target_at(&output.galley, &doc.text, local, marks)
+                        && t.mark.is_none()
+                    {
+                        p.definition_at = Some(t.range.start);
+                    }
+                }
                 if output.response.changed() {
                     self.hover.clear();
                     if doc.text.len() > len_before {
@@ -1365,8 +1610,73 @@ fn row(
     resp
 }
 
-const TREE_EXTENSIONS: &[&str] = &["pas", "pp", "lpr", "dpr", "inc", "lfm"];
-const HIDDEN_DIRS: &[&str] = &["target", "vendor", "lib"];
+const TREE_EXTENSIONS: &[&str] = crate::files::TREE_EXTENSIONS;
+const HIDDEN_DIRS: &[&str] = crate::files::HIDDEN_DIRS;
+
+/// What the project tree asked for while it was drawn; applied once drawing is done.
+pub(crate) enum TreeAction {
+    Select(PathBuf),
+    NewIn { dir: PathBuf, is_dir: bool },
+    AskRename(PathBuf),
+    RenameTo { path: PathBuf, name: String },
+    CancelRename,
+    Create { dir: PathBuf, is_dir: bool, name: String },
+    CancelNew,
+    AskDelete(PathBuf),
+    ConfirmDelete(PathBuf),
+}
+
+/// A name being typed for a new file or folder: an editable row at the top of `dir`.
+pub(crate) struct TreeNew {
+    dir: PathBuf,
+    is_dir: bool,
+    name: String,
+    focus: bool,
+}
+
+/// An item being renamed: its name field replaces its row.
+pub(crate) struct TreeRename {
+    path: PathBuf,
+    name: String,
+    focus: bool,
+}
+
+#[cfg(test)]
+impl TreeRename {
+    /// An item being renamed, with its current name in the field.
+    pub(crate) fn new(path: PathBuf, name: &str) -> Self {
+        Self {
+            path,
+            name: name.to_string(),
+            focus: false,
+        }
+    }
+}
+
+#[cfg(test)]
+impl TreeNew {
+    /// A new item being named in `dir`, with the field not yet focused.
+    pub(crate) fn new(dir: PathBuf, is_dir: bool) -> Self {
+        Self {
+            dir,
+            is_dir,
+            name: String::new(),
+            focus: false,
+        }
+    }
+}
+
+/// The state the project tree reads and writes while it is drawn.
+struct TreeView<'a> {
+    active: Option<&'a Path>,
+    sel: Option<&'a Path>,
+    expanded: &'a HashSet<PathBuf>,
+    new: &'a mut Option<TreeNew>,
+    rename: &'a mut Option<TreeRename>,
+    toggles: Vec<PathBuf>,
+    actions: Vec<TreeAction>,
+    open: Option<PathBuf>,
+}
 
 pub(crate) fn listing(dir: &Path) -> Vec<PathBuf> {
     let Ok(read) = std::fs::read_dir(dir) else {
@@ -1412,55 +1722,164 @@ fn collect_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
 }
 
 /// The folder `dir` and, when expanded, everything below it.
-#[allow(clippy::too_many_arguments)]
-fn tree_rows(
-    ui: &mut egui::Ui,
-    pal: &Palette,
-    dir: &Path,
-    depth: usize,
-    is_root: bool,
-    active: Option<&Path>,
-    expanded: &HashSet<PathBuf>,
-    toggles: &mut Vec<PathBuf>,
-    open: &mut Option<PathBuf>,
-) {
-    let is_open = expanded.contains(dir);
-    let resp = row(ui, pal, depth, true, is_open, dir, false);
-    if is_root {
-        // Xcode shows the project itself at the top; its name is the folder's.
+fn tree_rows(ui: &mut egui::Ui, pal: &Palette, dir: &Path, depth: usize, is_root: bool, view: &mut TreeView) {
+    let is_open = view.expanded.contains(dir);
+    let resp = row(ui, pal, depth, true, is_open, dir, view.sel == Some(dir));
+    let renaming = view.rename.as_ref().is_some_and(|r| r.path == dir);
+    if renaming {
+        rename_overlay(ui, pal, resp.rect, depth, view);
+    } else if resp.clicked() {
+        view.toggles.push(dir.to_path_buf());
+        view.actions.push(TreeAction::Select(dir.to_path_buf()));
     }
-    if resp.clicked() {
-        toggles.push(dir.to_path_buf());
-    }
+    resp.context_menu(|ui| {
+        if ui.button("New File").clicked() {
+            view.actions.push(TreeAction::NewIn { dir: dir.to_path_buf(), is_dir: false });
+            ui.close();
+        }
+        if ui.button("New Folder").clicked() {
+            view.actions.push(TreeAction::NewIn { dir: dir.to_path_buf(), is_dir: true });
+            ui.close();
+        }
+        if !is_root {
+            if ui.button("Rename").clicked() {
+                view.actions.push(TreeAction::AskRename(dir.to_path_buf()));
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Move to Trash").clicked() {
+                view.actions.push(TreeAction::AskDelete(dir.to_path_buf()));
+                ui.close();
+            }
+        }
+    });
     if !is_open || depth > 8 {
         return;
     }
+    if view.new.as_ref().is_some_and(|n| n.dir == dir) {
+        new_name_row(ui, pal, depth + 1, view);
+    }
     for p in listing(dir) {
         if p.is_dir() {
-            tree_rows(
+            tree_rows(ui, pal, &p, depth + 1, false, view);
+        } else {
+            let resp = row(
                 ui,
                 pal,
-                &p,
                 depth + 1,
                 false,
-                active,
-                expanded,
-                toggles,
-                open,
+                false,
+                &p,
+                view.active == Some(p.as_path()) || view.sel == Some(p.as_path()),
             );
-        } else if row(
-            ui,
-            pal,
-            depth + 1,
-            false,
-            false,
-            &p,
-            active == Some(p.as_path()),
-        )
-        .clicked()
-        {
-            *open = Some(p);
+            let renaming = view.rename.as_ref().is_some_and(|r| r.path == p);
+            if renaming {
+                rename_overlay(ui, pal, resp.rect, depth + 1, view);
+            } else if resp.clicked() {
+                view.open = Some(p.clone());
+                view.actions.push(TreeAction::Select(p.clone()));
+            }
+            resp.context_menu(|ui| {
+                if ui.button("Rename").clicked() {
+                    view.actions.push(TreeAction::AskRename(p.clone()));
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Move to Trash").clicked() {
+                    view.actions.push(TreeAction::AskDelete(p.clone()));
+                    ui.close();
+                }
+            });
         }
+    }
+}
+
+/// What an editable name field did this frame.
+enum NameEdit {
+    Submit(String),
+    Cancel,
+    Editing,
+}
+
+/// The area of a row where its name goes, at `depth`.
+fn name_rect(row: Rect, depth: usize) -> Rect {
+    let x = row.left() + 12.0 + depth as f32 * 14.0 + 34.0;
+    Rect::from_min_max(
+        egui::pos2(x, row.top() + 2.0),
+        egui::pos2(row.right() - 8.0, row.bottom() - 2.0),
+    )
+}
+
+/// A name field in `rect`. Enter or clicking away submits it (an empty name cancels); Escape
+/// cancels.
+fn name_field(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    rect: Rect,
+    name: &mut String,
+    focus: &mut bool,
+    hint: &str,
+) -> NameEdit {
+    let edit = ui.put(
+        rect,
+        egui::TextEdit::singleline(name)
+            .hint_text(hint)
+            .text_color(pal.text)
+            .desired_width(f32::INFINITY),
+    );
+    if std::mem::take(focus) {
+        edit.request_focus();
+    }
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        NameEdit::Cancel
+    } else if edit.lost_focus() {
+        if name.trim().is_empty() {
+            NameEdit::Cancel
+        } else {
+            NameEdit::Submit(name.clone())
+        }
+    } else {
+        NameEdit::Editing
+    }
+}
+
+/// The name field of a file or folder being created, as a row of its own at the top of `dir`.
+fn new_name_row(ui: &mut egui::Ui, pal: &Palette, depth: usize, view: &mut TreeView) {
+    let Some(new) = view.new.as_mut() else {
+        return;
+    };
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
+    let hint = if new.is_dir { "Folder name" } else { "File name" };
+    match name_field(ui, pal, name_rect(rect, depth), &mut new.name, &mut new.focus, hint) {
+        NameEdit::Submit(name) => view.actions.push(TreeAction::Create {
+            dir: new.dir.clone(),
+            is_dir: new.is_dir,
+            name,
+        }),
+        NameEdit::Cancel => view.actions.push(TreeAction::CancelNew),
+        NameEdit::Editing => {}
+    }
+}
+
+/// The name field over the row of an item being renamed.
+fn rename_overlay(ui: &mut egui::Ui, pal: &Palette, row: Rect, depth: usize, view: &mut TreeView) {
+    let Some(rename) = view.rename.as_mut() else {
+        return;
+    };
+    match name_field(
+        ui,
+        pal,
+        name_rect(row, depth),
+        &mut rename.name,
+        &mut rename.focus,
+        "Name",
+    ) {
+        NameEdit::Submit(name) => view.actions.push(TreeAction::RenameTo {
+            path: rename.path.clone(),
+            name,
+        }),
+        NameEdit::Cancel => view.actions.push(TreeAction::CancelRename),
+        NameEdit::Editing => {}
     }
 }
 
@@ -1737,4 +2156,145 @@ fn gutter(
         breakpoints.insert(line);
     }
     true
+}
+
+#[cfg(test)]
+mod tree_tests {
+    use super::*;
+
+    /// A fresh project folder holding `debug.pas`.
+    fn project(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("pascoda-tree-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("debug.pas"), "program debug;\nbegin\nend.\n").unwrap();
+        d
+    }
+
+    #[test]
+    fn a_new_file_is_named_then_created_and_opened() {
+        let root = project("new");
+        let mut app = App::bare(Some(root.join("debug.pas")));
+        let mut p = Pending::default();
+        app.apply_tree_actions(
+            vec![TreeAction::NewIn { dir: root.clone(), is_dir: false }],
+            &mut p,
+        );
+        assert!(app.tree_new.as_ref().is_some_and(|n| n.focus && n.dir == root));
+        app.apply_tree_actions(
+            vec![TreeAction::Create {
+                dir: root.clone(),
+                is_dir: false,
+                name: "unit2".into(),
+            }],
+            &mut p,
+        );
+        assert!(app.tree_new.is_none());
+        assert!(root.join("unit2.pas").is_file());
+        assert_eq!(p.open.as_deref(), Some(root.join("unit2.pas").as_path()));
+        assert_eq!(app.tree_sel.as_deref(), Some(root.join("unit2.pas").as_path()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_bad_name_is_reported_and_nothing_is_created() {
+        let root = project("bad");
+        let mut app = App::bare(Some(root.join("debug.pas")));
+        let mut p = Pending::default();
+        app.apply_tree_actions(
+            vec![TreeAction::Create {
+                dir: root.clone(),
+                is_dir: false,
+                name: "notes.txt".into(),
+            }],
+            &mut p,
+        );
+        assert!(!root.join("notes.txt").exists());
+        assert!(p.open.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn deleting_a_folder_closes_its_tabs_and_forgets_its_selection() {
+        // The app's root is canonical (`/private/var` on macOS): build paths from it.
+        let project_dir = project("delete");
+        let mut app = App::bare(Some(project_dir.join("debug.pas")));
+        let root = app.root.clone();
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("inner.pas"), "unit inner;\n").unwrap();
+        app.open_path(sub.join("inner.pas"));
+        assert_eq!(app.docs.len(), 2);
+        app.tree_sel = Some(sub.join("inner.pas"));
+
+        let mut p = Pending::default();
+        app.apply_tree_actions(vec![TreeAction::AskDelete(sub.clone())], &mut p);
+        assert_eq!(app.tree_delete.as_deref(), Some(sub.as_path()));
+        assert!(sub.exists(), "asking deletes nothing");
+
+        app.apply_tree_actions(vec![TreeAction::ConfirmDelete(sub.clone())], &mut p);
+        assert!(!sub.exists());
+        assert!(app.tree_delete.is_none());
+        assert_eq!(app.docs.len(), 1, "the tab of the deleted file closed");
+        assert!(app.tree_sel.is_none());
+        let _ = std::fs::remove_dir_all(&project_dir);
+    }
+
+    #[test]
+    fn the_project_folder_is_never_deleted() {
+        let project_dir = project("root");
+        let mut app = App::bare(Some(project_dir.join("debug.pas")));
+        let root = app.root.clone();
+        let mut p = Pending::default();
+        app.apply_tree_actions(vec![TreeAction::ConfirmDelete(root.clone())], &mut p);
+        assert!(root.join("debug.pas").exists());
+        let _ = std::fs::remove_dir_all(&project_dir);
+    }
+
+    #[test]
+    fn renaming_an_open_file_keeps_its_tab_and_selection() {
+        let project_dir = project("rename-open");
+        let mut app = App::bare(Some(project_dir.join("debug.pas")));
+        let root = app.root.clone();
+        let mut p = Pending::default();
+        app.apply_tree_actions(vec![TreeAction::AskRename(root.join("debug.pas"))], &mut p);
+        assert!(app.tree_rename.as_ref().is_some_and(|r| r.name == "debug.pas" && r.focus));
+        app.apply_tree_actions(
+            vec![TreeAction::RenameTo {
+                path: root.join("debug.pas"),
+                name: "main".into(),
+            }],
+            &mut p,
+        );
+        assert!(app.tree_rename.is_none());
+        assert!(root.join("main.pas").is_file() && !root.join("debug.pas").exists());
+        assert_eq!(app.docs[0].path, root.join("main.pas"));
+        assert_eq!(app.tree_sel.as_deref(), Some(root.join("main.pas").as_path()));
+        let _ = std::fs::remove_dir_all(&project_dir);
+    }
+
+    #[test]
+    fn renaming_a_folder_moves_the_open_files_and_the_expansion_under_it() {
+        let project_dir = project("rename-dir");
+        let mut app = App::bare(Some(project_dir.join("debug.pas")));
+        let root = app.root.clone();
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("inner.pas"), "unit inner;\n").unwrap();
+        app.open_path(sub.join("inner.pas"));
+        app.expanded.insert(sub.clone());
+        let mut p = Pending::default();
+        app.apply_tree_actions(
+            vec![TreeAction::RenameTo {
+                path: sub.clone(),
+                name: "other".into(),
+            }],
+            &mut p,
+        );
+        assert!(root.join("other/inner.pas").is_file());
+        assert_eq!(app.docs[1].path, root.join("other/inner.pas"));
+        assert!(app.expanded.contains(&root.join("other")));
+        assert!(!app.expanded.contains(&sub));
+        let _ = std::fs::remove_dir_all(&project_dir);
+    }
 }

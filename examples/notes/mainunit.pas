@@ -251,6 +251,12 @@ end;
 procedure TMainForm.MainFormShow(Sender: TObject);
 begin
   UpdateView;
+  {$IFDEF DARWIN}
+  // AppKit adds its own items (a Search field, and more) to the menu it takes for Help, which is
+  // the visible "&Help" menu when no other menu is set. Give AppKit a hidden menu for Help instead,
+  // so the menu bar's Help shows only what this form defines.
+  NSApplication.sharedApplication.setHelpMenu(NSMenu.alloc.init);
+  {$ENDIF}
 end;
 
 procedure TMainForm.Memo1Change(Sender: TObject);

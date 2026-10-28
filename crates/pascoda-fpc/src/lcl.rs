@@ -59,34 +59,23 @@ impl Lcl {
     }
 
     fn source_dirs(&self) -> Vec<PathBuf> {
-        let l = &self.lazarus_dir;
-        [
-            "lcl",
-            "lcl/nonwin32",
-            "lcl/forms",
-            "lcl/widgetset",
-            "lcl/interfaces/cocoa",
-            "components/lazutils",
-            "components/freetype",
-        ]
-        .iter()
-        .map(|p| l.join(p))
-        .collect()
+        source_dirs(&self.lazarus_dir)
     }
 
     /// Arguments every LCL compile shares, for the cache and for projects alike.
     fn common_args(&self) -> Vec<OsString> {
-        let mut args: Vec<OsString> = vec![
-            "-dLCL".into(),
-            "-dLCLcocoa".into(),
+        let mut args: Vec<OsString> = defines(&self.lazarus_dir)
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        args.extend([
             format!("-WM{MIN_MACOS}").into(),
             // fpc 3.2.2 emits Objective-C method lists that Apple's current linker rejects;
             // the classic linker accepts them. Apple has deprecated that flag.
             "-k-ld_classic".into(),
             "-k-framework".into(),
             "-kUserNotifications".into(),
-        ];
-        args.push(format!("-Fi{}", self.lazarus_dir.join("lcl/include").display()).into());
+        ]);
         args
     }
 
@@ -154,6 +143,43 @@ impl Lcl {
     }
 }
 
+/// The LCL's source folders, relative to the Lazarus tree.
+fn source_dirs(lazarus: &Path) -> Vec<PathBuf> {
+    [
+        "lcl",
+        "lcl/nonwin32",
+        "lcl/forms",
+        "lcl/widgetset",
+        "lcl/interfaces/cocoa",
+        "components/lazutils",
+        "components/freetype",
+    ]
+    .iter()
+    .map(|p| lazarus.join(p))
+    .collect()
+}
+
+/// The defines and include folder the LCL is compiled with.
+fn defines(lazarus: &Path) -> Vec<String> {
+    vec![
+        "-dLCL".into(),
+        "-dLCLcocoa".into(),
+        format!("-Fi{}", lazarus.join("lcl/include").display()),
+    ]
+}
+
+/// Compiler switches that let a tool parse the LCL's sources as a project would (pasls).
+/// Without them the LCL's `{$I lcl_defines.inc}` is not found and no LCL type resolves.
+pub fn pasls_options(lazarus: &Path) -> Vec<String> {
+    let mut options = defines(lazarus);
+    options.extend(
+        source_dirs(lazarus)
+            .iter()
+            .map(|d| format!("-Fu{}", d.display())),
+    );
+    options
+}
+
 /// Units in the LCL cache of this machine's build of it; the first GUI build compiles about
 /// this many, which sizes its progress bar.
 pub const LCL_UNITS: usize = 160;
@@ -169,6 +195,18 @@ pub fn build_gui_progress(
     source: &Path,
     mode: Mode,
     lcl: &Lcl,
+    total: Option<usize>,
+    on: &mut dyn FnMut(Progress),
+) -> std::io::Result<BuildResult> {
+    build_gui_progress_with(source, mode, lcl, &[], total, on)
+}
+
+/// [`build_gui_progress`] with extra compiler arguments, such as a project file's search paths.
+pub fn build_gui_progress_with(
+    source: &Path,
+    mode: Mode,
+    lcl: &Lcl,
+    extra: &[OsString],
     total: Option<usize>,
     on: &mut dyn FnMut(Progress),
 ) -> std::io::Result<BuildResult> {
@@ -192,7 +230,9 @@ pub fn build_gui_progress(
     std::fs::create_dir_all(&units_out)?;
     let units_out = units_out.canonicalize()?;
     let plan = Plan { total, lo, hi: 1.0 };
-    build_streaming(source, mode, &lcl.project_args(&units_out), plan, on)
+    let mut args = lcl.project_args(&units_out);
+    args.extend(extra.iter().cloned());
+    build_streaming(source, mode, &args, plan, on)
 }
 
 /// Wraps `exe` into `<dir>/<name>.app` so macOS treats it as a real application (Dock icon,
