@@ -401,6 +401,9 @@ pub struct OpenAi {
     history: Vec<Value>,
     cancel: Arc<AtomicBool>,
     next_id: u64,
+    /// Set after a server said tools need `reasoning_effort` (gpt-5 style models on Chat
+    /// Completions); every later request then sends `"reasoning_effort": "none"`.
+    reasoning_none: bool,
     /// Model calls per user turn.
     pub max_steps: usize,
 }
@@ -429,6 +432,7 @@ impl OpenAi {
             history: Vec::new(),
             cancel,
             next_id: 0,
+            reasoning_none: false,
             max_steps: 20,
         }
     }
@@ -454,6 +458,9 @@ impl OpenAi {
         });
         if !self.tools.is_empty() {
             body["tools"] = Value::Array(self.tools.clone());
+        }
+        if self.reasoning_none {
+            body["reasoning_effort"] = json!("none");
         }
         body
     }
@@ -564,7 +571,7 @@ impl OpenAi {
 
     /// One streamed reply, retrying rate limits and overload before any output.
     fn stream(&mut self, on_text: &mut dyn FnMut(&str)) -> Result<Reply, AiError> {
-        let body = self.request_body().to_string();
+        let mut body = self.request_body().to_string();
         let url = format!(
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
@@ -582,6 +589,20 @@ impl OpenAi {
                 }
                 Err((AiError::Overloaded(_), false)) if attempt < self.config.max_retries => {
                     self.backoff(attempt, None)?;
+                }
+                // "Function tools with reasoning_effort are not supported ...: set reasoning_effort
+                // to 'none'": resend once with it; models that never mention it are untouched.
+                Err((
+                    AiError::Api {
+                        status: 400,
+                        message,
+                        ..
+                    },
+                    false,
+                )) if !self.reasoning_none && message.contains("reasoning_effort") => {
+                    self.reasoning_none = true;
+                    body = self.request_body().to_string();
+                    continue;
                 }
                 Err((e, _)) => return Err(e),
                 Ok(reply) => return Ok(reply),

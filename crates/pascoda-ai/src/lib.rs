@@ -7,19 +7,21 @@
 mod agent;
 pub mod claude_code;
 mod client;
+pub mod codex;
 mod error;
 mod keychain;
 pub mod openai;
 mod prompt;
 mod sse;
 mod tools;
+mod udiff;
 
 pub use agent::{Agent, Backend, Decision, Event, Finish};
 pub use client::{ApiKey, Client, Config, Reply, Request};
 pub use error::AiError;
 pub use keychain::{Keystore, resolve_key, resolve_openai_key};
 pub use openai::{OpenAi, OpenAiConfig, OpenAiSettings};
-pub use prompt::{CLAUDE_CODE_PROMPT, SYSTEM_PROMPT};
+pub use prompt::{CLAUDE_CODE_PROMPT, CODEX_PROMPT, SYSTEM_PROMPT};
 pub use sse::{Accumulator, Block, SseEvent, SseParser, Usage};
 pub use tools::{Approval, Change, Host, Proposal, Sandbox, tool_definitions};
 

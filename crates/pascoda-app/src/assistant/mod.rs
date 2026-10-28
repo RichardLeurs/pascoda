@@ -13,6 +13,7 @@ mod ui;
 
 use super::*;
 use pascoda_ai::claude_code::{self, ClaudeCode, CliStatus};
+use pascoda_ai::codex::{self, Codex};
 use pascoda_ai::{
     Agent, ApiKey, Approval, Backend, Change, Client, Config, Decision, Event, Finish, Host,
     Keystore, OpenAi, OpenAiConfig, OpenAiSettings, Proposal, Sandbox, Usage,
@@ -270,6 +271,13 @@ pub enum Item {
     Note(String),
 }
 
+/// How many hand-added Claude models the dropdown remembers.
+const MAX_EXTRA_MODELS: usize = 10;
+
+fn is_builtin_model(id: &str) -> bool {
+    pascoda_ai::MODELS.iter().any(|(m, _)| *m == id)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum KeyState {
     /// Not looked up yet.
@@ -289,25 +297,43 @@ pub enum Provider {
     Api,
     OpenAi,
     ClaudeCode,
+    /// The user's own installed `codex` (OpenAI Codex CLI), driven through its app server.
+    Codex,
 }
 
 impl Provider {
-    pub const ALL: [Provider; 3] = [Provider::Api, Provider::OpenAi, Provider::ClaudeCode];
+    /// In the order of the chooser: the Claude providers together, then the OpenAI ones.
+    pub const ALL: [Provider; 4] = [
+        Provider::Api,
+        Provider::ClaudeCode,
+        Provider::OpenAi,
+        Provider::Codex,
+    ];
+
+    /// Which company's agents these are; the chooser groups by it.
+    pub fn vendor(self) -> &'static str {
+        match self {
+            Provider::Api | Provider::ClaudeCode => "Claude",
+            Provider::OpenAi | Provider::Codex => "OpenAI",
+        }
+    }
 
     pub fn label(self) -> &'static str {
         match self {
-            Provider::Api => "Anthropic API key",
-            Provider::OpenAi => "OpenAI API key",
-            Provider::ClaudeCode => "Claude Code (subscription)",
+            Provider::Api => "Claude Console API",
+            Provider::OpenAi => "OpenAI API",
+            Provider::ClaudeCode => "Claude Code CLI",
+            Provider::Codex => "Codex CLI",
         }
     }
 
     /// The agent's name for the panel title.
     pub fn short_name(self) -> &'static str {
         match self {
-            Provider::Api => "Anthropic API",
-            Provider::OpenAi => "OpenAI",
-            Provider::ClaudeCode => "Claude Code",
+            Provider::Api => "Claude Console API",
+            Provider::OpenAi => "OpenAI API",
+            Provider::ClaudeCode => "Claude Code CLI",
+            Provider::Codex => "Codex CLI",
         }
     }
 
@@ -317,6 +343,7 @@ impl Provider {
             Provider::Api => "api",
             Provider::OpenAi => "openai",
             Provider::ClaudeCode => "claude-code",
+            Provider::Codex => "codex",
         }
     }
 
@@ -370,10 +397,22 @@ pub struct Assistant {
     pub show_settings: bool,
     pub provider: Provider,
     pub cli: CliState,
+    /// The same for the `codex` program.
+    pub codex: CliState,
+    /// Use this `codex` binary instead of looking for one (tests).
+    pub codex_bin: Option<PathBuf>,
+    /// The Codex model; empty = Codex's own default.
+    pub codex_model: String,
+    /// Where the Codex model is remembered (tests: `None`).
+    pub codex_model_file: Option<PathBuf>,
     /// Use this `claude` binary instead of looking for one (tests).
     pub cli_bin: Option<PathBuf>,
     /// Where the provider choice is remembered; `None` = not remembered (tests).
     pub provider_file: Option<PathBuf>,
+    /// Where the Claude model and the models added by hand are remembered (tests: `None`).
+    pub model_file: Option<PathBuf>,
+    /// Model ids the user typed that are not in the built-in list, newest first.
+    pub extra_models: Vec<String>,
     pub items: Vec<Item>,
     pub input: String,
     pub model: String,
@@ -408,6 +447,7 @@ pub struct Assistant {
     run: Option<Run>,
     agent: Option<Arc<Mutex<Box<dyn Backend>>>>,
     cli_rx: Option<std::sync::mpsc::Receiver<CliStatus>>,
+    codex_rx: Option<std::sync::mpsc::Receiver<CliStatus>>,
     agent_root: PathBuf,
     data: Arc<Mutex<HostData>>,
     stop: Arc<AtomicBool>,
@@ -426,8 +466,14 @@ impl Default for Assistant {
             show_settings: false,
             provider: Provider::default(),
             cli: CliState::default(),
+            codex: CliState::default(),
+            codex_bin: None,
+            codex_model: String::new(),
+            codex_model_file: None,
             cli_bin: None,
             provider_file: None,
+            model_file: None,
+            extra_models: Vec::new(),
             items: Vec::new(),
             input: String::new(),
             model: pascoda_ai::DEFAULT_MODEL.to_string(),
@@ -451,6 +497,7 @@ impl Default for Assistant {
             run: None,
             agent: None,
             cli_rx: None,
+            codex_rx: None,
             agent_root: PathBuf::new(),
             data: Arc::default(),
             stop: Arc::default(),
@@ -477,6 +524,21 @@ impl Assistant {
             Provider::OpenAi => self.openai_key.is_some() || !self.openai.needs_key(),
             Provider::ClaudeCode => matches!(&self.cli,
                 CliState::Found(s) if s.logged_in != Some(false)),
+            Provider::Codex => matches!(&self.codex,
+                CliState::Found(s) if s.logged_in != Some(false)),
+        }
+    }
+
+    /// False while the key (or the Claude Code check) has not been looked up yet, so the panel
+    /// shows nothing instead of a connect card that vanishes a moment later.
+    pub fn settled(&self) -> bool {
+        match self.provider {
+            Provider::Api => self.key != KeyState::Unchecked,
+            Provider::OpenAi => {
+                !self.openai.needs_key() || self.openai_key_state != KeyState::Unchecked
+            }
+            Provider::ClaudeCode => !matches!(self.cli, CliState::Unchecked | CliState::Checking),
+            Provider::Codex => !matches!(self.codex, CliState::Unchecked | CliState::Checking),
         }
     }
 
@@ -514,6 +576,7 @@ impl Assistant {
     pub fn current_model(&self) -> &str {
         match self.provider {
             Provider::OpenAi => &self.openai.model,
+            Provider::Codex => &self.codex_model,
             _ => &self.model,
         }
     }
@@ -570,6 +633,70 @@ impl Assistant {
     }
 
     /// Writes base URL and model (never the key) when a file is set.
+    /// `~/Library/Application Support/Pascoda/claude-models`.
+    pub fn claude_model_file() -> Option<PathBuf> {
+        let home = std::env::var_os("HOME")?;
+        Some(Path::new(&home).join("Library/Application Support/Pascoda/claude-models"))
+    }
+
+    /// Reads the file: the chosen model on the first line, the added models after it.
+    pub fn load_claude_models(&mut self, file: &Path) {
+        let Ok(text) = std::fs::read_to_string(file) else {
+            return;
+        };
+        let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+        if let Some(first) = lines.next() {
+            self.model = first.to_string();
+        }
+        self.extra_models = lines
+            .filter(|l| !is_builtin_model(l))
+            .map(String::from)
+            .take(MAX_EXTRA_MODELS)
+            .collect();
+    }
+
+    /// Saves the chosen Claude model and the added ones (not the key, not the OpenAI model).
+    pub fn persist_claude_model(&self) {
+        if let Some(f) = &self.model_file {
+            let mut text = format!("{}\n", self.model.trim());
+            for m in &self.extra_models {
+                text.push_str(m);
+                text.push('\n');
+            }
+            if let Some(dir) = f.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(f, text);
+        }
+    }
+
+    /// A model typed by hand that is not built in joins the dropdown (newest first).
+    pub fn remember_model(&mut self) {
+        let m = self.model.trim().to_string();
+        if m.is_empty() || is_builtin_model(&m) {
+            return;
+        }
+        self.extra_models.retain(|e| *e != m);
+        self.extra_models.insert(0, m);
+        self.extra_models.truncate(MAX_EXTRA_MODELS);
+        self.persist_claude_model();
+    }
+
+    /// `~/Library/Application Support/Pascoda/codex-model`.
+    pub fn codex_model_path() -> Option<PathBuf> {
+        let home = std::env::var_os("HOME")?;
+        Some(Path::new(&home).join("Library/Application Support/Pascoda/codex-model"))
+    }
+
+    pub fn persist_codex_model(&self) {
+        if let Some(f) = &self.codex_model_file {
+            if let Some(dir) = f.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(f, self.codex_model.trim());
+        }
+    }
+
     pub fn persist_openai(&self) {
         if let Some(f) = &self.openai_file {
             let _ = self.openai.save(f);
@@ -594,7 +721,45 @@ impl Assistant {
         });
     }
 
+    /// [`Assistant::refresh_cli`] for the `codex` program.
+    pub fn refresh_codex(&mut self, ctx: &egui::Context) {
+        let bin = self.codex_bin.clone().or_else(codex::locate);
+        let Some(bin) = bin else {
+            self.codex = CliState::Missing;
+            return;
+        };
+        self.codex = CliState::Checking;
+        let (tx, rx) = channel();
+        self.codex_rx = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(codex::check(&bin));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Looks again for whichever CLI is chosen.
+    pub fn refresh_chosen_cli(&mut self, ctx: &egui::Context) {
+        match self.provider {
+            Provider::Codex => self.refresh_codex(ctx),
+            _ => self.refresh_cli(ctx),
+        }
+    }
+
     fn poll_cli(&mut self) {
+        if let Some(rx) = &self.codex_rx {
+            match rx.try_recv() {
+                Ok(s) => {
+                    self.codex = CliState::Found(s);
+                    self.codex_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(_) => {
+                    self.codex = CliState::Missing;
+                    self.codex_rx = None;
+                }
+            }
+        }
         if let Some(rx) = &self.cli_rx {
             match rx.try_recv() {
                 Ok(s) => {
@@ -783,6 +948,13 @@ impl Assistant {
                     s.logged_in = Some(false);
                     self.agent = None;
                 }
+                if e == pascoda_ai::AiError::CodexNotLoggedIn
+                    && let CliState::Found(s) = &mut self.codex
+                {
+                    s.logged_in = Some(false);
+                    self.agent = None;
+                    self.show_settings = true;
+                }
                 if matches!(e, pascoda_ai::AiError::Auth(_)) {
                     self.key_message = Some(e.to_string());
                     if self.provider == Provider::OpenAi {
@@ -794,6 +966,7 @@ impl Assistant {
                     } else if self.provider == Provider::Api {
                         self.api_key = None;
                         self.key = KeyState::Missing;
+                        self.show_settings = true;
                     }
                     self.agent = None;
                 }
@@ -870,6 +1043,15 @@ fn tool_label(name: &str, input: &Value) -> String {
             "Search for {}",
             input.get("pattern").and_then(Value::as_str).unwrap_or("")
         ),
+        "shell" => {
+            let c = input.get("command").and_then(Value::as_str).unwrap_or("");
+            // Codex runs `/bin/zsh -lc "..."`; show what is inside.
+            let inner = c.split_once(" -lc ").map_or(c, |(_, rest)| {
+                rest.trim().trim_matches(|ch| ch == '"' || ch == '\'')
+            });
+            let one_line: String = inner.chars().take(80).collect();
+            format!("Run {one_line}")
+        }
         other => other.to_string(),
     }
 }
@@ -1166,6 +1348,14 @@ impl App {
         if user.is_empty() || self.assistant.streaming() || !self.assistant.ready() {
             return false;
         }
+        if matches!(
+            self.assistant.provider,
+            Provider::Api | Provider::ClaudeCode
+        ) && self.assistant.model.trim().is_empty()
+        {
+            self.assistant.model = pascoda_ai::DEFAULT_MODEL.to_string();
+        }
+        self.assistant.remember_model();
         if self.assistant.provider == Provider::OpenAi && self.assistant.openai.model.is_empty() {
             self.assistant.items.push(Item::Error(
                 "No model is set. Type the model name your endpoint serves into the Model field below the message box, then send again.".into(),
@@ -1234,6 +1424,16 @@ impl App {
                     );
                     Box::new(OpenAi::new(cfg, Box::new(host), sandbox))
                 }
+                Provider::Codex => {
+                    let bin = match (&a.codex_bin, &a.codex) {
+                        (Some(b), _) => b.clone(),
+                        (None, CliState::Found(s)) => s.binary.clone(),
+                        _ => return Err("Codex was not found.".into()),
+                    };
+                    let mut cfg = codex::Config::new(bin);
+                    cfg.model = a.codex_model.clone();
+                    Box::new(Codex::new(cfg, Box::new(host), sandbox))
+                }
                 Provider::ClaudeCode => {
                     let bin = match (&a.cli_bin, &a.cli) {
                         (Some(b), _) => b.clone(),
@@ -1294,6 +1494,12 @@ impl App {
             && self.assistant.cli == CliState::Unchecked
         {
             self.assistant.refresh_cli(ctx);
+        }
+        if self.assistant.open
+            && self.assistant.provider == Provider::Codex
+            && self.assistant.codex == CliState::Unchecked
+        {
+            self.assistant.refresh_codex(ctx);
         }
         if self.assistant.run.is_some() {
             self.refresh_host_data();
@@ -1935,6 +2141,20 @@ impl App {
             self.assistant.provider_file = Provider::file();
             if let Some(f) = &self.assistant.provider_file {
                 self.assistant.provider = Provider::load(f);
+            }
+        }
+        if self.assistant.open && self.assistant.model_file.is_none() {
+            self.assistant.model_file = Assistant::claude_model_file();
+            if let Some(f) = self.assistant.model_file.clone() {
+                self.assistant.load_claude_models(&f);
+            }
+        }
+        if self.assistant.open && self.assistant.codex_model_file.is_none() {
+            self.assistant.codex_model_file = Assistant::codex_model_path();
+            if let Some(f) = &self.assistant.codex_model_file {
+                self.assistant.codex_model = std::fs::read_to_string(f)
+                    .map(|t| t.trim().to_string())
+                    .unwrap_or_default();
             }
         }
         if self.assistant.open && self.assistant.openai_file.is_none() {

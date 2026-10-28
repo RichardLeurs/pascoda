@@ -2,15 +2,16 @@
 
 A modern Pascal IDE with coding agents for MacOS ARM | Pascal reimagined with AI
 
-A modern IDE for Pascal (MacOS ARM for now), written in Rust. It wraps the
-Free Pascal compiler and aims at a modern, macOS-native look and feel.
-Support coding agents (OpenAI API, Anthropics API, Claude Code for now).
+A modern IDE for Pascal (macOS ARM for now), written in Rust. It wraps the
+Free Pascal compiler and aims at apps with a macOS-native look and feel.
+Supports coding agents (OpenAI API and compatible, OpenAI Codex CLI, Claude Console API, Claude Code CLI for now).
+OpenAI Codex CLI and Claude Code CLI (and other CLI's) also run in the Pascoda terminal inside the IDE.
 
-> **Status: early work in progress.** 
+> ** Status: early work in progress. The Pascoda IDE app builds and runs Pascal code ** 
 
 ## Requirements
 
-You need an Apple Silicon Mac with macOS 14 or later (generated apps target 14.0; the IDE itself was developed on macOS 27).
+You need an Apple Silicon Mac with macOS 14 Sonoma or later (generated apps target 14.0; the IDE itself was developed on macOS 27).
 
 | Tool | Used for | Notes |
 |---|---|---|

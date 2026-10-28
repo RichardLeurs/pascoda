@@ -1,12 +1,15 @@
 unit mainunit;
 
 {$mode objfpc}{$H+}
-
+{$IFDEF DARWIN}
+{$modeswitch objectivec1}
+{$ENDIF}
+ 
 interface
 
 uses
   Classes, SysUtils, Forms, Controls, Graphics, Dialogs, Menus, StdCtrls,
-  ComCtrls, ExtCtrls, ActnList;
+  ComCtrls, ExtCtrls, ActnList, settingsunit;
 
 type
   TMainForm = class(TForm)
@@ -56,13 +59,14 @@ type
     FFileName: string;
     FDirty: Boolean;
     FLoading: Boolean;
+    FTheme: TThemeSetting;
     function ConfirmDiscard: Boolean;
     procedure LoadFile(const AFileName: string);
     procedure NewDocument;
     procedure SaveFile(const AFileName: string);
     procedure UpdateView;
   public
-    procedure ApplySettings(AWordWrap: Boolean; AFontSize: Integer);
+    procedure ApplySettings(AWordWrap: Boolean; AFontSize: Integer; ATheme: TThemeSetting);
   end;
 
 var
@@ -71,7 +75,10 @@ var
 implementation
 
 uses
-  LazUTF8, settingsunit, aboutunit;
+  LazUTF8, aboutunit
+  {$IFDEF DARWIN}
+  , CocoaAll, Cocoa_Extra
+  {$ENDIF};
 
 {$R *.lfm}
 
@@ -150,8 +157,29 @@ begin
     [CountWords(Memo1.Text), UTF8Length(Memo1.Text)]);
 end;
 
-procedure TMainForm.ApplySettings(AWordWrap: Boolean; AFontSize: Integer);
+procedure TMainForm.ApplySettings(AWordWrap: Boolean; AFontSize: Integer; ATheme: TThemeSetting);
+{$IFDEF DARWIN}
+var
+  AppearanceName: NSString;
+{$ENDIF}
 begin
+  FTheme := ATheme;
+  {$IFDEF DARWIN}
+  case ATheme of
+    tsSystem:
+      NSApplication.sharedApplication.setAppearance(nil);
+    tsLight:
+      begin
+        AppearanceName := NSString.stringWithUTF8String(PChar('NSAppearanceNameAqua'));
+        NSApplication.sharedApplication.setAppearance(NSAppearance.appearanceNamed(AppearanceName));
+      end;
+    tsDark:
+      begin
+        AppearanceName := NSString.stringWithUTF8String(PChar('NSAppearanceNameDarkAqua'));
+        NSApplication.sharedApplication.setAppearance(NSAppearance.appearanceNamed(AppearanceName));
+      end;
+  end;
+  {$ENDIF}
   Memo1.WordWrap := AWordWrap;
   Memo1.Font.Size := AFontSize;
 end;
@@ -240,9 +268,10 @@ end;
 
 procedure TMainForm.ToolsSettingsItemClick(Sender: TObject);
 begin
-  SettingsForm.LoadSettings(Memo1.WordWrap, Memo1.Font.Size);
+  SettingsForm.LoadSettings(Memo1.WordWrap, Memo1.Font.Size, FTheme);
   if SettingsForm.ShowModal = mrOk then
-    ApplySettings(SettingsForm.WordWrapSetting, SettingsForm.FontSizeSetting);
+    ApplySettings(SettingsForm.WordWrapSetting, SettingsForm.FontSizeSetting,
+      SettingsForm.ThemeSetting);
 end;
 
 end.

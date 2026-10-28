@@ -1,5 +1,7 @@
 //! Drives the Free Pascal compiler and parses its output into diagnostics.
 
+pub mod check;
+pub mod export;
 pub mod lcl;
 
 use std::path::{Path, PathBuf};
@@ -61,6 +63,30 @@ pub enum Mode {
 }
 
 impl Mode {
+    /// The word used in project settings and the status bar.
+    pub fn name(self) -> &'static str {
+        match self {
+            Mode::ObjFpc => "objfpc",
+            Mode::Delphi => "delphi",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Mode> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "objfpc" => Some(Mode::ObjFpc),
+            "delphi" => Some(Mode::Delphi),
+            _ => None,
+        }
+    }
+
+    /// Shown to the user.
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::ObjFpc => "ObjFPC",
+            Mode::Delphi => "Delphi",
+        }
+    }
+
     pub fn flag(self) -> &'static str {
         match self {
             Mode::ObjFpc => "-Mobjfpc",
@@ -138,6 +164,48 @@ fn progress_for(line: &str, done: &mut usize, plan: &Plan) -> Option<Progress> {
     })
 }
 
+/// Shown when no Free Pascal compiler can be found.
+pub const NOT_FOUND_HINT: &str = "Free Pascal (fpc) was not found. Install it with `brew install fpc` \
+(or from freepascal.org), then restart Pascoda.";
+
+/// Finds the `fpc` executable: `$PASCODA_FPC`, then `$PATH`, then the usual install folders.
+/// An app started from Finder has a minimal `PATH` without Homebrew, so the folders matter.
+pub fn locate_fpc() -> Option<PathBuf> {
+    find_fpc(
+        std::env::var_os("PASCODA_FPC").map(PathBuf::from),
+        std::env::var_os("PATH"),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+fn find_fpc(
+    forced: Option<PathBuf>,
+    path: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(p) = forced {
+        return p.is_file().then_some(p);
+    }
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(path) = path {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    dirs.extend(
+        [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/local/lib/fpc/bin",
+        ]
+        .map(PathBuf::from),
+    );
+    if let Some(home) = home {
+        dirs.push(home.join(".fpc/bin"));
+    }
+    dirs.into_iter()
+        .map(|d| d.join("fpc"))
+        .find(|p| p.is_file())
+}
+
 /// Compiles `source` with debug info. Runs fpc in the source's directory.
 pub fn build(source: &Path, mode: Mode) -> std::io::Result<BuildResult> {
     build_with(source, mode, &[])
@@ -179,6 +247,19 @@ pub(crate) fn build_streaming(
     plan: Plan,
     on: &mut dyn FnMut(Progress),
 ) -> std::io::Result<BuildResult> {
+    build_streaming_as(source, mode, extra, plan, false, on)
+}
+
+/// `release`: optimised and stripped, no debug info, and not re-signed for the debugger. The
+/// caller says where the program goes (`-FE`) through `extra`.
+pub(crate) fn build_streaming_as(
+    source: &Path,
+    mode: Mode,
+    extra: &[std::ffi::OsString],
+    plan: Plan,
+    release: bool,
+    on: &mut dyn FnMut(Progress),
+) -> std::io::Result<BuildResult> {
     use std::io::{BufRead, BufReader, Read};
     use std::process::Stdio;
     let dir = source
@@ -186,8 +267,14 @@ pub(crate) fn build_streaming(
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     let file = source.file_name().unwrap_or(source.as_os_str());
-    let mut child = Command::new("fpc")
-        .arg("-g")
+    let fpc = locate_fpc()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, NOT_FOUND_HINT))?;
+    let mut child = Command::new(fpc)
+        .args(if release {
+            &["-O2", "-Xs"][..]
+        } else {
+            &["-g"][..]
+        })
         .arg(mode.flag())
         .arg("-vewnhi")
         .args(extra)
@@ -221,7 +308,7 @@ pub(crate) fn build_streaming(
     let status = child.wait()?;
     let stderr_text = err_reader.join().unwrap_or_default();
     let mut raw_output = without_linker_noise(&format!("{stdout_text}{stderr_text}"));
-    if status.success() {
+    if status.success() && !release {
         on(Progress {
             label: "Signing".into(),
             fraction: Some(plan.at(0.98)),
@@ -380,5 +467,26 @@ mod tests {
         assert!(parse_line("ld: warning: -multiply_defined is obsolete").is_none());
         assert!(parse_line("-macosx_version_min has been renamed to -macos_version_min").is_none());
         assert!(parse_line("Compiling hello.pas").is_none());
+    }
+}
+
+#[cfg(test)]
+mod locate_tests {
+    use super::*;
+
+    #[test]
+    fn a_forced_path_wins_and_a_missing_one_means_not_found() {
+        let tmp = std::env::temp_dir().join(format!("pascoda-fpc-find-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let fake = tmp.join("fpc");
+        std::fs::write(&fake, "").unwrap();
+        assert_eq!(find_fpc(Some(fake.clone()), None, None), Some(fake.clone()));
+        assert_eq!(find_fpc(Some(tmp.join("nope")), None, None), None);
+        // searched through PATH next
+        assert_eq!(
+            find_fpc(None, Some(tmp.clone().into_os_string()), None),
+            Some(fake)
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

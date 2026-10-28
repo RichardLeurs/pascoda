@@ -344,6 +344,43 @@ pub fn icon_button(
 }
 
 /// The rounded group Xcode puts around related toolbar buttons.
+/// A modal-looking dialog in the app's own colours (no system-grey title bar): rounded, with a
+/// soft shadow. `title`, when given, is the bold first line. Centred over the window.
+pub fn dialog<R>(
+    ctx: &egui::Context,
+    id: &str,
+    title: Option<&str>,
+    width: f32,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) {
+    let pal = Palette::of(ctx);
+    let frame = egui::Frame::new()
+        .fill(pal.chrome)
+        .stroke(Stroke::new(1.0, pal.separator))
+        .corner_radius(10)
+        .inner_margin(egui::Margin::same(18))
+        .shadow(egui::epaint::Shadow {
+            offset: [0, 8],
+            blur: 28,
+            spread: 0,
+            color: Color32::from_black_alpha(if pal.dark { 140 } else { 55 }),
+        });
+    egui::Window::new(title.unwrap_or(id))
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
+        .frame(frame)
+        .show(ctx, |ui| {
+            ui.set_width(width);
+            if let Some(t) = title {
+                ui.label(egui::RichText::new(t).size(15.0).strong().color(pal.text));
+                ui.add_space(10.0);
+            }
+            add(ui)
+        });
+}
+
 pub fn pill<R>(ui: &mut egui::Ui, pal: &Palette, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::new()
         .fill(pal.chrome)

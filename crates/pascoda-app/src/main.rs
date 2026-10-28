@@ -4,10 +4,12 @@ mod bottom;
 mod chrome;
 mod debugger;
 mod designer;
+mod export_dialog;
 mod external;
 mod highlight;
 mod hints;
 mod icons;
+mod livecheck;
 mod lsp;
 mod migrate;
 mod shell;
@@ -55,6 +57,15 @@ struct App {
     /// Progress messages of the build in flight, the latest one, and how many units each
     /// program compiled last time (sizes the next bar).
     build_progress_rx: Option<Receiver<pascoda_fpc::Progress>>,
+    /// An export (release build + `.app` + `.dmg`) in progress.
+    exporting: Option<Exporting>,
+    /// The program of the export in progress (keys its unit count).
+    export_source: PathBuf,
+    /// A question about unsaved changes that is waiting for an answer.
+    confirm: Option<Confirm>,
+    /// The user chose to quit despite (or after saving) unsaved changes.
+    quit_confirmed: bool,
+    export_dialog: Option<export_dialog::ExportDialog>,
     build_progress: Option<pascoda_fpc::Progress>,
     unit_counts: std::collections::HashMap<PathBuf, usize>,
     build_source: PathBuf,
@@ -83,6 +94,10 @@ struct App {
     hover: hints::Hover,
     /// Diagnostics of the last build placed in the open files; dropped when a file changes.
     marks: Vec<hints::FileMarks>,
+    live: livecheck::LiveCheck,
+    /// The project's language mode (`pascoda.toml` in `mode_root`).
+    mode: pascoda_fpc::Mode,
+    mode_root: PathBuf,
     /// Open files' text as the last build started, to place `marks`.
     build_texts: Vec<(PathBuf, String)>,
     designers: Vec<designer::Designer>,
@@ -153,6 +168,11 @@ impl App {
             console: String::new(),
             building: None,
             build_progress_rx: None,
+            exporting: None,
+            export_source: PathBuf::new(),
+            confirm: None,
+            quit_confirmed: false,
+            export_dialog: None,
             build_progress: None,
             unit_counts: Default::default(),
             build_source: PathBuf::new(),
@@ -173,6 +193,9 @@ impl App {
             typing: Default::default(),
             hover: Default::default(),
             marks: Vec::new(),
+            live: Default::default(),
+            mode: Default::default(),
+            mode_root: PathBuf::new(),
             build_texts: Vec::new(),
             designers: Vec::new(),
             form_view: false,
@@ -201,6 +224,11 @@ impl App {
         let mut app = Self::bare(path);
         app.menu = NativeMenu::install(ctx);
         app.start_watching(ctx);
+        app.live.enabled = true;
+        if pascoda_fpc::locate_fpc().is_none() {
+            app.console = format!("{}\n", pascoda_fpc::NOT_FOUND_HINT);
+            app.auto_tab(ctx, bottom::BottomTab::Output);
+        }
         app.selftest = std::env::var_os("PASCODA_SELFTEST").map(|d| SelfTest {
             dir: d.into(),
             frame: 0,
@@ -268,8 +296,40 @@ impl App {
         }
     }
 
+    /// Has tab `i` (or the form of its unit) unsaved changes?
+    fn is_dirty(&self, i: usize) -> bool {
+        self.docs.get(i).is_some_and(|d| {
+            d.dirty()
+                || self
+                    .designers
+                    .iter()
+                    .any(|f| f.pas_path == d.path && f.dirty())
+        })
+    }
+
+    /// The close button of a tab: closes at once, or asks first when there are unsaved changes.
+    fn request_close(&mut self, i: usize) {
+        match self.docs.get(i).map(|d| d.path.clone()) {
+            Some(path) if self.is_dirty(i) => self.confirm = Some(Confirm::Tab(path)),
+            Some(_) => self.close_doc(i),
+            None => {}
+        }
+    }
+
+    /// Closes tab `i` without saving it: its form edits are dropped too.
+    fn discard_doc(&mut self, i: usize) {
+        if let Some(path) = self.docs.get(i).map(|d| d.path.clone()) {
+            self.designers.retain(|f| f.pas_path != path);
+        }
+        self.remove_doc(i);
+    }
+
     fn close_doc(&mut self, i: usize) {
         self.save_doc_form(i);
+        self.remove_doc(i);
+    }
+
+    fn remove_doc(&mut self, i: usize) {
         self.docs.remove(i);
         self.active = self.active.min(self.docs.len().saturating_sub(1));
         if !self.active_is_unit_with_form() {
@@ -395,6 +455,8 @@ impl App {
         let Some(path) = self.docs.get(self.active).map(|d| program_for(&d.path)) else {
             return;
         };
+        self.sync_mode();
+        let mode = self.mode;
         self.save_all();
         self.build_texts = self
             .docs
@@ -419,7 +481,6 @@ impl App {
                 let _ = ptx.send(p);
                 repaint.request_repaint();
             };
-            let mode = pascoda_fpc::Mode::default();
             let built = if gui {
                 match pascoda_fpc::lcl::Lcl::find(&path) {
                     Some(lcl) => {
@@ -481,6 +542,347 @@ impl App {
             self.diagnostics = result.diagnostics.clone();
             self.building = None;
             self.assistant_build_done(&result);
+        }
+    }
+
+    /// Live check of the active file: after a pause in typing, `fpc` checks its current text and
+    /// the result becomes squiggles (the same marks a build makes).
+    /// Opens the export dialog for the active program; its "Export..." button asks for the
+    /// folder and starts the export.
+    fn start_export(&mut self) {
+        if self.exporting.is_some() || self.building.is_some() || self.session.is_some() {
+            return;
+        }
+        let Some(path) = self.docs.get(self.active).map(|d| program_for(&d.path)) else {
+            return;
+        };
+        self.sync_mode();
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Program".into());
+        self.export_dialog = Some(export_dialog::ExportDialog::new(
+            pascoda_project::load_export(&self.root),
+            &name,
+            is_gui_program(&path),
+        ));
+    }
+
+    /// The window close button and Quit: with unsaved changes the user is asked first.
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.quit_confirmed
+            && (0..self.docs.len()).any(|i| self.is_dirty(i))
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm = Some(Confirm::Quit);
+        }
+    }
+
+    /// The "save changes?" question: Save, Don't Save or Cancel.
+    fn show_confirm(&mut self, ctx: &egui::Context) {
+        let Some(what) = self.confirm.clone() else {
+            return;
+        };
+        let (title, detail, save_label, discard_label) = match &what {
+            Confirm::Tab(path) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                (
+                    format!("Save changes to \u{201C}{name}\u{201D}?"),
+                    "Your changes will be lost if you don't save them.".to_string(),
+                    "Save",
+                    "Don't Save",
+                )
+            }
+            Confirm::Quit => {
+                let n = (0..self.docs.len()).filter(|&i| self.is_dirty(i)).count();
+                (
+                    format!(
+                        "You have {n} file{} with unsaved changes. Do you want to save {}?",
+                        if n == 1 { "" } else { "s" },
+                        if n == 1 { "it" } else { "them" }
+                    ),
+                    "Your changes will be lost if you don't save them.".to_string(),
+                    "Save All",
+                    "Don't Save",
+                )
+            }
+        };
+        enum Answer {
+            Save,
+            Discard,
+            Cancel,
+        }
+        let mut answer = None;
+        style::dialog(ctx, "confirm-dialog", None, 380.0, |ui| {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(title).strong().size(14.0));
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(detail).weak());
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui.button(discard_label).clicked() {
+                    answer = Some(Answer::Discard);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button(save_label).clicked() {
+                        answer = Some(Answer::Save);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        answer = Some(Answer::Cancel);
+                    }
+                });
+            });
+        });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            answer = Some(Answer::Cancel);
+        } else if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+            answer = Some(Answer::Save);
+        }
+        let Some(answer) = answer else {
+            return;
+        };
+        self.confirm = None;
+        match (what, answer) {
+            (_, Answer::Cancel) => {}
+            (Confirm::Tab(path), a) => {
+                if let Some(i) = self.docs.iter().position(|d| d.path == path) {
+                    match a {
+                        Answer::Save => {
+                            self.save_doc(i);
+                            self.close_doc(i);
+                        }
+                        _ => self.discard_doc(i),
+                    }
+                }
+            }
+            (Confirm::Quit, a) => {
+                if matches!(a, Answer::Save) {
+                    self.save_all();
+                }
+                self.quit_confirmed = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    /// Draws the dialog while it is open and acts on its answer.
+    fn show_export_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &mut self.export_dialog else {
+            return;
+        };
+        match dialog.show(ctx, &self.root) {
+            None => {}
+            Some(export_dialog::Answer::Cancel) => self.export_dialog = None,
+            Some(export_dialog::Answer::Export(name, info)) => {
+                let start = self.docs.get(self.active).map(|d| program_for(&d.path));
+                // A Save panel: the name is the file name of the disk image (the app beside it
+                // gets the same name), the folder is where both are written.
+                let dir = start
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .unwrap_or(Path::new("."));
+                let suggested = format!("{}.dmg", pascoda_fpc::export::clean_name(&name));
+                let Some(chosen) = rfd::FileDialog::new()
+                    .set_title("Export Application")
+                    .set_directory(dir)
+                    .set_file_name(suggested)
+                    .add_filter("Disk image", &["dmg"])
+                    .save_file()
+                else {
+                    return; // the dialog stays open
+                };
+                let Some((out, name)) = export_target(&chosen, &name) else {
+                    return;
+                };
+                if let Some(d) = self.export_dialog.take() {
+                    if let Err(e) = pascoda_project::save_export(&self.root, &d.settings) {
+                        self.console = format!("Could not save the export settings: {e}\n");
+                    }
+                }
+                self.export_to(ctx, out, name, info);
+            }
+        }
+    }
+
+    /// The export itself, into `out`.
+    fn export_to(
+        &mut self,
+        ctx: &egui::Context,
+        out: PathBuf,
+        name: String,
+        info: pascoda_fpc::lcl::BundleInfo,
+    ) {
+        let Some(path) = self.docs.get(self.active).map(|d| program_for(&d.path)) else {
+            return;
+        };
+        self.save_all();
+        self.sync_mode();
+        let mode = self.mode;
+        // how many units the last export of this program compiled: sizes the bar
+        let total = self.unit_counts.get(&export_key(&path)).copied();
+        self.export_source = path.clone();
+        self.console = format!("Exporting {name}...\n");
+        self.auto_tab(ctx, bottom::BottomTab::Output);
+        let (tx, rx) = channel();
+        let (ptx, prx) = channel();
+        self.build_progress = None;
+        self.build_progress_rx = Some(prx);
+        let repaint = ctx.clone();
+        let out_dir = out.clone();
+        std::thread::spawn(move || {
+            let mut on = move |p: pascoda_fpc::Progress| {
+                let _ = ptx.send(p);
+                repaint.request_repaint();
+            };
+            let lcl = if is_gui_program(&path) {
+                pascoda_fpc::lcl::Lcl::find(&path)
+            } else {
+                None
+            };
+            let r = if is_gui_program(&path) && lcl.is_none() {
+                Err(std::io::Error::other(
+                    "vendor/lazarus not found (needed for GUI programs)",
+                ))
+            } else {
+                pascoda_fpc::export::export(
+                    &path,
+                    mode,
+                    lcl.as_ref(),
+                    &out_dir,
+                    &name,
+                    &info,
+                    true,
+                    total,
+                    &mut on,
+                )
+            };
+            let _ = tx.send(r);
+        });
+        self.exporting = Some(Exporting { rx, out });
+    }
+
+    fn poll_export(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.exporting else { return };
+        if let Some(prx) = &self.build_progress_rx {
+            while let Ok(p) = prx.try_recv() {
+                self.build_progress = Some(p);
+            }
+        }
+        let Ok(result) = job.rx.try_recv() else {
+            return;
+        };
+        let out = job.out.clone();
+        self.exporting = None;
+        if matches!(&result, Ok(d) if d.build.success)
+            && let Some(p) = self.build_progress.as_ref().filter(|p| p.done > 0)
+        {
+            self.unit_counts
+                .insert(export_key(&self.export_source), p.done);
+        }
+        self.build_progress = None;
+        self.build_progress_rx = None;
+        match result {
+            Ok(done) if done.build.success => {
+                self.console = done.build.raw_output.clone();
+                for p in done.product.iter().chain(done.dmg.iter()) {
+                    self.console
+                        .push_str(&format!("\nExported {}", p.display()));
+                }
+                self.console.push('\n');
+                self.diagnostics = done.build.diagnostics;
+                // Show the result in Finder (not from tests).
+                #[cfg(not(test))]
+                {
+                    let shown = done.dmg.or(done.product);
+                    let mut open = std::process::Command::new("open");
+                    match shown {
+                        Some(p) => open.arg("-R").arg(p),
+                        None => open.arg(&out),
+                    };
+                    let _ = open.spawn();
+                }
+                #[cfg(test)]
+                let _ = &out;
+            }
+            Ok(done) => {
+                self.console = format!("{}\nExport failed.\n", done.build.raw_output);
+                self.diagnostics = done.build.diagnostics;
+                self.auto_tab(ctx, bottom::BottomTab::Problems);
+            }
+            Err(e) => {
+                self.console = format!("Export failed: {e}\n");
+            }
+        }
+    }
+
+    /// The Problems list shows the live result for `path` in place of what an earlier build or
+    /// check said about that file; other files' entries stay.
+    fn merge_live_problems(&mut self, path: &Path, live: &[Diagnostic]) {
+        let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let this = canon(path);
+        let dir = self.build_dir.clone();
+        self.diagnostics
+            .retain(|d| canon(&dir.join(&d.file)) != this);
+        self.diagnostics.extend(live.iter().cloned());
+    }
+
+    /// Re-reads the language mode when the project folder changed.
+    fn sync_mode(&mut self) {
+        if self.mode_root != self.root {
+            self.mode_root = self.root.clone();
+            self.mode = pascoda_project::load_mode(&self.root);
+        }
+    }
+
+    /// Sets the project's language mode, saves it and re-checks the open file.
+    fn set_mode(&mut self, mode: pascoda_fpc::Mode) {
+        self.sync_mode();
+        if mode == self.mode {
+            return;
+        }
+        self.mode = mode;
+        if let Err(e) = pascoda_project::save_mode(&self.root, mode) {
+            self.console = format!("Could not save the language mode: {e}\n");
+        }
+        self.live.forget();
+    }
+
+    fn poll_live_check(&mut self, ctx: &egui::Context) {
+        self.sync_mode();
+        if !self.live.enabled {
+            return;
+        }
+        if let Some(done) = self.live.poll() {
+            // Errors (no fpc, timeout) are silent: the build reports them properly.
+            if let Ok(diags) = done.result {
+                self.merge_live_problems(&done.path, &diags);
+                self.marks.retain(|m| m.path != done.path);
+                self.marks
+                    .extend(livecheck::marks(&done.path, &done.text, &diags));
+            }
+        }
+        if self.live.busy() || self.building.is_some() {
+            return;
+        }
+        let Some(doc) = self.docs.get(self.active) else {
+            return;
+        };
+        if !pascoda_fpc::check::checkable(&doc.path) {
+            return;
+        }
+        if self
+            .live
+            .due(&doc.path, &doc.text, std::time::Instant::now())
+        {
+            let (path, text) = (doc.path.clone(), doc.text.clone());
+            self.live.start(ctx, path, text, self.mode);
+        } else {
+            // Come back when the pause is over, even if nothing else repaints.
+            ctx.request_repaint_after(livecheck::QUIET);
         }
     }
 
@@ -1155,6 +1557,24 @@ impl App {
 
 /// When `path` is a unit and its folder holds exactly one program file, that program is what
 /// Build & Run should compile.
+/// Where and under which name an export goes, from the path chosen in the Save panel: its folder,
+/// and its file name without `.dmg` (`fallback` when that is empty).
+fn export_target(chosen: &Path, fallback: &str) -> Option<(PathBuf, String)> {
+    let dir = chosen.parent().filter(|d| !d.as_os_str().is_empty())?;
+    let stem = chosen
+        .file_stem()
+        .map(|s| s.to_string_lossy().trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| fallback.to_string());
+    Some((dir.to_path_buf(), stem))
+}
+
+/// Key of an export's unit count: a release build compiles every unit from scratch, so its
+/// count differs from the (cached) debug builds of the same program.
+fn export_key(program: &Path) -> PathBuf {
+    program.with_extension("export")
+}
+
 fn program_for(path: &Path) -> PathBuf {
     let is_unit = path
         .extension()
@@ -1229,9 +1649,26 @@ struct NativeMenu {
     save: muda::MenuId,
     run: muda::MenuId,
     debug: muda::MenuId,
+    export: muda::MenuId,
+    quit: muda::MenuId,
     edit: Vec<(muda::MenuItem, EditCmd)>,
     appearance: Vec<(muda::CheckMenuItem, theme::Appearance)>,
     events: Receiver<muda::MenuId>,
+}
+
+/// What the unsaved-changes question is about.
+#[derive(Clone, PartialEq)]
+enum Confirm {
+    /// Closing the tab of this file.
+    Tab(PathBuf),
+    /// Quitting Pascoda.
+    Quit,
+}
+
+/// An export running on a worker thread, and where it writes.
+struct Exporting {
+    rx: Receiver<std::io::Result<pascoda_fpc::export::Exported>>,
+    out: PathBuf,
 }
 
 #[derive(Clone, Copy)]
@@ -1244,6 +1681,8 @@ enum MenuAction {
     Save,
     Run,
     Debug,
+    Export,
+    Quit,
     Appearance(theme::Appearance),
     Edit(EditCmd),
 }
@@ -1364,6 +1803,8 @@ impl NativeMenu {
             edit_menu.append(item).ok()?;
         }
         let menu = Menu::new();
+        // Not the system's Quit: that ends the process without asking about unsaved changes.
+        let quit = MenuItem::new("Quit Pascoda", true, cmd(Code::KeyQ));
         let app = Submenu::with_items(
             "Pascoda",
             true,
@@ -1373,12 +1814,25 @@ impl NativeMenu {
                 &PredefinedMenuItem::hide(None),
                 &PredefinedMenuItem::hide_others(None),
                 &PredefinedMenuItem::separator(),
-                &PredefinedMenuItem::quit(None),
+                &quit,
             ],
         )
         .ok()?;
         let file = Submenu::with_items("File", true, &[&new_gui, &open, &save]).ok()?;
-        let build = Submenu::with_items("Build", true, &[&run, &debug]).ok()?;
+        let export = MenuItem::new(
+            "Export Application...",
+            true,
+            Some(Accelerator::new(
+                Modifiers::META | Modifiers::SHIFT,
+                Code::KeyE,
+            )),
+        );
+        let build = Submenu::with_items(
+            "Build",
+            true,
+            &[&run, &debug, &PredefinedMenuItem::separator(), &export],
+        )
+        .ok()?;
         let current = theme::Appearance::load();
         let appearance: Vec<_> = theme::Appearance::ALL
             .into_iter()
@@ -1414,6 +1868,8 @@ impl NativeMenu {
             save: save.id().clone(),
             run: run.id().clone(),
             debug: debug.id().clone(),
+            export: export.id().clone(),
+            quit: quit.id().clone(),
             edit,
             appearance,
             events,
@@ -1438,6 +1894,8 @@ impl NativeMenu {
                     (&self.save, MenuAction::Save),
                     (&self.run, MenuAction::Run),
                     (&self.debug, MenuAction::Debug),
+                    (&self.export, MenuAction::Export),
+                    (&self.quit, MenuAction::Quit),
                 ]
                 .into_iter()
                 .find(|(i, _)| **i == id)
@@ -1580,6 +2038,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
+            // navigator 250 + inspector 200 + a usable centre; smaller squeezes the panels over each other
+            .with_min_inner_size([860.0, 520.0])
             .with_fullsize_content_view(true)
             .with_titlebar_shown(false)
             .with_title_shown(false),
@@ -1804,6 +2264,209 @@ mod tests {
         let mut app = App::bare(None);
         app.completion = Some(popup(true));
         assert_eq!(press(&mut app, egui::Key::Enter), Some(0));
+    }
+
+    #[test]
+    fn the_language_mode_is_saved_per_project_and_follows_the_folder() {
+        let a = crate::target_tmp().join("mode-a");
+        let b = crate::target_tmp().join("mode-b");
+        for d in [&a, &b] {
+            let _ = std::fs::remove_dir_all(d);
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let mut app = App::bare(None);
+        app.root = a.clone();
+        app.set_mode(pascoda_fpc::Mode::Delphi);
+        assert_eq!(app.mode, pascoda_fpc::Mode::Delphi);
+        assert!(
+            std::fs::read_to_string(a.join("pascoda.toml"))
+                .unwrap()
+                .contains("delphi")
+        );
+        // another project starts in the default mode, and coming back finds the saved one
+        app.root = b.clone();
+        app.sync_mode();
+        assert_eq!(app.mode, pascoda_fpc::Mode::ObjFpc);
+        assert!(
+            !b.join("pascoda.toml").exists(),
+            "nothing is written until a change"
+        );
+        app.root = a;
+        app.sync_mode();
+        assert_eq!(app.mode, pascoda_fpc::Mode::Delphi);
+    }
+
+    #[test]
+    fn exporting_writes_the_executable_and_dmg_and_reports_errors() {
+        if pascoda_fpc::locate_fpc().is_none() {
+            return;
+        }
+        let dir = crate::target_tmp().join("export-app");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("tool.pas");
+        std::fs::write(&good, "program tool;\nbegin\n  WriteLn('hi');\nend.\n").unwrap();
+        let out = dir.join("out");
+        let ctx = egui::Context::default();
+        let wait = |app: &mut App| {
+            let t = std::time::Instant::now();
+            while app.exporting.is_some() && t.elapsed() < std::time::Duration::from_secs(60) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                app.poll_export(&ctx);
+            }
+            assert!(app.exporting.is_none(), "the export finished");
+        };
+        let mut app = App::bare(Some(good.clone()));
+        app.export_to(&ctx, out.clone(), "tool".into(), Default::default());
+        assert!(app.exporting.is_some());
+        wait(&mut app);
+        assert!(out.join("tool").is_file() && out.join("tool.dmg").is_file());
+        // the next export of this program knows how many units to expect (a determinate bar)
+        assert!(
+            app.unit_counts
+                .contains_key(&export_key(&program_for(&good))),
+            "{:?}",
+            app.unit_counts
+        );
+        assert!(app.console.contains("Exported"), "{}", app.console);
+        assert!(
+            app.diagnostics
+                .iter()
+                .all(|d| d.severity != Severity::Error)
+        );
+        // a program that does not compile
+        std::fs::write(&good, "program tool;\nbegin\n  nope;\nend.\n").unwrap();
+        let mut app = App::bare(Some(good));
+        let out2 = dir.join("out2");
+        app.export_to(&ctx, out2.clone(), "tool".into(), Default::default());
+        wait(&mut app);
+        assert!(app.console.contains("Export failed"), "{}", app.console);
+        assert!(!app.diagnostics.is_empty());
+        assert!(!out2.join("tool.dmg").exists());
+    }
+
+    #[test]
+    fn closing_a_changed_tab_asks_and_only_saves_when_told_to() {
+        let dir = crate::target_tmp().join("close-tab");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("c.pas");
+        std::fs::write(&file, "program c;\nbegin end.\n").unwrap();
+        let ctx = egui::Context::default();
+        let open = |text: &str| {
+            let mut app = App::bare(Some(file.clone()));
+            app.docs[0].text = text.to_string();
+            app
+        };
+        // a clean tab closes at once
+        let mut app = open("program c;\nbegin end.\n");
+        app.request_close(0);
+        assert!(app.docs.is_empty() && app.confirm.is_none());
+        // a changed tab asks first and stays open
+        let mut app = open("program c; // changed\nbegin end.\n");
+        app.request_close(0);
+        assert_eq!(app.docs.len(), 1);
+        assert!(matches!(&app.confirm, Some(Confirm::Tab(p)) if *p == app.docs[0].path));
+        // Cancel: nothing happens (drive the dialog's answer through the same code path)
+        app.confirm = None;
+        assert_eq!(app.docs.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "program c;\nbegin end.\n"
+        );
+        // Don't Save: the tab closes, the file stays as it was
+        app.discard_doc(0);
+        assert!(app.docs.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "program c;\nbegin end.\n"
+        );
+        // Save: the file is written, then the tab closes
+        let mut app = open("program c; // changed\nbegin end.\n");
+        app.save_doc(0);
+        app.close_doc(0);
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("// changed")
+        );
+        let _ = ctx;
+    }
+
+    #[test]
+    fn quitting_with_unsaved_changes_asks_first() {
+        let dir = crate::target_tmp().join("quit-ask");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("q.pas");
+        std::fs::write(&file, "program q;\nbegin end.\n").unwrap();
+        let mut app = App::bare(Some(file));
+        assert!(!(0..app.docs.len()).any(|i| app.is_dirty(i)));
+        app.docs[0].text.push_str("// typed\n");
+        assert!((0..app.docs.len()).any(|i| app.is_dirty(i)));
+    }
+
+    #[test]
+    fn the_save_panel_gives_the_folder_and_the_name_of_the_export() {
+        let (dir, name) = export_target(Path::new("/Users/me/Out/My App.dmg"), "x").unwrap();
+        assert_eq!(
+            (dir, name.as_str()),
+            (PathBuf::from("/Users/me/Out"), "My App")
+        );
+        // typing another name changes the name of both files
+        let (_, name) = export_target(Path::new("/o/Other.dmg"), "x").unwrap();
+        assert_eq!(name, "Other");
+        // no extension typed: still the name
+        let (_, name) = export_target(Path::new("/o/Plain"), "x").unwrap();
+        assert_eq!(name, "Plain");
+        assert!(export_target(Path::new("justname.dmg"), "x").is_none());
+    }
+
+    #[test]
+    fn typing_an_error_gets_a_squiggle_after_a_pause_without_touching_the_file() {
+        if pascoda_fpc::locate_fpc().is_none() {
+            return;
+        }
+        let dir = crate::target_tmp().join("live");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("l.pas");
+        let on_disk = "program l;\nbegin\nend.\n";
+        std::fs::write(&file, on_disk).unwrap();
+        let mut app = App::bare(Some(file.clone()));
+        app.live.enabled = true;
+        let ctx = egui::Context::default();
+        app.docs[0].text = "program l;\nbegin\n  nope;\nend.\n".into();
+        app.poll_live_check(&ctx); // starts the quiet period
+        assert!(!app.live.busy(), "not before the pause");
+        std::thread::sleep(livecheck::QUIET + std::time::Duration::from_millis(100));
+        app.poll_live_check(&ctx);
+        assert!(app.live.busy());
+        let t = std::time::Instant::now();
+        while app.marks.is_empty() && t.elapsed() < std::time::Duration::from_secs(20) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            app.poll_live_check(&ctx);
+        }
+        let m = &app.marks[0].items[0];
+        assert_eq!(m.line, 2);
+        assert!(m.message.contains("nope"), "{}", m.message);
+        // the same finding is in the Problems list, once, and fixing the text clears it
+        assert_eq!(app.diagnostics.len(), 1, "{:?}", app.diagnostics);
+        assert_eq!(app.diagnostics[0].line, 3);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), on_disk);
+        // the same text is not checked again
+        std::thread::sleep(livecheck::QUIET + std::time::Duration::from_millis(100));
+        app.poll_live_check(&ctx);
+        assert!(!app.live.busy());
+        // fixing the text clears the squiggle and the Problems entry
+        app.docs[0].text = on_disk.into();
+        app.poll_live_check(&ctx);
+        std::thread::sleep(livecheck::QUIET + std::time::Duration::from_millis(100));
+        app.poll_live_check(&ctx);
+        let t = std::time::Instant::now();
+        while app.live.busy() && t.elapsed() < std::time::Duration::from_secs(20) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            app.poll_live_check(&ctx);
+        }
+        assert!(app.diagnostics.is_empty() && app.marks.is_empty());
     }
 
     #[test]

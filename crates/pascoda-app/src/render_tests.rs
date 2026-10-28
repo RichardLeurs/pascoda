@@ -389,6 +389,18 @@ fn renders_the_menu_editor() {
     let a = render(menu_app(), false, (1368.0, 1000.0), "ui-menu-editor");
     let b = render(menu_app(), true, (1368.0, 1000.0), "ui-menu-editor-dark");
     println!("{}\n{}", a.display(), b.display());
+    // a narrower window: the editor must stay inside its area, clear of the inspector
+    render(menu_app(), false, (1100.0, 800.0), "ui-menu-editor-narrow");
+    for (w, assistant) in [(900.0, false), (1368.0, true), (1100.0, true)] {
+        let mut app = menu_app();
+        app.assistant.open = assistant;
+        render(
+            app,
+            false,
+            (w, 800.0),
+            &format!("ui-menu-editor-w{w}-{assistant}"),
+        );
+    }
 }
 
 /// The editor's buttons reach the designer: Add Item, Add Sub-item, Indent, Done.
@@ -899,6 +911,7 @@ fn the_provider_switch_changes_the_card() {
     app.assistant.key = assistant::KeyState::Missing;
     // The CLI check is not started here: a state with a result already.
     app.assistant.cli = assistant::CliState::Missing;
+    app.assistant.show_settings = true;
     let mut harness = Harness::builder()
         .with_size(egui::vec2(1368.0, 800.0))
         .with_pixels_per_point(1.0)
@@ -906,7 +919,7 @@ fn the_provider_switch_changes_the_card() {
         .build_ui_state(|ui, app: &mut App| app.draw(ui, None), app);
     harness.run_steps(2);
     assert_eq!(harness.state().assistant.provider, assistant::Provider::Api);
-    harness.get_by_label("Claude Code (subscription)").click();
+    harness.get_by_label("Claude Code CLI").click();
     harness.run_steps(3);
     assert_eq!(
         harness.state().assistant.provider,
@@ -915,7 +928,7 @@ fn the_provider_switch_changes_the_card() {
     // the CLI card is up: it says so and the key field is gone
     assert!(harness.query_by_label("Check again").is_some());
     assert!(harness.query_by_label("API key").is_none());
-    harness.get_by_label("Anthropic API key").click();
+    harness.get_by_label("Claude Console API").click();
     harness.run_steps(3);
     assert_eq!(harness.state().assistant.provider, assistant::Provider::Api);
     assert!(harness.query_by_label("API key").is_some());
@@ -998,13 +1011,14 @@ fn the_openai_card_takes_a_local_endpoint() {
     app.assistant.open = true;
     app.assistant.key = assistant::KeyState::Missing;
     app.assistant.openai_key_state = assistant::KeyState::Missing; // never read the real Keychain
+    app.assistant.show_settings = true;
     let mut harness = Harness::builder()
         .with_size(egui::vec2(1368.0, 900.0))
         .with_pixels_per_point(1.0)
         .with_context_setup(theme::apply)
         .build_ui_state(|ui, app: &mut App| app.draw(ui, None), app);
     harness.run_steps(2);
-    harness.get_by_label("OpenAI API key").click();
+    harness.get_by_label("OpenAI API").click();
     harness.run_steps(3);
     assert_eq!(
         harness.state().assistant.provider,
@@ -1039,8 +1053,11 @@ fn the_openai_card_takes_a_local_endpoint() {
     let a = &harness.state().assistant;
     assert!(a.ready(), "a local server needs no key");
     assert_eq!(a.openai.model, "llama3.1");
-    // the chat is up with the model field and the neutral placeholder; the settings stay open
-    // (only the gear closes them), so the Model label is there twice
+    // the settings page stays open (only the gear closes it); after that the chat is up with
+    // the model field and the neutral placeholder
+    assert!(harness.state().assistant.show_settings);
+    harness.state_mut().assistant.show_settings = false;
+    harness.run_steps(2);
     assert!(harness.query_all_by_label("Model").next().is_some());
     assert!(harness.query_by_label("Message").is_some());
 }
@@ -1187,15 +1204,10 @@ fn the_edit_switch_and_the_save_first_button_work_with_clicks() {
         .build_ui_state(|ui, app: &mut App| app.draw(ui, None), app);
     harness.run_steps(2);
     assert!(!harness.state().assistant.auto_edits);
-    assert!(
-        harness
-            .query_by_label("Edits applied automatically")
-            .is_none()
-    );
     harness.get_by_label("Allow edits this session").click();
     harness.run_steps(3);
     assert!(harness.state().assistant.auto_edits);
-    harness.get_by_label("Edits applied automatically").click();
+    harness.get_by_label("Allow edits this session").click();
     harness.run_steps(3);
     assert!(!harness.state().assistant.auto_edits);
     // the dirty file: "Save and apply" saves the tab, then answers
@@ -1482,4 +1494,200 @@ fn the_terminal_wheel_scrolls_the_history() {
     image
         .save(out_dir().join("ui-terminal-scrollbar.png"))
         .unwrap();
+}
+
+// ---- the export dialog ---------------------------------------------------------------------
+
+#[test]
+fn renders_and_drives_the_export_dialog() {
+    use pascoda_project::ExportSettings;
+    for dark in [false, true] {
+        let mut app = editing_app();
+        app.export_dialog = Some(export_dialog::ExportDialog::new(
+            ExportSettings::default(),
+            "debug",
+            true,
+        ));
+        render(
+            app,
+            dark,
+            (900.0, 560.0),
+            &format!("ui-export{}", if dark { "-dark" } else { "" }),
+        );
+    }
+    // console programs only get the name
+    let mut app = editing_app();
+    app.export_dialog = Some(export_dialog::ExportDialog::new(
+        ExportSettings::default(),
+        "debug",
+        false,
+    ));
+    render(app, false, (900.0, 560.0), "ui-export-console");
+
+    // typing a bad identifier shows the sentence and keeps the dialog open
+    let mut app = editing_app();
+    app.export_dialog = Some(export_dialog::ExportDialog::new(
+        ExportSettings::default(),
+        "debug",
+        true,
+    ));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(900.0, 560.0))
+        .with_pixels_per_point(1.0)
+        .with_context_setup(theme::apply)
+        .build_ui_state(|ui, app: &mut App| app.draw(ui, None), app);
+    harness.run_steps(2);
+    harness.get_by_label("Bundle identifier").click();
+    harness.run_steps(2);
+    harness
+        .get_by_label("Bundle identifier")
+        .type_text("nodots");
+    harness.run_steps(2);
+    assert_eq!(
+        harness
+            .state()
+            .export_dialog
+            .as_ref()
+            .unwrap()
+            .settings
+            .bundle_id,
+        "nodots"
+    );
+    harness.get_by_label("Export...").click();
+    harness.run_steps(3);
+    let d = harness.state().export_dialog.as_ref().expect("still open");
+    assert!(
+        d.error
+            .as_deref()
+            .unwrap_or("")
+            .contains("bundle identifier")
+    );
+    harness.get_by_label("Cancel").click();
+    harness.run_steps(2);
+    assert!(harness.state().export_dialog.is_none());
+}
+
+// ---- unsaved changes ---------------------------------------------------------------------------
+
+#[test]
+fn a_changed_tab_is_red_and_closing_it_asks() {
+    for dark in [false, true] {
+        let mut app = editing_app();
+        app.docs[0].text.push_str("// typed, not saved\n");
+        render(
+            app,
+            dark,
+            (900.0, 560.0),
+            &format!("ui-tab-changed{}", if dark { "-dark" } else { "" }),
+        );
+    }
+    let mut app = editing_app();
+    app.docs[0].text.push_str("// typed, not saved\n");
+    app.request_close(0);
+    render(app, false, (900.0, 560.0), "ui-close-asks");
+
+    // Don't Save closes the tab and leaves the file alone; Cancel keeps the tab
+    let on_disk = std::fs::read_to_string(fixture()).unwrap();
+    let mut app = editing_app();
+    app.docs[0].text.push_str("// typed, not saved\n");
+    app.request_close(0);
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(900.0, 560.0))
+        .with_pixels_per_point(1.0)
+        .with_context_setup(theme::apply)
+        .build_ui_state(|ui, app: &mut App| app.draw(ui, None), app);
+    harness.run_steps(2);
+    harness.get_by_label("Cancel").click();
+    harness.run_steps(2);
+    assert_eq!(harness.state().docs.len(), 1);
+    assert!(harness.state().confirm.is_none());
+    harness.state_mut().request_close(0);
+    harness.run_steps(2);
+    harness.get_by_label("Don't Save").click();
+    harness.run_steps(2);
+    assert!(harness.state().docs.is_empty());
+    assert_eq!(std::fs::read_to_string(fixture()).unwrap(), on_disk);
+}
+
+/// A full-screen program that asked for mouse reports (Codex, vim, htop) gets the wheel as a
+/// mouse report, not as arrow keys; a plain shell keeps the IDE's own scrolling.
+#[test]
+fn the_wheel_reaches_a_program_that_asked_for_the_mouse() {
+    use egui::Event;
+    let mut app = editing_app();
+    app.bottom.tab = bottom::BottomTab::Terminal;
+    let mut cmd = portable_pty::CommandBuilder::new("/bin/sh");
+    cmd.args([
+        "-c",
+        "printf '\\033[?1049h\\033[?1000h\\033[?1006h'; stty -icanon -echo; cat -v",
+    ]);
+    app.bottom.terminal =
+        Some(crate::terminal::Terminal::spawn(cmd, 10, 80, || {}).expect("spawn"));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1000.0, 600.0))
+        .with_pixels_per_point(1.0)
+        .with_context_setup(theme::apply)
+        .build_ui_state(|ui, app: &mut App| app.draw(ui, None), app);
+    let screen = |h: &Harness<'_, App>| h.state().bottom.terminal.as_ref().unwrap().screen_text();
+    for _ in 0..50 {
+        h.run_steps(1);
+        if h.state().bottom.terminal.as_ref().unwrap().wants_mouse() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(h.state().bottom.terminal.as_ref().unwrap().wants_mouse());
+    // over the terminal, which fills the bottom pane
+    let pos = egui::pos2(300.0, 520.0);
+    h.event(Event::PointerMoved(pos));
+    h.run_steps(2);
+    h.event(Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Line,
+        delta: egui::vec2(0.0, 3.0),
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Wheel,
+        modifiers: egui::Modifiers::NONE,
+    });
+    for _ in 0..100 {
+        h.run_steps(1);
+        if screen(&h).contains("^[[<64;") {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("no wheel report arrived:\n{}", screen(&h));
+}
+
+/// The toolbar's activity bar during an export: the same bar as a build, labelled with the step.
+#[test]
+fn the_toolbar_shows_export_progress() {
+    for dark in [false, true] {
+        let mut app = editing_app();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.exporting = Some(Exporting {
+            rx,
+            out: std::path::PathBuf::from("/tmp"),
+        });
+        app.build_progress = Some(pascoda_fpc::Progress {
+            label: "Creating the disk image".into(),
+            fraction: Some(0.6),
+            done: 3,
+        });
+        assert!(app.working());
+        render(
+            app,
+            dark,
+            (900.0, 300.0),
+            &format!("ui-export-progress{}", if dark { "-dark" } else { "" }),
+        );
+    }
+    // the status text before the first progress message
+    let mut app = editing_app();
+    let (_tx, rx) = std::sync::mpsc::channel();
+    app.exporting = Some(Exporting {
+        rx,
+        out: std::path::PathBuf::from("/tmp"),
+    });
+    let (text, _) = app.activity(&style::Palette::LIGHT);
+    assert_eq!(text, "Exporting...");
 }

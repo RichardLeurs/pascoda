@@ -90,6 +90,16 @@ pub struct Outcome {
     pub unit_changed: bool,
 }
 
+/// The inspector may not be narrower than this ...
+const INSPECTOR_MIN: f32 = 200.0;
+/// ... and the palette and canvas keep at least this much.
+const CENTRE_MIN: f32 = 360.0;
+
+/// The widest the inspector may grow when `avail` is the width of the designer's whole area.
+fn inspector_max(avail: f32) -> f32 {
+    (avail - CENTRE_MIN).max(INSPECTOR_MIN)
+}
+
 pub fn show(
     d: &mut Designer,
     state: &mut UiState,
@@ -100,9 +110,12 @@ pub fn show(
 ) -> Outcome {
     let mut out = Outcome::default();
     let pal = Palette::of(ui.ctx());
+    let max_w = inspector_max(ui.available_width());
     egui::Panel::right("designer-inspector")
         .resizable(true)
         .default_size(260.0)
+        .min_size(INSPECTOR_MIN)
+        .max_size(max_w)
         .show_separator_line(true)
         .frame(
             Frame::new()
@@ -111,6 +124,9 @@ pub fn show(
         )
         .show(ui, |ui| inspector(d, state, ui, unit, &mut out));
 
+    // The palette and the canvas never paint outside the area the inspector left to them.
+    let rest = ui.available_rect_before_wrap();
+    ui.set_clip_rect(ui.clip_rect().intersect(rest));
     Frame::new().fill(pal.chrome).show(ui, |ui| {
         ui.set_width(ui.available_width());
         // Pages as real tabs: the chosen one is joined to the icon row below it.
@@ -1572,5 +1588,18 @@ mod tests {
             1,
             "dropped on itself"
         );
+    }
+}
+
+#[cfg(test)]
+mod width_tests {
+    use super::*;
+
+    #[test]
+    fn the_inspector_leaves_the_palette_and_canvas_room() {
+        assert_eq!(inspector_max(1200.0), 1200.0 - CENTRE_MIN);
+        // a very narrow window: never below the inspector's own minimum
+        assert_eq!(inspector_max(500.0), INSPECTOR_MIN);
+        assert_eq!(inspector_max(100.0), INSPECTOR_MIN);
     }
 }

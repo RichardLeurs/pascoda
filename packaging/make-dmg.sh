@@ -24,8 +24,9 @@ ditto "$app" "$stage/Pascoda.app"
 ln -s /Applications "$stage/Applications"
 
 rm -f "$dmg"
-# ULFO (LZFSE) is much smaller than zlib for the bundled sources and needs macOS 10.11 or later.
-hdiutil create -volname "Pascoda $version" -srcfolder "$stage" -ov -format ULFO "$dmg" >/dev/null
+# ULFO (LZFSE) is much smaller than zlib for the bundled sources. diskutil makes an APFS volume
+# (macOS 11 or later; the app itself needs macOS 14).
+diskutil image create from --format ULFO --volumeName "Pascoda $version" "$stage" "$dmg" >/dev/null
 rm -rf "$work"
 
 if [ -n "${CODESIGN_IDENTITY:-}" ]; then

@@ -75,7 +75,10 @@ pub const CRATES: &[(&str, &str, &str, &str)] = &[
 
 /// The Free Pascal version on this machine, if the compiler is installed.
 fn fpc_version() -> Option<String> {
-    let out = Command::new("fpc").arg("-iV").output().ok()?;
+    let out = Command::new(pascoda_fpc::locate_fpc()?)
+        .arg("-iV")
+        .output()
+        .ok()?;
     let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !v.is_empty()).then_some(v)
 }

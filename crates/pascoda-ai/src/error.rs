@@ -21,6 +21,8 @@ pub enum AiError {
     Protocol(String),
     /// The Claude Code CLI is not signed in (subscription provider).
     NotLoggedIn,
+    /// The Codex CLI is not signed in (Codex provider).
+    CodexNotLoggedIn,
     /// The Claude Code CLI is missing, died or reported an error (subscription provider). The
     /// text is ready to show.
     Cli(String),
@@ -57,6 +59,10 @@ impl fmt::Display for AiError {
             AiError::NotLoggedIn => write!(
                 f,
                 "Claude Code is not logged in. Open a terminal, run `claude` once, type /login and sign in with your Claude account, then send your message again."
+            ),
+            AiError::CodexNotLoggedIn => write!(
+                f,
+                "Codex is not logged in. Open a terminal, run `codex login`, sign in, then send your message again."
             ),
             AiError::Cli(m) | AiError::Config(m) => write!(f, "{m}"),
             AiError::Cancelled => write!(f, "Cancelled"),

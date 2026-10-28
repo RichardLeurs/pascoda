@@ -54,6 +54,11 @@ impl App {
         self.poll_build(ctx);
         self.poll_debug(ctx);
         self.poll_lsp(ctx);
+        self.poll_live_check(ctx);
+        self.poll_export(ctx);
+        self.handle_close_request(ctx);
+        self.show_export_dialog(ctx);
+        self.show_confirm(ctx);
         self.poll_assistant(ctx);
         self.poll_external(ctx);
         self.sync_lfm_tab();
@@ -122,7 +127,7 @@ impl App {
             self.open_path(path);
         }
         if let Some(i) = p.close {
-            self.close_doc(i);
+            self.request_close(i);
         }
         if let Some((file, line, col)) = p.goto {
             self.goto(ctx, &file, line, col);
@@ -131,7 +136,10 @@ impl App {
 
     fn run_menu_actions(&mut self, ctx: &egui::Context) {
         let actions = self.menu.as_ref().map(NativeMenu::poll).unwrap_or_default();
-        let can_build = !self.docs.is_empty() && self.building.is_none() && self.session.is_none();
+        let can_build = !self.docs.is_empty()
+            && self.building.is_none()
+            && self.exporting.is_none()
+            && self.session.is_none();
         for action in actions {
             match action {
                 MenuAction::NewGui => self.new_gui_app(),
@@ -163,6 +171,8 @@ impl App {
                 MenuAction::Save => self.save_doc(self.active),
                 MenuAction::Run if can_build => self.build_and_run(ctx, false),
                 MenuAction::Debug if can_build => self.build_and_run(ctx, true),
+                MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                MenuAction::Export if can_build && self.exporting.is_none() => self.start_export(),
                 _ => {}
             }
         }
@@ -171,12 +181,22 @@ impl App {
     // ---- toolbar ----------------------------------------------------------------------
 
     /// One line saying what the IDE is doing, and its colour.
-    fn activity(&self, pal: &Palette) -> (String, egui::Color32) {
-        if self.building.is_some() {
+    /// A build or an export is running: the toolbar shows its progress.
+    pub(crate) fn working(&self) -> bool {
+        self.building.is_some() || self.exporting.is_some()
+    }
+
+    pub(crate) fn activity(&self, pal: &Palette) -> (String, egui::Color32) {
+        if self.working() {
+            let idle = if self.exporting.is_some() {
+                "Exporting..."
+            } else {
+                "Building..."
+            };
             let label = self
                 .build_progress
                 .as_ref()
-                .map_or("Building...", |p| p.label.as_str());
+                .map_or(idle, |p| p.label.as_str());
             (label.into(), pal.accent)
         } else if self.session.is_some() {
             match &self.paused {
@@ -211,7 +231,10 @@ impl App {
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, pal: &Palette) {
-        let can_build = !self.docs.is_empty() && self.building.is_none() && self.session.is_none();
+        let can_build = !self.docs.is_empty()
+            && self.building.is_none()
+            && self.exporting.is_none()
+            && self.session.is_none();
         let has_form = self.has_form();
         let form_showing = self.form_showing();
         let (status, status_color) = self.activity(pal);
@@ -322,7 +345,7 @@ impl App {
                         egui::FontId::proportional(13.0),
                         pal.text,
                     );
-                    if self.building.is_some() {
+                    if self.working() {
                         // A thin bar along the bottom of the pill; it slides when the amount of
                         // work is not known.
                         let track = Rect::from_min_max(
@@ -383,6 +406,29 @@ impl App {
 
     // ---- status bar -------------------------------------------------------------------
 
+    /// The project's language mode: shows it and offers the choice.
+    fn mode_menu(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        self.sync_mode();
+        let mut chosen = None;
+        let current = self.mode;
+        let text = RichText::new(current.label())
+            .size(11.5)
+            .color(pal.text_secondary);
+        ui.menu_button(text, |ui| {
+            for m in [pascoda_fpc::Mode::ObjFpc, pascoda_fpc::Mode::Delphi] {
+                if ui.selectable_label(m == current, m.label()).clicked() {
+                    chosen = Some(m);
+                    ui.close();
+                }
+            }
+        })
+        .response
+        .on_hover_text("Language mode of this project (saved in pascoda.toml)");
+        if let Some(m) = chosen {
+            self.set_mode(m);
+        }
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         let (dot, text) = match (&self.lsp, self.lsp_ready) {
             (None, _) => (pal.text_tertiary, "Language server off"),
@@ -417,6 +463,8 @@ impl App {
                                 .size(11.5)
                                 .color(pal.text_secondary),
                         );
+                        ui.add_space(14.0);
+                        self.mode_menu(ui, pal);
                     });
                 });
             });
@@ -608,6 +656,12 @@ impl App {
                 &mut doc.text,
             );
             p.designer_outcome = Some((doc.path.clone(), outcome));
+            if (self.export_dialog.is_some() || self.confirm.is_some())
+                && let Some(n) = &self.native
+            {
+                // egui windows draw under the native controls.
+                n.hide();
+            }
             return;
         }
         if let Some(n) = &self.native {
@@ -691,8 +745,19 @@ impl App {
                             && ui
                                 .input(|i| i.pointer.hover_pos())
                                 .is_some_and(|h| close.contains(h));
-                        if dirty && !(hovered || active) {
-                            ui.painter().circle_filled(close.center(), 3.0, pal.accent);
+                        if dirty {
+                            // Unsaved changes: a red dot, which becomes a red x under the pointer.
+                            if over_close {
+                                ui.painter().rect_filled(close, 4.0, pal.row_hover);
+                                style::paint_icon(
+                                    ui.painter(),
+                                    close.shrink(4.5),
+                                    Icon::Close,
+                                    pal.error,
+                                );
+                            } else {
+                                ui.painter().circle_filled(close.center(), 4.0, pal.error);
+                            }
                         } else if hovered || active {
                             if over_close {
                                 ui.painter().rect_filled(close, 4.0, pal.row_hover);

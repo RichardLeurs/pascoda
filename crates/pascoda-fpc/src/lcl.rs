@@ -143,7 +143,7 @@ impl Lcl {
     }
 
     /// Search paths for a project: cached units first, sources as the fallback.
-    fn project_args(&self, units_out: &Path) -> Vec<OsString> {
+    pub(crate) fn project_args(&self, units_out: &Path) -> Vec<OsString> {
         let mut args = self.common_args();
         args.push(format!("-FU{}", units_out.display()).into());
         args.push(format!("-Fu{}", self.cache.display()).into());
@@ -198,33 +198,188 @@ pub fn build_gui_progress(
 /// Wraps `exe` into `<dir>/<name>.app` so macOS treats it as a real application (Dock icon,
 /// menu bar, light/dark appearance). Returns the bundle path.
 pub fn make_bundle(exe: &Path, name: &str) -> std::io::Result<PathBuf> {
-    let bundle = exe
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join(format!("{name}.app"));
+    let dir = exe.parent().unwrap_or(Path::new("."));
+    bundle(exe, name, dir, true, &BundleInfo::default())
+}
+
+/// What an exported app says about itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BundleInfo {
+    /// `com.example.app`; `com.pascoda.<name>` when empty.
+    pub bundle_id: String,
+    /// `1.0` when empty.
+    pub version: String,
+    /// A `.icns` (copied) or `.png` (converted with `sips`) file.
+    pub icon: Option<PathBuf>,
+}
+
+impl BundleInfo {
+    /// `Err` with a sentence for the user when a field cannot be used.
+    pub fn check(&self) -> Result<(), String> {
+        let id = self.bundle_id.trim();
+        if !id.is_empty()
+            && (!id.contains('.')
+                || id.starts_with('.')
+                || id.ends_with('.')
+                || !id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'))
+        {
+            return Err(
+                "The bundle identifier uses letters, digits, '-' and dots, like com.example.myapp."
+                    .into(),
+            );
+        }
+        let v = self.version.trim();
+        if !v.is_empty() && !v.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            return Err("The version uses digits and dots, like 1.0 or 2.1.3.".into());
+        }
+        if let Some(i) = &self.icon {
+            let ext = i
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase);
+            if !i.is_file() || !matches!(ext.as_deref(), Some("icns" | "png")) {
+                return Err("The icon must be an existing .icns or .png file.".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `<dir>/<name>.app` around `exe`. `debuggable` re-signs for lldb (a development build); a
+/// release bundle gets a plain ad-hoc signature instead.
+pub(crate) fn bundle(
+    exe: &Path,
+    name: &str,
+    dir: &Path,
+    debuggable: bool,
+    info: &BundleInfo,
+) -> std::io::Result<PathBuf> {
+    let bundle = dir.join(format!("{name}.app"));
     let macos = bundle.join("Contents/MacOS");
     if bundle.exists() {
         std::fs::remove_dir_all(&bundle)?;
     }
     std::fs::create_dir_all(&macos)?;
     std::fs::copy(exe, macos.join(name))?;
-    std::fs::write(bundle.join("Contents/Info.plist"), info_plist(name))?;
-    allow_debugging(&bundle)?;
+    let icon_file = match &info.icon {
+        Some(icon) => {
+            let res = bundle.join("Contents/Resources");
+            std::fs::create_dir_all(&res)?;
+            let to = res.join("AppIcon.icns");
+            if icon
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("icns"))
+            {
+                std::fs::copy(icon, &to)?;
+            } else {
+                png_to_icns(icon, &to)?;
+            }
+            Some("AppIcon")
+        }
+        None => None,
+    };
+    std::fs::write(
+        bundle.join("Contents/Info.plist"),
+        info_plist(name, info, icon_file),
+    )?;
+    if debuggable {
+        allow_debugging(&bundle)?;
+    } else {
+        let st = Command::new("codesign")
+            .args(["--force", "--deep", "-s", "-"])
+            .arg(&bundle)
+            .output()?;
+        if !st.status.success() {
+            return Err(std::io::Error::other(format!(
+                "codesign failed: {}",
+                String::from_utf8_lossy(&st.stderr).trim()
+            )));
+        }
+    }
     Ok(bundle)
+}
+
+/// Makes an `.icns` from a PNG: every size of an iconset with `sips`, then `iconutil`.
+fn png_to_icns(png: &Path, out: &Path) -> std::io::Result<()> {
+    let set = std::env::temp_dir().join(format!("pascoda-icon-{}.iconset", std::process::id()));
+    let _ = std::fs::remove_dir_all(&set);
+    std::fs::create_dir_all(&set)?;
+    let result = (|| {
+        for (px, name) in [
+            (16, "icon_16x16"),
+            (32, "icon_16x16@2x"),
+            (32, "icon_32x32"),
+            (64, "icon_32x32@2x"),
+            (128, "icon_128x128"),
+            (256, "icon_128x128@2x"),
+            (256, "icon_256x256"),
+            (512, "icon_256x256@2x"),
+            (512, "icon_512x512"),
+            (1024, "icon_512x512@2x"),
+        ] {
+            let st = Command::new("sips")
+                .args(["-z", &px.to_string(), &px.to_string()])
+                .arg(png)
+                .arg("--out")
+                .arg(set.join(format!("{name}.png")))
+                .output()?;
+            if !st.status.success() {
+                return Err(std::io::Error::other(format!(
+                    "could not read the icon: {}",
+                    String::from_utf8_lossy(&st.stderr).trim()
+                )));
+            }
+        }
+        let st = Command::new("iconutil")
+            .args(["-c", "icns"])
+            .arg(&set)
+            .arg("-o")
+            .arg(out)
+            .output()?;
+        if !st.status.success() {
+            return Err(std::io::Error::other(format!(
+                "could not build the icon: {}",
+                String::from_utf8_lossy(&st.stderr).trim()
+            )));
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&set);
+    result
 }
 
 /// No `NSPrincipalClass`: LCL creates its own `NSApplication` subclass, and if AppKit makes a
 /// plain one first the app dies with `unrecognized selector lclSetLCLMainLoop:`.
-fn info_plist(name: &str) -> String {
+fn info_plist(name: &str, info: &BundleInfo, icon: Option<&str>) -> String {
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    let id = match info.bundle_id.trim() {
+        "" => format!("com.pascoda.{}", name.replace(' ', "-")),
+        id => id.to_string(),
+    };
+    let version = match info.version.trim() {
+        "" => "1.0",
+        v => v,
+    };
+    let icon = icon
+        .map(|i| format!("<key>CFBundleIconFile</key><string>{i}</string>\n"))
+        .unwrap_or_default();
+    let (id, version, name) = (esc(&id), esc(version), esc(name));
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>CFBundleExecutable</key><string>{name}</string>
-<key>CFBundleIdentifier</key><string>com.pascoda.{name}</string>
+<key>CFBundleIdentifier</key><string>{id}</string>
 <key>CFBundleName</key><string>{name}</string>
-<key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.0</string>
+{icon}<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>{version}</string>
+<key>CFBundleVersion</key><string>{version}</string>
 <key>LSMinimumSystemVersion</key><string>{MIN_MACOS}</string>
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
@@ -233,7 +388,7 @@ fn info_plist(name: &str) -> String {
 }
 
 fn fpc_version() -> String {
-    Command::new("fpc")
+    Command::new(crate::locate_fpc().unwrap_or_else(|| "fpc".into()))
         .arg("-iV")
         .output()
         .ok()

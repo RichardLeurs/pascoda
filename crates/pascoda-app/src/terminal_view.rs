@@ -21,6 +21,9 @@ pub(crate) struct ViewState {
     sel_scroll: usize,
     /// The "[process exited]" line has been written into the screen.
     exit_noted: bool,
+    /// The button held down while a program receives mouse reports, and the last cell sent.
+    mouse_down: Option<u8>,
+    mouse_cell: Option<Cell>,
 }
 
 impl ViewState {
@@ -286,6 +289,15 @@ fn handle_mouse(
     rows: u16,
     cols: u16,
 ) {
+    // A program that asked for mouse reports (Codex, vim with `mouse=a`, htop ...) gets the
+    // wheel, the clicks and the drags; holding Shift keeps the terminal's own selection.
+    if term.wants_mouse() && !ui.input(|i| i.modifiers.shift) {
+        st.selection = None;
+        st.anchor = None;
+        forward_pointer(ui, resp, term, st, origin, cell_w, rows, cols);
+        return;
+    }
+    st.mouse_down = None;
     if let Some(pos) = resp.interact_pointer_pos() {
         let cell = pointer_cell(pos, origin, cell_w, rows, cols);
         if resp.drag_started() {
@@ -327,6 +339,72 @@ fn handle_mouse(
         }
     } else {
         st.wheel_carry = 0.0;
+    }
+}
+
+/// Reports the pointer to a program that wants mouse reports: wheel steps, presses, releases,
+/// and moves with a button held (or any moves, when the program asked for them).
+fn forward_pointer(
+    ui: &egui::Ui,
+    resp: &egui::Response,
+    term: &Terminal,
+    st: &mut ViewState,
+    origin: egui::Pos2,
+    cell_w: f32,
+    rows: u16,
+    cols: u16,
+) {
+    use terminal::MouseEvent;
+    let mods = ui.input(|i| i.modifiers);
+    let hover = resp.hover_pos().or_else(|| resp.interact_pointer_pos());
+    let cell = hover.map(|p| pointer_cell(p, origin, cell_w, rows, cols));
+    if resp.hovered() {
+        let dy = ui.input(|i| i.smooth_scroll_delta.y);
+        let lines = terminal::wheel_lines(&mut st.wheel_carry, dy, CELL_H);
+        if let (Some(cell), true) = (cell, lines != 0) {
+            let ev = if lines > 0 {
+                MouseEvent::WheelUp
+            } else {
+                MouseEvent::WheelDown
+            };
+            for _ in 0..lines.unsigned_abs().min(10) {
+                term.report_mouse(ev, cell, mods);
+            }
+        }
+    } else {
+        st.wheel_carry = 0.0;
+    }
+    use egui::PointerButton::{Middle, Primary, Secondary};
+    for (b, id) in [(Primary, 0u8), (Middle, 1), (Secondary, 2)] {
+        if let Some(cell) = cell
+            && resp.hovered()
+            && ui.input(|i| i.pointer.button_pressed(b))
+        {
+            term.report_mouse(MouseEvent::Press(id), cell, mods);
+            st.mouse_down = Some(id);
+            st.mouse_cell = Some(cell);
+        }
+        if st.mouse_down == Some(id) && ui.input(|i| i.pointer.button_released(b)) {
+            if let Some(cell) = cell.or(st.mouse_cell) {
+                term.report_mouse(MouseEvent::Release(id), cell, mods);
+            }
+            st.mouse_down = None;
+        }
+    }
+    // Motion, once per cell.
+    if let Some(cell) = cell
+        && st.mouse_cell != Some(cell)
+        && (resp.hovered() || st.mouse_down.is_some())
+    {
+        st.mouse_cell = Some(cell);
+        let ev = match st.mouse_down {
+            Some(id) => MouseEvent::Drag(id),
+            None => MouseEvent::Move,
+        };
+        // Not for the press itself, which set the cell above.
+        if !ui.input(|i| i.pointer.any_pressed()) {
+            term.report_mouse(ev, cell, mods);
+        }
     }
 }
 

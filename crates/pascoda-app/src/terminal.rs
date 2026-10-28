@@ -162,6 +162,84 @@ pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     }
 }
 
+/// What the pointer did, as a program that asked for mouse reports wants to hear it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MouseEvent {
+    /// Button 0 = left, 1 = middle, 2 = right.
+    Press(u8),
+    Release(u8),
+    /// Pointer moved with this button down.
+    Drag(u8),
+    /// Pointer moved with no button down.
+    Move,
+    WheelUp,
+    WheelDown,
+}
+
+/// The report for `ev` at the 0-based cell (`col`, `row`), in the encoding the program chose,
+/// or `None` when its mode does not report this kind of event (or the cell does not fit the
+/// encoding). Presses and the wheel are reported in every mode; releases from `PressRelease` on,
+/// drags from `ButtonMotion`, plain moves only in `AnyMotion`.
+pub fn encode_mouse(
+    ev: MouseEvent,
+    col: u16,
+    row: u16,
+    m: egui::Modifiers,
+    mode: vt100::MouseProtocolMode,
+    enc: vt100::MouseProtocolEncoding,
+) -> Option<Vec<u8>> {
+    use vt100::{MouseProtocolEncoding as E, MouseProtocolMode as M};
+    let wanted = match ev {
+        MouseEvent::Press(_) | MouseEvent::WheelUp | MouseEvent::WheelDown => mode != M::None,
+        MouseEvent::Release(_) => matches!(mode, M::PressRelease | M::ButtonMotion | M::AnyMotion),
+        MouseEvent::Drag(_) => matches!(mode, M::ButtonMotion | M::AnyMotion),
+        MouseEvent::Move => mode == M::AnyMotion,
+    };
+    if !wanted {
+        return None;
+    }
+    let (mut code, release) = match ev {
+        MouseEvent::Press(b) => (u32::from(b.min(2)), false),
+        // The old encodings cannot say which button went up.
+        MouseEvent::Release(b) => (
+            if enc == E::Sgr {
+                u32::from(b.min(2))
+            } else {
+                3
+            },
+            true,
+        ),
+        MouseEvent::Drag(b) => (32 + u32::from(b.min(2)), false),
+        MouseEvent::Move => (35, false),
+        MouseEvent::WheelUp => (64, false),
+        MouseEvent::WheelDown => (65, false),
+    };
+    code += 4 * u32::from(m.shift) + 8 * u32::from(m.alt) + 16 * u32::from(m.ctrl);
+    let (x, y) = (u32::from(col) + 1, u32::from(row) + 1);
+    match enc {
+        E::Sgr => {
+            Some(format!("\x1b[<{code};{x};{y}{}", if release { 'm' } else { 'M' }).into_bytes())
+        }
+        E::Utf8 => {
+            let mut out = b"\x1b[M".to_vec();
+            for v in [code + 32, x + 32, y + 32] {
+                let c = char::from_u32(v)?;
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+            Some(out)
+        }
+        E::Default => {
+            // One byte each: positions beyond 222 cannot be said.
+            let b = |v: u32| u8::try_from(v + 32).ok();
+            if x > 222 || y > 222 {
+                return None;
+            }
+            Some(vec![0x1b, b'[', b'M', b(code)?, b(x)?, b(y)?])
+        }
+    }
+}
+
 /// Mouse-wheel movement turned into whole lines. `carry` keeps the fraction between frames.
 /// Positive `delta` (scroll up in egui) gives positive lines (towards older output).
 pub fn wheel_lines(carry: &mut f32, delta: f32, line_h: f32) -> i32 {
@@ -356,6 +434,30 @@ impl Terminal {
     }
 
     /// Sends bytes to the shell (queued; never blocks).
+    /// Reports a pointer event to the program when it asked for mouse reports. Returns whether
+    /// it did (then the IDE must not also treat the event as its own, e.g. a selection).
+    pub fn report_mouse(&self, ev: MouseEvent, cell: (u16, u16), m: egui::Modifiers) -> bool {
+        let (mode, enc) = {
+            let p = self.parser();
+            (
+                p.screen().mouse_protocol_mode(),
+                p.screen().mouse_protocol_encoding(),
+            )
+        };
+        if mode == vt100::MouseProtocolMode::None {
+            return false;
+        }
+        if let Some(bytes) = encode_mouse(ev, cell.1, cell.0, m, mode, enc) {
+            self.write(&bytes);
+        }
+        true
+    }
+
+    /// Does the program want mouse reports?
+    pub fn wants_mouse(&self) -> bool {
+        self.parser().screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
+    }
+
     pub fn write(&self, bytes: &[u8]) {
         if !bytes.is_empty() {
             self.typed.store(true, Ordering::Relaxed);
@@ -720,5 +822,96 @@ mod tests {
         let t = Terminal::spawn(cmd, 10, 100, || {}).unwrap();
         assert!(wait_for(&t, |t| t.screen_text().contains("xterm-256color")));
         assert!(t.screen_text().contains(dir.to_str().unwrap()));
+    }
+
+    #[test]
+    fn mouse_reports_in_the_three_encodings() {
+        use vt100::{MouseProtocolEncoding as E, MouseProtocolMode as M};
+        let none = egui::Modifiers::NONE;
+        let sgr = |ev, c, r| encode_mouse(ev, c, r, none, M::AnyMotion, E::Sgr).unwrap();
+        assert_eq!(sgr(MouseEvent::WheelUp, 4, 2), b"\x1b[<64;5;3M");
+        assert_eq!(sgr(MouseEvent::WheelDown, 0, 0), b"\x1b[<65;1;1M");
+        assert_eq!(sgr(MouseEvent::Press(0), 9, 9), b"\x1b[<0;10;10M");
+        assert_eq!(
+            sgr(MouseEvent::Release(2), 9, 9),
+            b"\x1b[<2;10;10m",
+            "SGR keeps the button"
+        );
+        assert_eq!(sgr(MouseEvent::Drag(0), 1, 1), b"\x1b[<32;2;2M");
+        assert_eq!(sgr(MouseEvent::Move, 1, 1), b"\x1b[<35;2;2M");
+        // modifiers: shift 4, alt 8, ctrl 16
+        let m = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..none
+        };
+        assert_eq!(
+            encode_mouse(MouseEvent::WheelUp, 0, 0, m, M::Press, E::Sgr).unwrap(),
+            b"\x1b[<84;1;1M"
+        );
+        // the old encoding: one byte each, release has no button
+        assert_eq!(
+            encode_mouse(MouseEvent::Press(0), 0, 0, none, M::Press, E::Default).unwrap(),
+            vec![0x1b, b'[', b'M', 32, 33, 33]
+        );
+        assert_eq!(
+            encode_mouse(
+                MouseEvent::Release(1),
+                0,
+                0,
+                none,
+                M::PressRelease,
+                E::Default
+            )
+            .unwrap(),
+            vec![0x1b, b'[', b'M', 35, 33, 33]
+        );
+        assert_eq!(
+            encode_mouse(MouseEvent::Press(0), 250, 0, none, M::Press, E::Default),
+            None
+        );
+        // UTF-8 encoding reaches further
+        let far = encode_mouse(MouseEvent::Press(0), 300, 0, none, M::Press, E::Utf8).unwrap();
+        assert_eq!(String::from_utf8(far).unwrap(), "\u{1b}[M \u{14d}!");
+    }
+
+    #[test]
+    fn a_mode_only_reports_what_it_asked_for() {
+        use vt100::{MouseProtocolEncoding as E, MouseProtocolMode as M};
+        let none = egui::Modifiers::NONE;
+        let ev = |ev, mode| encode_mouse(ev, 0, 0, none, mode, E::Sgr).is_some();
+        assert!(!ev(MouseEvent::WheelUp, M::None));
+        assert!(ev(MouseEvent::WheelUp, M::Press));
+        assert!(ev(MouseEvent::Press(0), M::Press));
+        assert!(!ev(MouseEvent::Release(0), M::Press));
+        assert!(ev(MouseEvent::Release(0), M::PressRelease));
+        assert!(!ev(MouseEvent::Drag(0), M::PressRelease));
+        assert!(ev(MouseEvent::Drag(0), M::ButtonMotion));
+        assert!(!ev(MouseEvent::Move, M::ButtonMotion));
+        assert!(ev(MouseEvent::Move, M::AnyMotion));
+    }
+
+    #[test]
+    fn a_program_in_mouse_mode_hears_the_wheel_and_one_that_is_not_does_not() {
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "printf '\\033[?1000h\\033[?1006h'; stty -icanon -echo; cat -v",
+        ]);
+        let t = Terminal::spawn(cmd, 10, 40, || {}).expect("spawn");
+        assert!(
+            wait_for(&t, |t| t.wants_mouse()),
+            "the program turned mouse reports on"
+        );
+        assert!(t.report_mouse(MouseEvent::WheelUp, (2, 4), egui::Modifiers::NONE));
+        assert!(
+            wait_for(&t, |t| t.screen_text().contains("^[[<64;5;3M")),
+            "{}",
+            t.screen_text()
+        );
+        // a shell in its normal state: nothing is reported, so the IDE keeps the event
+        let plain = sh("true");
+        assert!(!plain.wants_mouse());
+        assert!(!plain.report_mouse(MouseEvent::WheelUp, (0, 0), egui::Modifiers::NONE));
     }
 }

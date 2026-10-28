@@ -1478,16 +1478,14 @@ fn the_provider_is_remembered_in_a_plain_text_file() {
     a.set_provider(Provider::ClaudeCode);
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "claude-code");
     assert_eq!(Provider::load(&file), Provider::ClaudeCode);
-    assert!(
-        matches!(a.items.last(), Some(Item::Note(n)) if n.contains("Claude Code (subscription)"))
-    );
+    assert!(matches!(a.items.last(), Some(Item::Note(n)) if n.contains("Claude Code CLI")));
     a.set_provider(Provider::Api);
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "api");
     std::fs::write(&file, "garbage").unwrap();
     assert_eq!(Provider::load(&file), Provider::Api);
     // no switching while a turn runs
-    assert_eq!(Provider::Api.label(), "Anthropic API key");
-    assert_eq!(Provider::ClaudeCode.label(), "Claude Code (subscription)");
+    assert_eq!(Provider::Api.label(), "Claude Console API");
+    assert_eq!(Provider::ClaudeCode.label(), "Claude Code CLI");
 }
 
 #[test]
@@ -1884,8 +1882,8 @@ fn the_provider_file_knows_openai_and_the_switch_resets_the_card() {
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "openai");
     assert_eq!(Provider::load(&file), Provider::OpenAi);
     assert!(a.key_message.is_none() && a.key_input.is_empty());
-    assert_eq!(Provider::OpenAi.label(), "OpenAI API key");
-    assert_eq!(Provider::ALL.len(), 3);
+    assert_eq!(Provider::OpenAi.label(), "OpenAI API");
+    assert_eq!(Provider::ALL.len(), 4);
 }
 
 #[test]
@@ -2332,4 +2330,272 @@ fn the_prompts_tell_the_model_about_the_overview_and_to_read_first() {
         pascoda_ai::CLAUDE_CODE_PROMPT.contains("(Read)")
             && pascoda_ai::CLAUDE_CODE_PROMPT.contains("Grep")
     );
+}
+
+#[test]
+fn hand_typed_claude_models_are_remembered_saved_and_reloaded() {
+    let dir = crate::target_tmp().join("claude-models");
+    let _ = std::fs::remove_dir_all(&dir);
+    let file = dir.join("claude-models");
+    let mut a = Assistant::default();
+    a.model_file = Some(file.clone());
+    // built-in models are not added to the list
+    a.model = pascoda_ai::MODEL_OPUS.into();
+    a.remember_model();
+    assert!(a.extra_models.is_empty() && !file.exists());
+    // a new one is, newest first, without duplicates
+    a.model = "claude-future-6".into();
+    a.remember_model();
+    a.model = "claude-other-1".into();
+    a.remember_model();
+    a.model = "claude-future-6".into();
+    a.remember_model();
+    assert_eq!(a.extra_models, ["claude-future-6", "claude-other-1"]);
+    // a new session finds the chosen model and the list
+    let mut b = Assistant::default();
+    b.load_claude_models(&file);
+    assert_eq!(b.model, "claude-future-6");
+    assert_eq!(b.extra_models, ["claude-future-6", "claude-other-1"]);
+    // the list is capped and blank input is ignored
+    for i in 0..15 {
+        b.model = format!("m{i}");
+        b.model_file = Some(file.clone());
+        b.remember_model();
+    }
+    assert_eq!(b.extra_models.len(), 10);
+    assert_eq!(b.extra_models[0], "m14");
+    b.model = "  ".into();
+    b.remember_model();
+    assert_eq!(b.extra_models.len(), 10);
+}
+
+// ---- the Codex CLI provider ----------------------------------------------------------------------
+
+fn codex_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../pascoda-ai/tests/fixtures/codex/fake_codex.py")
+}
+
+/// A `codex` stand-in playing `turns` (see pascoda-ai's fixture folder).
+fn fake_codex(name: &str, turns: Value) -> PathBuf {
+    let base = crate::target_tmp().join(format!("{name}-codex"));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("script.json"), turns.to_string()).unwrap();
+    let wrapper = base.join("codex");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexport FAKE_CODEX_SCRIPT='{}' FAKE_CODEX_LOG='{}'\nexec '{}' \"$@\"\n",
+            base.join("script.json").display(),
+            base.join("log.jsonl").display(),
+            codex_fixture().display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    wrapper
+}
+
+fn codex_found(logged_in: Option<bool>) -> CliState {
+    CliState::Found(CliStatus {
+        binary: "/usr/local/bin/codex".into(),
+        version: Some("0.165.0".into()),
+        logged_in,
+    })
+}
+
+/// The turn of a Codex edit of the greeting in unit1.pas: ask, write on accept, finish.
+fn codex_edit_turn(unit: &Path) -> Value {
+    let text = std::fs::read_to_string(unit).unwrap();
+    let (n, line) = text
+        .lines()
+        .enumerate()
+        .find(|(_, l)| l.contains(GREETING))
+        .unwrap();
+    let new_line = line.replace(GREETING, "'Fixed'");
+    let diff = format!("@@ -{0},1 +{0},1 @@\n-{line}\n+{new_line}\n", n + 1);
+    let after = text.replace(GREETING, "'Fixed'");
+    let changes = json!([{"path": unit.to_str().unwrap(), "kind": {"type":"update","move_path":null}, "diff": diff}]);
+    let item =
+        |status: &str| json!({"type":"fileChange","id":"fc1","changes":changes,"status":status});
+    json!([[
+        {"notify":{"method":"item/started","params":{"item":item("inProgress"),"threadId":"{THREAD}","turnId":"{TURN}"}}},
+        {"notify":{"method":"item/agentMessage/delta","params":{"threadId":"{THREAD}","turnId":"{TURN}","itemId":"m1","delta":"Changing it."}}},
+        {"request":{"id":100,"method":"item/fileChange/requestApproval","params":{"threadId":"{THREAD}","turnId":"{TURN}","itemId":"fc1","startedAtMs":1}}},
+        {"write":{"path":unit.to_str().unwrap(),"text":after}},
+        {"notify":{"method":"item/completed","params":{"item":item("completed"),"threadId":"{THREAD}","turnId":"{TURN}"}}},
+        {"notify":{"method":"turn/completed","params":{"threadId":"{THREAD}","turn":{"id":"{TURN}","status":"completed","items":[],"error":null}}}}
+    ]])
+}
+
+fn codex_send(app: &mut App, ctx: &egui::Context, text: &str) {
+    app.assistant.input = text.into();
+    assert!(app.assistant_send(ctx));
+}
+
+#[test]
+fn the_chooser_groups_claude_and_openai_agents_and_remembers_codex() {
+    use std::collections::BTreeSet;
+    let order: Vec<_> = Provider::ALL
+        .iter()
+        .map(|p| (p.vendor(), p.label()))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            ("Claude", "Claude Console API"),
+            ("Claude", "Claude Code CLI"),
+            ("OpenAI", "OpenAI API"),
+            ("OpenAI", "Codex CLI"),
+        ]
+    );
+    // each vendor's providers sit together
+    let mut seen = BTreeSet::new();
+    let mut last = "";
+    for p in Provider::ALL {
+        if p.vendor() != last {
+            assert!(seen.insert(p.vendor()), "{} appears twice", p.vendor());
+            last = p.vendor();
+        }
+    }
+    let file = crate::target_tmp().join("codex-provider").join("provider");
+    let mut a = Assistant::default();
+    a.provider_file = Some(file.clone());
+    a.set_provider(Provider::Codex);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "codex");
+    assert_eq!(Provider::load(&file), Provider::Codex);
+    assert_eq!(Provider::Codex.short_name(), "Codex CLI");
+}
+
+#[test]
+fn codex_is_ready_only_when_found_and_logged_in_and_the_model_is_remembered() {
+    let mut a = Assistant::default();
+    a.provider = Provider::Codex;
+    assert!(!a.ready() && !a.settled(), "not looked for yet");
+    a.codex = CliState::Missing;
+    assert!(a.settled() && !a.ready());
+    a.codex = codex_found(Some(false));
+    assert!(a.settled() && !a.ready(), "found but not logged in");
+    a.codex = codex_found(None);
+    assert!(
+        a.ready(),
+        "unknown login state: let the first message find out"
+    );
+    a.codex = codex_found(Some(true));
+    assert!(a.ready());
+    // the other CLI's state does not count
+    a.provider = Provider::ClaudeCode;
+    assert!(!a.ready());
+    // an empty model is fine (Codex's own default); a typed one is saved
+    a.provider = Provider::Codex;
+    assert_eq!(a.current_model(), "");
+    let file = crate::target_tmp()
+        .join("codex-model-test")
+        .join("codex-model");
+    a.codex_model_file = Some(file.clone());
+    a.codex_model = " gpt-test ".into();
+    a.persist_codex_model();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "gpt-test");
+}
+
+#[test]
+fn a_codex_turn_with_an_approved_edit_is_written_by_codex_and_reloaded() {
+    let dir = scratch("assist-codex-ok");
+    let unit = dir.join("unit1.pas").canonicalize().unwrap();
+    let mut app = App::bare(Some(unit.clone()));
+    app.assistant.provider = Provider::Codex;
+    app.assistant.codex_bin = Some(fake_codex("assist-codex-ok", codex_edit_turn(&unit)));
+    app.assistant.codex = codex_found(Some(true));
+    let ctx = egui::Context::default();
+    codex_send(&mut app, &ctx, "Please change the greeting");
+    wait(&mut app, &ctx, "a proposal", |a| {
+        a.assistant.items.iter().any(|i| matches!(i, Item::Card(_)))
+    });
+    let idx = app
+        .assistant
+        .items
+        .iter()
+        .position(|i| matches!(i, Item::Card(_)))
+        .unwrap();
+    let before = app.docs[0].text.clone();
+    assert!(app.assistant.backend_writes, "Codex writes the file itself");
+    app.assistant_decide(idx, true);
+    assert_eq!(app.assistant.items[idx].card_state(), &CardState::Writing);
+    assert_eq!(app.docs[0].text, before, "the app does not touch the text");
+    wait(&mut app, &ctx, "the end of the turn", |a| {
+        !a.assistant.streaming()
+    });
+    let disk = std::fs::read_to_string(&unit).unwrap();
+    assert!(disk.contains("'Fixed'") && !disk.contains(GREETING));
+    assert_eq!(app.docs[0].text, disk, "the tab shows what Codex wrote");
+    assert!(!app.docs[0].dirty());
+    assert!(matches!(
+        app.assistant.items[idx].card_state(),
+        CardState::Applied
+    ));
+}
+
+#[test]
+fn a_rejected_codex_edit_leaves_the_file_alone() {
+    let dir = scratch("assist-codex-no");
+    let unit = dir.join("unit1.pas").canonicalize().unwrap();
+    let original = std::fs::read_to_string(&unit).unwrap();
+    let mut app = App::bare(Some(unit.clone()));
+    app.assistant.provider = Provider::Codex;
+    app.assistant.codex_bin = Some(fake_codex("assist-codex-no", codex_edit_turn(&unit)));
+    app.assistant.codex = codex_found(Some(true));
+    let ctx = egui::Context::default();
+    codex_send(&mut app, &ctx, "change it");
+    wait(&mut app, &ctx, "a proposal", |a| {
+        a.assistant.items.iter().any(|i| matches!(i, Item::Card(_)))
+    });
+    let idx = app
+        .assistant
+        .items
+        .iter()
+        .position(|i| matches!(i, Item::Card(_)))
+        .unwrap();
+    app.assistant_decide(idx, false);
+    wait(&mut app, &ctx, "the end of the turn", |a| {
+        !a.assistant.streaming()
+    });
+    assert_eq!(std::fs::read_to_string(&unit).unwrap(), original);
+    assert_eq!(app.assistant.items[idx].card_state(), &CardState::Rejected);
+}
+
+#[test]
+fn codex_not_logged_in_shows_the_login_steps() {
+    let dir = scratch("assist-codex-login");
+    let unit = dir.join("unit1.pas");
+    let turn = json!([[{"notify":{"method":"turn/completed","params":{"threadId":"{THREAD}","turn":{
+        "id":"{TURN}","status":"failed","items":[],
+        "error":{"message":"401 Unauthorized","codexErrorInfo":"unauthorized"}}}}}]]);
+    let mut app = App::bare(Some(unit));
+    app.assistant.provider = Provider::Codex;
+    app.assistant.codex_bin = Some(fake_codex("assist-codex-login", turn));
+    app.assistant.codex = codex_found(Some(true));
+    let ctx = egui::Context::default();
+    codex_send(&mut app, &ctx, "hi");
+    wait(&mut app, &ctx, "the error", |a| {
+        a.assistant
+            .items
+            .iter()
+            .any(|i| matches!(i, Item::Error(_)))
+    });
+    assert!(matches!(&app.assistant.codex, CliState::Found(s) if s.logged_in == Some(false)));
+    assert!(!app.assistant.ready());
+    assert!(
+        app.assistant.show_settings,
+        "the card with the login steps is shown"
+    );
+    let msg = app
+        .assistant
+        .items
+        .iter()
+        .find_map(|i| match i {
+            Item::Error(m) => Some(m.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(msg.contains("codex login"), "{msg}");
 }

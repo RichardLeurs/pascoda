@@ -15,6 +15,10 @@ pub(super) enum Act {
     SaveKey,
     /// The model field of the OpenAI provider changed.
     SaveModel,
+    /// The Claude model field changed or a suggestion was picked.
+    SaveClaudeModel,
+    /// The Codex model field changed.
+    SaveCodexModel,
     RemoveKey,
     ToggleSettings,
     SetProvider(Provider),
@@ -135,7 +139,8 @@ impl App {
             .resizable(true)
             .default_size(380.0)
             .min_size(300.0)
-            .max_size(720.0)
+            // leave the editor (or designer) room: at least 520 pt
+            .max_size((ui.available_width() - 520.0).clamp(300.0, 720.0))
             .show_separator_line(true)
             .frame(Frame::new().fill(pal.chrome))
             .show(ui, |ui| {
@@ -156,8 +161,10 @@ impl App {
                     self.assistant.openai_edit = self.assistant.openai.clone();
                 }
                 Act::SaveModel => self.assistant.persist_openai(),
+                Act::SaveClaudeModel => self.assistant.persist_claude_model(),
+                Act::SaveCodexModel => self.assistant.persist_codex_model(),
                 Act::SetProvider(p) => self.assistant.set_provider(p),
-                Act::CheckCli => self.assistant.refresh_cli(&ctx),
+                Act::CheckCli => self.assistant.refresh_chosen_cli(&ctx),
                 Act::Copy(t) => ctx.copy_text(t),
                 Act::Insert(t) => self.insert_at_cursor(&ctx, &t),
                 Act::ApplyBlock(code) => self.assistant_propose_block(&code),
@@ -187,17 +194,29 @@ fn panel(ui: &mut Ui, pal: &Palette, a: &mut Assistant, view: &View, acts: &mut 
                 .inner_margin(Margin::symmetric(10, 0)),
         )
         .show(ui, |ui| header(ui, pal, a, acts));
-    if !a.ready() {
-        match a.provider {
-            Provider::Api => key_card(ui, pal, a, acts),
-            Provider::OpenAi => openai_card(ui, pal, a, acts),
-            Provider::ClaudeCode => cli_card(ui, pal, a, acts),
+    // The provider page is hidden until the gear is clicked; it then fills the panel.
+    if a.show_settings {
+        if a.ready() {
+            settings(ui, pal, a, acts);
+        } else {
+            match a.provider {
+                Provider::Api => key_card(ui, pal, a, acts),
+                Provider::OpenAi => openai_card(ui, pal, a, acts),
+                Provider::ClaudeCode | Provider::Codex => cli_card(ui, pal, a, acts),
+            }
         }
         return;
     }
-    if a.show_settings {
-        settings(ui, pal, a, acts);
-        hline(ui, pal);
+    if !a.settled() {
+        // Still looking up the key / the CLI: show nothing rather than a card that disappears.
+        Frame::new().fill(pal.editor).show(ui, |ui| {
+            ui.set_min_size(ui.available_size());
+        });
+        return;
+    }
+    if !a.ready() {
+        not_connected(ui, pal);
+        return;
     }
     egui::Panel::bottom("assistant-input")
         .resizable(false)
@@ -251,9 +270,6 @@ fn header(ui: &mut Ui, pal: &Palette, a: &Assistant, acts: &mut Vec<Act>) {
                 .size(12.0)
                 .color(pal.text_secondary),
         );
-        if a.auto_edits {
-            auto_badge(ui, pal, acts);
-        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if icon_button(ui, pal, Icon::Gear, true, a.show_settings)
                 .on_hover_text("Provider and privacy")
@@ -274,6 +290,8 @@ fn header(ui: &mut Ui, pal: &Palette, a: &Assistant, acts: &mut Vec<Act>) {
 }
 
 const PRIVACY_CLI: &str = "What leaves this Mac: the messages you type, the project overview (file names, and the units each file uses), the file, selection, other tabs and build errors you attach with the chips above the input, and any file the assistant reads or edits in this project folder. They go to Anthropic through your own Claude Code (the `claude` program on this Mac, signed in with your Claude account). Pascoda only starts that program and talks to it; it never reads or stores your Claude login. Claude Code keeps its own session files for the conversation. Nothing else is uploaded, and no change is made to a file without your approval (unless you switch on \"Allow edits this session\"). \"What was sent\" under each message shows the exact text.";
+
+const PRIVACY_CODEX: &str = "What leaves this Mac: the messages you type, the project overview (file names, and the units each file uses), the file, selection, other tabs and build errors you attach with the chips above the input, and any file the assistant reads or edits in this project folder. They go to OpenAI through your own Codex (the `codex` program on this Mac, signed in with your ChatGPT or OpenAI login). Pascoda only starts that program and talks to it; it never reads or stores your Codex login. Codex runs in its read-only mode here: it looks at your files, and every change it wants to make is shown to you first (unless you switch on \"Allow edits this session\"); commands that need permission are refused. Codex keeps its own session files and uses your Codex settings, including any tools you have set up there. \"What was sent\" under each message shows the exact text.";
 
 const PRIVACY: &str = "What leaves this Mac: the messages you type, the project overview (file names, and the units each file uses), the file, selection, other tabs and build errors you attach with the chips above the input, and any file the assistant reads or edits in this project folder. They go to Anthropic (api.anthropic.com) with your key. Nothing else is uploaded, and the assistant never changes a file without your approval (unless you switch on \"Allow edits this session\") or runs a build without it. \"What was sent\" under each message shows the exact text.";
 
@@ -297,10 +315,21 @@ pub(super) fn privacy_openai(s: &OpenAiSettings) -> String {
     )
 }
 
-/// The three providers as radio rows.
+/// The providers as radio rows, grouped by vendor (Claude, then OpenAI).
 fn provider_choice(ui: &mut Ui, pal: &Palette, a: &Assistant, acts: &mut Vec<Act>) {
     let enabled = !a.streaming();
+    let mut vendor = "";
     for p in Provider::ALL {
+        if p.vendor() != vendor {
+            vendor = p.vendor();
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(vendor)
+                    .size(12.0)
+                    .strong()
+                    .color(pal.text_secondary),
+            );
+        }
         let on = a.provider == p;
         let galley = ui.painter().layout_no_wrap(
             p.label().to_string(),
@@ -355,7 +384,7 @@ fn cli_card(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<Act>) 
                     ui.add_space(6.0);
                     ui.vertical_centered(|ui| {
                         ui.label(
-                            RichText::new("Connect to Claude")
+                            RichText::new(format!("Connect to {}", a.provider.vendor()))
                                 .size(17.0)
                                 .color(pal.text),
                         );
@@ -365,7 +394,15 @@ fn cli_card(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<Act>) 
                     ui.add_space(10.0);
                     cli_status_card(ui, pal, a, acts);
                     ui.add_space(12.0);
-                    privacy_box(ui, pal, PRIVACY_CLI);
+                    privacy_box(
+                        ui,
+                        pal,
+                        if a.provider == Provider::Codex {
+                            PRIVACY_CODEX
+                        } else {
+                            PRIVACY_CLI
+                        },
+                    );
                 });
             });
     });
@@ -378,14 +415,31 @@ fn privacy_box(ui: &mut Ui, pal: &Palette, text: &str) {
         .inner_margin(Margin::same(10))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new("Privacy").size(12.0).color(pal.text));
+            ui.label(RichText::new("Privacy").size(13.0).color(pal.text));
             ui.add_space(2.0);
-            ui.label(RichText::new(text).size(11.5).color(pal.text_secondary));
+            ui.label(RichText::new(text).size(13.0).color(pal.text_secondary));
         });
 }
 
-/// What the app knows about the `claude` program, and what to do about it.
+/// What the app knows about the `claude` or `codex` program, and what to do about it.
 fn cli_status_card(ui: &mut Ui, pal: &Palette, a: &Assistant, acts: &mut Vec<Act>) {
+    let codex = a.provider == Provider::Codex;
+    let (name, program, state) = if codex {
+        ("Codex", "codex", &a.codex)
+    } else {
+        ("Claude Code", "claude", &a.cli)
+    };
+    let (install, login_how) = if codex {
+        (
+            "Pascoda uses the Codex program installed on this Mac, so your ChatGPT or OpenAI login works without a key in Pascoda. Install it with `npm i -g @openai/codex` (or `brew install codex`), then log in once: open a terminal and run `codex login`.",
+            "Open a terminal, run `codex login` and sign in. Then come back and check again.",
+        )
+    } else {
+        (
+            "Pascoda uses the Claude Code program installed on this Mac, so your Claude subscription works without an API key. Install it from claude.com/claude-code, then log in once: open a terminal, run `claude`, and type /login.",
+            "Open a terminal, run `claude` once, type /login and sign in with your Claude account. Then come back and check again.",
+        )
+    };
     Frame::new()
         .fill(pal.sidebar)
         .corner_radius(8)
@@ -393,23 +447,23 @@ fn cli_status_card(ui: &mut Ui, pal: &Palette, a: &Assistant, acts: &mut Vec<Act
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             let note = |ui: &mut Ui, t: &str, color: Color32| {
-                ui.label(RichText::new(t).size(12.0).color(color));
+                ui.label(RichText::new(t).size(13.0).color(color));
             };
-            match &a.cli {
+            match state {
                 CliState::Unchecked | CliState::Checking => {
                     ui.horizontal(|ui| {
-                        ui.add(egui::Spinner::new().size(12.0));
-                        note(ui, "Looking for Claude Code...", pal.text_secondary);
+                        ui.add(egui::Spinner::new().size(13.0));
+                        note(ui, &format!("Looking for {name}..."), pal.text_secondary);
                     });
                 }
                 CliState::Missing => {
-                    ui.label(RichText::new("Claude Code was not found").size(12.5).color(pal.error));
-                    ui.add_space(2.0);
-                    note(
-                        ui,
-                        "Pascoda uses the Claude Code program installed on this Mac, so your Claude subscription works without an API key. Install it from claude.com/claude-code, then log in once: open a terminal, run `claude`, and type /login.",
-                        pal.text_secondary,
+                    ui.label(
+                        RichText::new(format!("{name} was not found"))
+                            .size(13.0)
+                            .color(pal.error),
                     );
+                    ui.add_space(2.0);
+                    note(ui, install, pal.text_secondary);
                     ui.add_space(6.0);
                     if text_button(ui, pal, "Check again", true, true).clicked() {
                         acts.push(Act::CheckCli);
@@ -418,25 +472,25 @@ fn cli_status_card(ui: &mut Ui, pal: &Palette, a: &Assistant, acts: &mut Vec<Act
                 CliState::Found(s) => {
                     let v = s.version.as_deref().unwrap_or("(version unknown)");
                     if s.logged_in == Some(false) {
-                        ui.label(RichText::new("Claude Code is not logged in").size(12.5).color(pal.error));
-                        ui.add_space(2.0);
-                        note(
-                            ui,
-                            &format!("Found Claude Code {v}. Open a terminal, run `claude` once, type /login and sign in with your Claude account. Then come back and check again."),
-                            pal.text_secondary,
+                        ui.label(
+                            RichText::new(format!("{name} is not logged in"))
+                                .size(13.0)
+                                .color(pal.error),
                         );
+                        ui.add_space(2.0);
+                        note(ui, &format!("Found {name} {v}. {login_how}"), pal.text_secondary);
                         ui.add_space(6.0);
                         if text_button(ui, pal, "Check again", true, true).clicked() {
                             acts.push(Act::CheckCli);
                         }
                     } else {
-                        ui.label(RichText::new(format!("Claude Code {v}")).size(12.5).color(pal.text));
+                        ui.label(RichText::new(format!("{name} {v}")).size(13.0).color(pal.text));
                         let login = match s.logged_in {
-                            Some(true) => "Logged in with your Claude account.",
-                            _ => "Login state unknown; if a message fails, run `claude` in a terminal and type /login.",
+                            Some(true) => format!("Logged in ({name} keeps the login itself)."),
+                            _ => format!("Login state unknown; if a message fails, run `{program} login` in a terminal."),
                         };
-                        note(ui, login, pal.text_secondary);
-                        note(ui, &s.binary.display().to_string(), pal.text_tertiary);
+                        note(ui, &login, pal.text_secondary);
+                        note(ui, &s.binary.display().to_string(), pal.text_secondary);
                         ui.add_space(6.0);
                         if text_button(ui, pal, "Check again", false, true).clicked() {
                             acts.push(Act::CheckCli);
@@ -466,9 +520,9 @@ fn key_card(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<Act>) 
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new(
-                        "Pascoda uses your own Anthropic API key. Create one at console.anthropic.com (Settings > API keys) and paste it here.",
+                        "Pascoda uses your own Claude Console API key. Create one at console.anthropic.com (Settings > API keys) and paste it here.",
                     )
-                    .size(12.5)
+                    .size(13.0)
                     .color(pal.text_secondary),
                 );
                 ui.add_space(10.0);
@@ -484,7 +538,7 @@ fn key_card(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<Act>) 
                 let enter = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                 if let Some(m) = &a.key_message {
                     ui.add_space(4.0);
-                    ui.label(RichText::new(m).size(12.0).color(pal.error));
+                    ui.label(RichText::new(m).size(13.0).color(pal.error));
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
@@ -498,8 +552,8 @@ fn key_card(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<Act>) 
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new("The key is kept in the macOS Keychain (service \"Pascoda\"). It is never written to a file or shown again. ANTHROPIC_API_KEY in the environment also works.")
-                        .size(11.5)
-                        .color(pal.text_tertiary),
+                        .size(13.0)
+                        .color(pal.text_secondary),
                 );
                 ui.add_space(12.0);
                 Frame::new()
@@ -508,9 +562,9 @@ fn key_card(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<Act>) 
                     .inner_margin(Margin::same(10))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        ui.label(RichText::new("Privacy").size(12.0).color(pal.text));
+                        ui.label(RichText::new("Privacy").size(13.0).color(pal.text));
                         ui.add_space(2.0);
-                        ui.label(RichText::new(PRIVACY).size(11.5).color(pal.text_secondary));
+                        ui.label(RichText::new(PRIVACY).size(13.0).color(pal.text_secondary));
                     });
             });
         });
@@ -520,7 +574,7 @@ fn key_card(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<Act>) 
 /// The OpenAI provider's fields: endpoint, model and key, with Save and Remove key.
 fn openai_fields(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<Act>) {
     let label = |ui: &mut Ui, t: &str| {
-        ui.label(RichText::new(t).size(11.5).color(pal.text_tertiary));
+        ui.label(RichText::new(t).size(13.0).color(pal.text_secondary));
     };
     label(ui, "Base URL");
     let url = ui.add(
@@ -542,7 +596,7 @@ fn openai_fields(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<A
     ui.horizontal_wrapped(|ui| {
         for m in pascoda_ai::openai::SUGGESTED_MODELS {
             if ui
-                .selectable_label(a.openai_edit.model == m, RichText::new(m).size(11.5))
+                .selectable_label(a.openai_edit.model == m, RichText::new(m).size(13.0))
                 .clicked()
             {
                 a.openai_edit.model = m.into();
@@ -582,14 +636,14 @@ fn openai_fields(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<A
         _ => ("No API key (not needed for this server).", false),
     };
     // The normal text colour (white in dark mode) once a key is stored, not green.
-    ui.label(RichText::new(status).size(12.0).color(if stored {
+    ui.label(RichText::new(status).size(13.0).color(if stored {
         pal.text
     } else {
         pal.text_secondary
     }));
     if let Some(m) = &a.key_message {
         ui.add_space(2.0);
-        ui.label(RichText::new(m).size(12.0).color(pal.error));
+        ui.label(RichText::new(m).size(13.0).color(pal.error));
     }
     ui.add_space(8.0);
     ui.horizontal(|ui| {
@@ -606,8 +660,8 @@ fn openai_fields(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<A
     ui.add_space(4.0);
     ui.label(
         RichText::new("The key is kept in the macOS Keychain (service \"Pascoda\", account \"openai\"); OPENAI_API_KEY in the environment also works. The base URL and model are saved in a plain settings file, never the key. For a local server use e.g. http://localhost:11434/v1 (Ollama) or http://localhost:1234/v1 (LM Studio).")
-            .size(11.5)
-            .color(pal.text_tertiary),
+            .size(13.0)
+            .color(pal.text_secondary),
     );
 }
 
@@ -633,7 +687,7 @@ fn openai_card(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<Act
                     RichText::new(
                         "Pascoda uses your own OpenAI API key (platform.openai.com), or any server that speaks the same API: change the base URL.",
                     )
-                    .size(12.5)
+                    .size(13.0)
                     .color(pal.text_secondary),
                 );
                 ui.add_space(10.0);
@@ -645,11 +699,11 @@ fn openai_card(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<Act
                     .inner_margin(Margin::same(10))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        ui.label(RichText::new("Privacy").size(12.0).color(pal.text));
+                        ui.label(RichText::new("Privacy").size(13.0).color(pal.text));
                         ui.add_space(2.0);
                         ui.label(
                             RichText::new(privacy_openai(&a.openai_edit))
-                                .size(11.5)
+                                .size(13.0)
                                 .color(pal.text_secondary),
                         );
                     });
@@ -658,61 +712,99 @@ fn openai_card(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<Act
     });
 }
 
-fn settings(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<Act>) {
-    Frame::new()
-        .fill(pal.sidebar)
-        .inner_margin(Margin::symmetric(12, 8))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
+/// Shown instead of the chat while no provider is usable and the settings are closed.
+fn not_connected(ui: &mut Ui, pal: &Palette) {
+    Frame::new().fill(pal.editor).show(ui, |ui| {
+        ui.set_min_size(ui.available_size());
+        ui.add_space(40.0);
+        ui.vertical_centered(|ui| {
+            let (r, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
+            paint_icon(ui.painter(), r, Icon::Sparkle, pal.text_secondary);
+            ui.add_space(4.0);
             ui.label(
-                RichText::new("Provider")
-                    .size(11.5)
-                    .color(pal.text_tertiary),
+                RichText::new("The assistant is not connected")
+                    .size(15.0)
+                    .color(pal.text_secondary),
             );
-            provider_choice(ui, pal, a, acts);
-            ui.add_space(6.0);
-            match a.provider {
-                Provider::Api => {
-                    let (text, removable) = match a.key {
-                        KeyState::Keychain => ("API key: stored in the macOS Keychain.", true),
-                        KeyState::Env => {
-                            ("API key: from ANTHROPIC_API_KEY in the environment.", false)
-                        }
-                        _ => ("No API key.", false),
-                    };
-                    ui.label(RichText::new(text).size(12.0).color(pal.text));
-                    if let Some(m) = &a.key_message {
-                        ui.label(RichText::new(m).size(11.5).color(pal.error));
-                    }
-                    if removable {
-                        ui.add_space(4.0);
-                        if text_button(ui, pal, "Remove key", false, true).clicked() {
-                            acts.push(Act::RemoveKey);
-                        }
-                    }
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(PRIVACY).size(11.0).color(pal.text_tertiary));
-                }
-                Provider::OpenAi => {
-                    openai_fields(ui, pal, a, acts);
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new(privacy_openai(&a.openai))
-                            .size(11.0)
-                            .color(pal.text_tertiary),
-                    );
-                }
-                Provider::ClaudeCode => {
-                    cli_status_card(ui, pal, a, acts);
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new(PRIVACY_CLI)
-                            .size(11.0)
-                            .color(pal.text_tertiary),
-                    );
-                }
-            }
+            ui.label(
+                RichText::new("Click the gear to choose a provider.")
+                    .size(13.0)
+                    .color(pal.text_secondary),
+            );
         });
+    });
+}
+
+fn settings(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<Act>) {
+    Frame::new().fill(pal.sidebar).show(ui, |ui| {
+        ui.set_min_size(ui.available_size());
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                Frame::new()
+                    .inner_margin(Margin::symmetric(12, 8))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            RichText::new("Provider")
+                                .size(13.0)
+                                .color(pal.text_secondary),
+                        );
+                        provider_choice(ui, pal, a, acts);
+                        ui.add_space(6.0);
+                        match a.provider {
+                            Provider::Api => {
+                                let (text, removable) = match a.key {
+                                    KeyState::Keychain => {
+                                        ("API key: stored in the macOS Keychain.", true)
+                                    }
+                                    KeyState::Env => (
+                                        "API key: from ANTHROPIC_API_KEY in the environment.",
+                                        false,
+                                    ),
+                                    _ => ("No API key.", false),
+                                };
+                                ui.label(RichText::new(text).size(13.0).color(pal.text));
+                                if let Some(m) = &a.key_message {
+                                    ui.label(RichText::new(m).size(13.0).color(pal.error));
+                                }
+                                if removable {
+                                    ui.add_space(4.0);
+                                    if text_button(ui, pal, "Remove key", false, true).clicked() {
+                                        acts.push(Act::RemoveKey);
+                                    }
+                                }
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new(PRIVACY).size(13.0).color(pal.text_secondary),
+                                );
+                            }
+                            Provider::OpenAi => {
+                                openai_fields(ui, pal, a, acts);
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new(privacy_openai(&a.openai))
+                                        .size(13.0)
+                                        .color(pal.text_secondary),
+                                );
+                            }
+                            Provider::ClaudeCode | Provider::Codex => {
+                                cli_status_card(ui, pal, a, acts);
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new(if a.provider == Provider::Codex {
+                                        PRIVACY_CODEX
+                                    } else {
+                                        PRIVACY_CLI
+                                    })
+                                    .size(13.0)
+                                    .color(pal.text_secondary),
+                                );
+                            }
+                        }
+                    });
+            });
+    });
 }
 
 fn empty_state(ui: &mut Ui, pal: &Palette, acts: &mut Vec<Act>) {
@@ -727,7 +819,7 @@ fn empty_state(ui: &mut Ui, pal: &Palette, acts: &mut Vec<Act>) {
                 .color(pal.text_secondary),
         );
         ui.label(
-            RichText::new("The assistant sees what the chips below the chat attach.")
+            RichText::new("The assistant receives the attached context items as input.")
                 .size(12.0)
                 .color(pal.text_tertiary),
         );
@@ -806,7 +898,9 @@ fn input_area(ui: &mut Ui, pal: &Palette, a: &mut Assistant, view: &View, acts: 
                             .desired_rows(2)
                             .desired_width(f32::INFINITY)
                             .frame(Frame::NONE)
-                            .hint_text(if a.provider == Provider::OpenAi {
+                            .hint_text(if a.provider == Provider::Codex {
+                                "Ask Codex...  Enter sends, Shift+Enter adds a line"
+                            } else if a.provider == Provider::OpenAi {
                                 "Ask the assistant...  Enter sends, Shift+Enter adds a line"
                             } else {
                                 "Ask Claude...  Enter sends, Shift+Enter adds a line"
@@ -822,58 +916,50 @@ fn input_area(ui: &mut Ui, pal: &Palette, a: &mut Assistant, view: &View, acts: 
                 });
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(!streaming, |ui| {
-                    if a.provider == Provider::OpenAi {
-                        let r = ui.add(
-                            egui::TextEdit::singleline(&mut a.openai.model)
-                                .hint_text("model name")
-                                .font(FontId::proportional(12.0))
-                                .desired_width(150.0),
-                        );
-                        r.widget_info(|| {
-                            egui::WidgetInfo::labeled(egui::Role::TextInput, true, "Model")
-                        });
-                        if r.changed() {
-                            acts.push(Act::SaveModel);
+                    if a.provider == Provider::Codex {
+                        // Empty = Codex's own default model; any name Codex accepts can be typed.
+                        if model_field(
+                            ui,
+                            &mut a.codex_model,
+                            &[],
+                            "codex-model-list",
+                            "default model",
+                        ) {
+                            acts.push(Act::SaveCodexModel);
                         }
-                        let mut picked = None;
-                        let list = egui::ComboBox::from_id_salt("openai-model-list")
-                            .selected_text("")
-                            .width(14.0)
-                            .show_ui(ui, |ui| {
-                                for m in pascoda_ai::openai::SUGGESTED_MODELS {
-                                    if ui.selectable_label(a.openai.model == m, m).clicked() {
-                                        picked = Some(m);
-                                    }
-                                }
-                            });
-                        list.response.widget_info(|| {
-                            egui::WidgetInfo::labeled(
-                                egui::Role::ComboBox,
-                                true,
-                                "Suggested models",
-                            )
-                        });
-                        if let Some(m) = picked {
-                            a.openai.model = m.into();
+                        return;
+                    }
+                    if a.provider == Provider::OpenAi {
+                        let suggestions: Vec<(String, String)> =
+                            pascoda_ai::openai::SUGGESTED_MODELS
+                                .iter()
+                                .map(|m| (m.to_string(), m.to_string()))
+                                .collect();
+                        if model_field(
+                            ui,
+                            &mut a.openai.model,
+                            &suggestions,
+                            "openai-model-list",
+                            "model name",
+                        ) {
                             acts.push(Act::SaveModel);
                         }
                         return;
                     }
-                    let current = pascoda_ai::MODELS
+                    let mut suggestions: Vec<(String, String)> = pascoda_ai::MODELS
                         .iter()
-                        .find(|(m, _)| *m == a.model)
-                        .map_or(a.model.as_str(), |(_, n)| *n);
-                    let combo = egui::ComboBox::from_id_salt("assistant-model")
-                        .selected_text(RichText::new(current).size(12.0))
-                        .width(150.0)
-                        .show_ui(ui, |ui| {
-                            for (m, name) in pascoda_ai::MODELS {
-                                ui.selectable_value(&mut a.model, m.to_string(), name);
-                            }
-                        });
-                    combo.response.widget_info(|| {
-                        egui::WidgetInfo::labeled(egui::Role::ComboBox, true, "Model")
-                    });
+                        .map(|(m, n)| (m.to_string(), n.to_string()))
+                        .collect();
+                    suggestions.extend(a.extra_models.iter().map(|m| (m.clone(), m.clone())));
+                    if model_field(
+                        ui,
+                        &mut a.model,
+                        &suggestions,
+                        "assistant-model",
+                        "model name",
+                    ) {
+                        acts.push(Act::SaveClaudeModel);
+                    }
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if streaming {
@@ -904,6 +990,47 @@ fn input_area(ui: &mut Ui, pal: &Palette, a: &mut Assistant, view: &View, acts: 
     );
 }
 
+/// The model chooser: a text field for any model name plus a small dropdown of suggestions
+/// (`(id, label)`). True when the model changed.
+fn model_field(
+    ui: &mut Ui,
+    model: &mut String,
+    suggestions: &[(String, String)],
+    list_id: &str,
+    hint: &str,
+) -> bool {
+    let mut changed = false;
+    let r = ui.add(
+        egui::TextEdit::singleline(model)
+            .hint_text(hint)
+            .font(FontId::proportional(12.0))
+            .desired_width(150.0),
+    );
+    r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, "Model"));
+    changed |= r.changed();
+    if suggestions.is_empty() {
+        return changed;
+    }
+    let mut picked = None;
+    let list = egui::ComboBox::from_id_salt(list_id)
+        .selected_text("")
+        .width(14.0)
+        .show_ui(ui, |ui| {
+            for (id, label) in suggestions {
+                if ui.selectable_label(model == id, label).clicked() {
+                    picked = Some(id.clone());
+                }
+            }
+        });
+    list.response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, true, "Suggested models"));
+    if let Some(id) = picked {
+        *model = id;
+        changed = true;
+    }
+    changed
+}
+
 /// `12,345 tokens in, 987 out` (and how many of the input came from the cache).
 pub fn usage_line(u: &Usage) -> String {
     let n = |v: u64| {
@@ -926,27 +1053,6 @@ pub fn usage_line(u: &Usage) -> String {
         s.push_str(&format!(" ({} cached)", n(u.cache_read_input_tokens)));
     }
     s
-}
-
-/// The orange chip in the header while "Allow edits this session" is on; a click turns it off.
-fn auto_badge(ui: &mut Ui, pal: &Palette, acts: &mut Vec<Act>) {
-    let label = "Edits applied automatically";
-    // Dark text: the pill is yellow in both themes, and white on yellow cannot be read.
-    let ink = Color32::from_rgb(0x2B, 0x20, 0x00);
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label.to_string(), FontId::proportional(11.0), ink);
-    let (rect, resp) = ui.allocate_exact_size(vec2(galley.size().x + 16.0, 18.0), Sense::click());
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
-    ui.painter().rect_filled(rect, 9.0, pal.warning);
-    ui.painter()
-        .galley(rect.center() - galley.size() / 2.0, galley, ink);
-    if resp
-        .on_hover_text("Proposed edits are applied without asking. Click to switch this off.")
-        .clicked()
-    {
-        acts.push(Act::ToggleAuto);
-    }
 }
 
 /// A small on/off switch with a label; true when clicked.

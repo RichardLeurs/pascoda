@@ -47,7 +47,8 @@ cp "$lz"/COPYING*.txt "$res/lazarus/"
 rsync -a --exclude '.git' "$lz/lcl" "$res/lazarus/"
 for c in lazutils codetools freetype; do rsync -a --exclude '.git' "$lz/components/$c" "$res/lazarus/components/"; done
 git -C "$lz" rev-parse --short HEAD > "$res/lazarus/.pascoda-commit" 2>/dev/null || echo bundled > "$res/lazarus/.pascoda-commit"
-rsync -a --exclude '.git' "$root/vendor/fpcsrc" "$res/"
+mkdir -p "$res/fpcsrc"
+rsync -a --exclude '.git' --exclude-from="$root/packaging/fpcsrc.exclude" "$root/vendor/fpcsrc/" "$res/fpcsrc/"
 cp "$root/vendor/pasls/dist/aarch64-darwin/pasls" "$res/pasls/dist/aarch64-darwin/"
 cp "$root/vendor/pasls/COPYING" "$res/pasls/COPYING"
 

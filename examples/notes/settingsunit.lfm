@@ -59,6 +59,7 @@ object SettingsForm: TSettingsForm
     Kind = bkOK
     ModalResult = 1
     TabOrder = 3
+    OnClick = OKButtonClick
   end
   object CancelButton: TBitBtn
     Anchors = [akRight, akBottom]

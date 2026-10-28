@@ -39,10 +39,9 @@ impl Config {
                     .map(Path::to_path_buf),
             );
         }
-        Self::find_in(
-            dirs.iter().map(PathBuf::as_path),
-            Path::new("/opt/homebrew/bin/fpc"),
-        )
+        // `pasls` needs the compiler's path (`PP`); wherever fpc is installed, not only Homebrew.
+        let fpc = pascoda_fpc::locate_fpc()?;
+        Self::find_in(dirs.iter().map(PathBuf::as_path), &fpc)
     }
 
     fn find_in<'a>(dirs: impl Iterator<Item = &'a Path>, fpc: &Path) -> Option<Self> {

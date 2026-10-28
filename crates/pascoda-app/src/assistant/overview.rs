@@ -419,17 +419,23 @@ fn cap_line(s: String) -> String {
 }
 
 fn summary_line(rel: &str, s: &Summary, form: Option<&str>) -> String {
-    let mut line = format!("{rel}: {} {}", s.kind.word(), s.name);
+    let head = format!("{rel}: {} {}", s.kind.word(), s.name);
+    // The form class is worth more than the end of a long `uses` list: it is kept, and the
+    // lists are cut with "..." when the line would be too long.
+    let tail = form.map(|c| format!("; form {c}")).unwrap_or_default();
+    let mut mid = String::new();
     if !s.uses.is_empty() {
-        line.push_str(&format!("; uses {}", s.uses.join(", ")));
+        mid.push_str(&format!("; uses {}", s.uses.join(", ")));
     }
     if !s.impl_uses.is_empty() {
-        line.push_str(&format!("; implementation uses {}", s.impl_uses.join(", ")));
+        mid.push_str(&format!("; implementation uses {}", s.impl_uses.join(", ")));
     }
-    if let Some(c) = form {
-        line.push_str(&format!("; form {c}"));
+    let budget = MAX_LINE_CHARS.saturating_sub(head.chars().count() + tail.chars().count());
+    if mid.chars().count() > budget {
+        let keep = budget.saturating_sub(3);
+        mid = mid.chars().take(keep).collect::<String>() + "...";
     }
-    cap_line(line)
+    cap_line(format!("{head}{mid}{tail}"))
 }
 
 /// The overview text. `overlay` holds the text of open tabs (project-relative path, text); it

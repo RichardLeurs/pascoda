@@ -66,6 +66,10 @@ enum Act {
     Delete,
 }
 
+/// Width of the item list, and the gap between it and the properties.
+const LIST_W: f32 = 300.0;
+const GAP: f32 = 20.0;
+
 /// Draws the editor in the space the canvas would take. Returns `false` once it is closed.
 pub(super) fn show(
     d: &mut Designer,
@@ -129,7 +133,21 @@ pub(super) fn show(
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.horizontal_top(|ui| {
+                    // List and properties side by side when there is room, else stacked: the
+                    // editor must stay inside the area between the navigator and the inspector.
+                    let avail_w = ui.available_width();
+                    let wide = avail_w >= LIST_W + GAP + 360.0;
+                    let list_w = if wide {
+                        LIST_W
+                    } else {
+                        (avail_w - 14.0).clamp(200.0, LIST_W)
+                    };
+                    let side_w = if wide {
+                        (avail_w - LIST_W - GAP - 14.0).min(460.0)
+                    } else {
+                        avail_w.min(460.0)
+                    };
+                    let mut body = |ui: &mut egui::Ui| {
                         Frame::new()
                             .fill(pal.sidebar)
                             .stroke(Stroke::new(1.0, pal.separator))
@@ -137,7 +155,7 @@ pub(super) fn show(
                             .inner_margin(Margin::same(6))
                             .show(ui, |ui| {
                                 ui.vertical(|ui| {
-                                    ui.set_width(300.0);
+                                    ui.set_width(list_w);
                                     list(d, ui, &pal, &rows, &sel, unit, out);
                                     if rows.is_empty() {
                                         ui.add_space(6.0);
@@ -158,9 +176,9 @@ pub(super) fn show(
                                     }
                                 });
                             });
-                        ui.add_space(20.0);
+                        ui.add_space(GAP);
                         ui.vertical(|ui| {
-                            ui.set_max_width(460.0);
+                            ui.set_max_width(side_w);
                             match &cur {
                                 Some(c) => properties(d, state, ui, &pal, &sel, c, unit, out),
                                 None => {
@@ -177,7 +195,12 @@ pub(super) fn show(
                                 preview(d, ui, &pal, &owner, &sel, main_menu);
                             }
                         });
-                    });
+                    };
+                    if wide {
+                        ui.horizontal_top(&mut body);
+                    } else {
+                        ui.vertical(&mut body);
+                    }
                 });
         });
 
@@ -262,9 +285,11 @@ fn toolbar(
             *act = Some(a);
         }
     };
-    ui.horizontal(|ui| {
-        pill(ui, pal, |ui| {
-            if is_menu {
+    // Three groups of buttons. egui does not wrap a group once it has started on a row, so the
+    // rows are chosen from the width: all in one, add + (move, delete), or one group per row.
+    let mut group = |ui: &mut egui::Ui, which: usize| {
+        pill(ui, pal, |ui| match which {
+            0 if is_menu => {
                 button(
                     ui,
                     "Add Item",
@@ -286,58 +311,66 @@ fn toolbar(
                     true,
                     Act::Add(NewItem::Separator),
                 );
-            } else {
-                button(
-                    ui,
-                    "Add Action",
-                    "A new action after the selected one",
-                    true,
-                    Act::Add(NewItem::Item),
-                );
             }
-        });
-        pill(ui, pal, |ui| {
-            button(
+            0 => button(
                 ui,
-                "Up",
-                "Move up (Cmd+Up)",
-                at_item && siblings_before,
-                Act::Move(-1),
-            );
-            button(
-                ui,
-                "Down",
-                "Move down (Cmd+Down)",
-                at_item && last_sibling,
-                Act::Move(1),
-            );
-            if is_menu {
+                "Add Action",
+                "A new action after the selected one",
+                true,
+                Act::Add(NewItem::Item),
+            ),
+            1 => {
                 button(
                     ui,
-                    "Outdent",
-                    "Out of its parent item (Cmd+Left)",
-                    at_item && depth > 0,
-                    Act::Outdent,
-                );
-                button(
-                    ui,
-                    "Indent",
-                    "Into the item above (Cmd+Right)",
+                    "Up",
+                    "Move up (Cmd+Up)",
                     at_item && siblings_before,
-                    Act::Indent,
+                    Act::Move(-1),
                 );
+                button(
+                    ui,
+                    "Down",
+                    "Move down (Cmd+Down)",
+                    at_item && last_sibling,
+                    Act::Move(1),
+                );
+                if is_menu {
+                    button(
+                        ui,
+                        "Outdent",
+                        "Out of its parent item (Cmd+Left)",
+                        at_item && depth > 0,
+                        Act::Outdent,
+                    );
+                    button(
+                        ui,
+                        "Indent",
+                        "Into the item above (Cmd+Right)",
+                        at_item && siblings_before,
+                        Act::Indent,
+                    );
+                }
             }
-        });
-        pill(ui, pal, |ui| {
-            button(
+            _ => button(
                 ui,
                 "Delete",
                 "Delete with its sub-items (Delete)",
                 at_item,
                 Act::Delete,
-            );
+            ),
         });
-    });
+    };
+    let width = ui.available_width();
+    if width >= 600.0 {
+        ui.horizontal(|ui| (0..3).for_each(|g| group(ui, g)));
+    } else if width >= 300.0 {
+        ui.horizontal(|ui| group(ui, 0));
+        ui.horizontal(|ui| (1..3).for_each(|g| group(ui, g)));
+    } else {
+        (0..3).for_each(|g| {
+            ui.horizontal(|ui| group(ui, g));
+        });
+    }
 }
 
 /// The item tree: one row per item, indented by depth.
@@ -571,7 +604,7 @@ fn preview(
             break;
         }
     }
-    let width = ui.available_width().clamp(320.0, 460.0);
+    let width = ui.available_width().clamp(200.0, 460.0);
     let (rect, _) = ui.allocate_exact_size(vec2(width, 250.0), Sense::hover());
     let p = ui.painter_at(rect);
     let desk = if pal.dark {

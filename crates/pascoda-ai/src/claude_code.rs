@@ -57,7 +57,7 @@ const SCRUBBED_ENV: [&str; 1] = ["ANTHROPIC_API_KEY"];
 
 // ---- finding the binary and its state ------------------------------------------------------
 
-fn is_executable(p: &Path) -> bool {
+pub(crate) fn is_executable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
@@ -1035,7 +1035,7 @@ fn read_scope(sandbox: &Sandbox, tool: &str, input: &Value) -> Result<(), String
 }
 
 /// The text of a file as the IDE has it (unsaved tabs and open forms win over the disk).
-fn current_text(host: &mut dyn Host, abs: &Path) -> Option<String> {
+pub(crate) fn current_text(host: &mut dyn Host, abs: &Path) -> Option<String> {
     host.open_text(abs)
         .or_else(|| {
             (abs.extension()
