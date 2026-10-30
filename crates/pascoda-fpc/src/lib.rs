@@ -2,7 +2,10 @@
 
 pub mod check;
 pub mod export;
+pub mod bundled;
 pub mod lcl;
+pub mod vendor;
+pub mod unittest;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -168,11 +171,19 @@ fn progress_for(line: &str, done: &mut usize, plan: &Plan) -> Option<Progress> {
 pub const NOT_FOUND_HINT: &str = "Free Pascal (fpc) was not found. Install it with `brew install fpc` \
 (or from freepascal.org), then restart Pascoda.";
 
-/// Finds the `fpc` executable: `$PASCODA_FPC`, then `$PATH`, then the usual install folders.
+/// Finds the `fpc` executable: `$PASCODA_FPC`, then the compiler that ships with Pascoda (`bundled`),
+/// then `$PATH`, then the usual install folders.
 /// An app started from Finder has a minimal `PATH` without Homebrew, so the folders matter.
 pub fn locate_fpc() -> Option<PathBuf> {
+    let forced = std::env::var_os("PASCODA_FPC").map(PathBuf::from);
+    // The compiler that ships with Pascoda is the tested one, so it comes before an installed one.
+    if forced.is_none()
+        && let Some(bundled) = bundled::fpc()
+    {
+        return Some(bundled);
+    }
     find_fpc(
-        std::env::var_os("PASCODA_FPC").map(PathBuf::from),
+        forced,
         std::env::var_os("PATH"),
         std::env::var_os("HOME").map(PathBuf::from),
     )
@@ -204,6 +215,39 @@ fn find_fpc(
     dirs.into_iter()
         .map(|d| d.join("fpc"))
         .find(|p| p.is_file())
+}
+
+/// The configuration arguments for an fpc run in `dir`.
+///
+/// fpc reads only the first configuration file it finds: the `fpc.cfg` in the directory it runs
+/// in, else `~/.fpc.cfg`, else the one next to the compiler. A project's own `fpc.cfg` would
+/// therefore replace the global file and drop its unit paths, and the build would fail. Instead
+/// the global file is read explicitly, then `~/.fpc.cfg` and the project's `fpc.cfg` (so their
+/// settings win), and `-n` stops fpc's own search. Without a global file next to the compiler,
+/// fpc's search is kept as it is.
+pub fn config_args(fpc: &Path, dir: &Path) -> Vec<std::ffi::OsString> {
+    let prefix = fpc.parent().and_then(Path::parent);
+    // The bundled compiler has no configuration file of its own (an app can move): one is written for
+    // where it is now. An installed compiler has its `etc/fpc.cfg`.
+    let global = match prefix {
+        Some(p) if bundled::is_bundle(p) => bundled::config_file(p),
+        Some(p) => Some(p.join("etc/fpc.cfg")).filter(|f| f.is_file()),
+        None => None,
+    };
+    let Some(global) = global else {
+        return Vec::new();
+    };
+    let mut args: Vec<std::ffi::OsString> = vec!["-n".into(), format!("@{}", global.display()).into()];
+    let home = std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join(".fpc.cfg"))
+        .filter(|p| p.is_file());
+    for file in [home, Some(dir.join("fpc.cfg")).filter(|p| p.is_file())]
+        .into_iter()
+        .flatten()
+    {
+        args.push(format!("@{}", file.display()).into());
+    }
+    args
 }
 
 /// Compiles `source` with debug info. Runs fpc in the source's directory.
@@ -238,6 +282,29 @@ pub fn build_progress_with(
             total,
             ..Plan::WHOLE
         },
+        on,
+    )
+}
+
+/// [`build_progress_with`] in a configuration: `release` builds optimised, without debug information
+/// (`-O2 -Xs`), as the export does; otherwise it is the debug build (`-g`).
+pub fn build_progress_configured(
+    source: &Path,
+    mode: Mode,
+    extra: &[std::ffi::OsString],
+    total: Option<usize>,
+    release: bool,
+    on: &mut dyn FnMut(Progress),
+) -> std::io::Result<BuildResult> {
+    build_streaming_as(
+        source,
+        mode,
+        extra,
+        Plan {
+            total,
+            ..Plan::WHOLE
+        },
+        release,
         on,
     )
 }
@@ -280,7 +347,9 @@ pub(crate) fn build_streaming_as(
     let file = source.file_name().unwrap_or(source.as_os_str());
     let fpc = locate_fpc()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, NOT_FOUND_HINT))?;
+    let config = config_args(&fpc, dir);
     let mut child = Command::new(fpc)
+        .args(config)
         .args(if release {
             &["-O2", "-Xs"][..]
         } else {

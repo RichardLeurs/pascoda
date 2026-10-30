@@ -4,6 +4,7 @@ pub mod geometry;
 pub mod item_editor;
 pub mod menu;
 pub mod native;
+pub mod imports;
 pub mod ui;
 pub mod viewport;
 
@@ -15,6 +16,7 @@ use std::sync::Arc;
 use std::path::{Path, PathBuf};
 
 /// One class on the palette.
+#[derive(Clone, Copy, Debug)]
 pub struct Entry {
     pub class: &'static str,
     /// The property that holds its visible text; empty when it has none.
@@ -97,22 +99,115 @@ pub const PALETTE: &[Entry] = &[
     nv("System", "TImageList", "Controls"),
     nv("System", "TMainMenu", "Menus"),
     nv("System", "TPopupMenu", "Menus"),
+    e("Data Controls", "TDBNavigator", "", "DBCtrls"),
+    e("Data Controls", "TDBText", "Caption", "DBCtrls"),
+    e("Data Controls", "TDBEdit", "", "DBCtrls"),
+    e("Data Controls", "TDBMemo", "", "DBCtrls"),
+    e("Data Controls", "TDBImage", "", "DBCtrls"),
+    e("Data Controls", "TDBListBox", "", "DBCtrls"),
+    e("Data Controls", "TDBLookupListBox", "", "DBCtrls"),
+    e("Data Controls", "TDBComboBox", "", "DBCtrls"),
+    e("Data Controls", "TDBLookupComboBox", "", "DBCtrls"),
+    e("Data Controls", "TDBCheckBox", "Caption", "DBCtrls"),
+    e("Data Controls", "TDBRadioGroup", "Caption", "DBCtrls"),
+    e("Data Controls", "TDBGrid", "", "DBGrids"),
 ];
+
+/// Components from imported packages (see `imports`), after the built-in pages. Set when the imports
+/// change; the lookups below read it.
+static IMPORTED: std::sync::RwLock<Vec<Entry>> = std::sync::RwLock::new(Vec::new());
+
+/// Replaces the imported components.
+pub fn set_imported(entries: Vec<Entry>) {
+    *IMPORTED.write().unwrap_or_else(|e| e.into_inner()) = entries;
+}
+
+/// The imported components, in the order their pages were imported.
+pub fn imported_entries() -> Vec<Entry> {
+    IMPORTED.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The palette entry for `class`, built-in first, then imported.
+fn lookup<R>(class: &str, f: impl Fn(&Entry) -> R) -> Option<R> {
+    PALETTE
+        .iter()
+        .find(|en| en.class.eq_ignore_ascii_case(class))
+        .map(&f)
+        .or_else(|| {
+            IMPORTED
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .find(|en| en.class.eq_ignore_ascii_case(class))
+                .map(&f)
+        })
+}
+
+/// The database drivers the connection editor offers, each with the unit that registers it. A
+/// connector uses its driver only when that unit is in the form's `uses`.
+pub const CONNECTORS: &[(&str, &str)] = &[("SQLite3", "sqlite3conn"), ("PostgreSQL", "pqconnection")];
+
+/// The settings of a `TSQLConnector`, as the connection editor shows them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConnectionEdit {
+    pub path: Vec<usize>,
+    pub connector: String,
+    pub host: String,
+    pub database: String,
+    pub user: String,
+    pub password: String,
+}
+
+/// The text of a string or identifier property, empty when it is not set.
+fn text_of(c: &Component, name: &str) -> String {
+    match c.prop(name) {
+        Some(PropValue::Str(s)) | Some(PropValue::Ident(s)) => s.clone(),
+        _ => String::new(),
+    }
+}
+
+impl Designer {
+    /// The connection settings of the `TSQLConnector` at `path`, or `None` for another component.
+    pub fn connection_of(&self, path: &[usize]) -> Option<ConnectionEdit> {
+        let c = self.doc.component(path)?;
+        if !c.class.eq_ignore_ascii_case("TSQLConnector") {
+            return None;
+        }
+        Some(ConnectionEdit {
+            path: path.to_vec(),
+            connector: text_of(c, "ConnectorType"),
+            host: text_of(c, "HostName"),
+            database: text_of(c, "DatabaseName"),
+            user: text_of(c, "UserName"),
+            password: text_of(c, "Password"),
+        })
+    }
+
+    /// Writes the connection settings to the connector, as one undo step.
+    pub fn apply_connection(&mut self, edit: &ConnectionEdit) -> Result<(), DesignerError> {
+        self.batch(None, |d| {
+            for (name, value) in [
+                ("ConnectorType", &edit.connector),
+                ("HostName", &edit.host),
+                ("DatabaseName", &edit.database),
+                ("UserName", &edit.user),
+                ("Password", &edit.password),
+            ] {
+                d.set_prop(&edit.path, name, PropValue::Str(value.clone()))?;
+            }
+            Ok(())
+        })
+    }
+}
 
 /// Components without a place on the form: the palette's non-visual classes and the items
 /// that live inside them (`TMenuItem` in a menu, `TAction` in an action list).
 pub fn is_nonvisual(class: &str) -> bool {
-    PALETTE
-        .iter()
-        .find(|en| en.class.eq_ignore_ascii_case(class))
-        .map_or_else(
-            || {
-                ["TMenuItem", "TAction"]
-                    .iter()
-                    .any(|c| c.eq_ignore_ascii_case(class))
-            },
-            |en| en.nonvisual,
-        )
+    lookup(class, |en| en.nonvisual).unwrap_or_else(|| {
+        ["TMenuItem", "TAction"]
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(class))
+    })
 }
 
 /// Where the tray's slots are in the file: Lazarus keeps a non-visual component's icon
@@ -167,7 +262,8 @@ pub fn custom_classes(root: &Path) -> ClassUnits {
             }
         }
     }
-    const FORM_BASES: &[&str] = &["tform", "tframe", "tcustomform", "tcustomframe", "tdatamodule"];
+    // Forms and data modules are not placed on forms. Frames are controls, so they are placeable.
+    const FORM_BASES: &[&str] = &["tform", "tcustomform", "tdatamodule"];
     let mut files = Vec::new();
     collect(root, 0, &mut files);
     let mut out = ClassUnits::new();
@@ -194,6 +290,26 @@ fn is_builtin(class: &str) -> bool {
     PALETTE.iter().any(|en| en.class.eq_ignore_ascii_case(class))
 }
 
+/// The imported (package) classes a form uses, found in its component tree.
+fn imported_used(form: &Component) -> Vec<&'static str> {
+    fn walk(c: &Component, imported: &[Entry], out: &mut Vec<&'static str>) {
+        for child in &c.children {
+            if let Some(en) = imported
+                .iter()
+                .find(|en| en.class.eq_ignore_ascii_case(&child.class))
+                && !out.contains(&en.class)
+            {
+                out.push(en.class);
+            }
+            walk(child, imported, out);
+        }
+    }
+    let imported = imported_entries();
+    let mut out = Vec::new();
+    walk(form, &imported, &mut out);
+    out
+}
+
 /// The custom classes a form uses, found in its component tree.
 fn custom_used(form: &Component, custom: &ClassUnits) -> Vec<&'static str> {
     fn walk(c: &Component, custom: &ClassUnits, out: &mut Vec<&'static str>) {
@@ -213,17 +329,33 @@ fn custom_used(form: &Component, custom: &ClassUnits) -> Vec<&'static str> {
     out
 }
 
+/// Whether the class is a data module: its unit declares it `TDataModule`, or it is named like one.
+fn is_datamodule(pas: &Path, class: &str) -> bool {
+    let based = std::fs::read_to_string(pas)
+        .ok()
+        .and_then(|t| base_class(&t, class))
+        .is_some_and(|b| b.eq_ignore_ascii_case("tdatamodule"));
+    based || class.to_ascii_lowercase().starts_with("tdatamodule")
+}
+
 /// The units a form needs `uses`d for the classes it contains (Controls/Forms are always there):
 /// the palette's units, and the unit of each custom class. The form's own unit is never listed.
 pub fn units_for(form: &Component, own_unit: &str, custom: &ClassUnits) -> Vec<&'static str> {
     fn walk(c: &Component, out: &mut Vec<&'static str>) {
         for child in &c.children {
-            if let Some(en) = PALETTE
-                .iter()
-                .find(|en| en.class.eq_ignore_ascii_case(&child.class))
-                && !out.contains(&en.unit)
+            if let Some(unit) = lookup(&child.class, |en| en.unit)
+                && !out.contains(&unit)
             {
-                out.push(en.unit);
+                out.push(unit);
+            }
+            // A connector's driver is registered by its unit, which the form must use too.
+            if child.class.eq_ignore_ascii_case("TSQLConnector") {
+                let driver = text_of(child, "ConnectorType");
+                if let Some((_, unit)) = CONNECTORS.iter().find(|(name, _)| name.eq_ignore_ascii_case(&driver))
+                    && !out.contains(unit)
+                {
+                    out.push(unit);
+                }
             }
             walk(child, out);
         }
@@ -246,17 +378,16 @@ pub fn is_container(class: &str) -> bool {
 }
 
 fn text_prop(class: &str) -> &'static str {
-    PALETTE
-        .iter()
-        .find(|en| en.class.eq_ignore_ascii_case(class))
-        .map_or("Caption", |en| en.text)
+    lookup(class, |en| en.text).unwrap_or("Caption")
 }
 
 /// Whether the class can take the keyboard focus, and so has a `TabOrder`: LCL's windowed
 /// controls do, graphic controls (labels, speed buttons, images, shapes, bevels) do not.
 pub fn takes_focus(class: &str) -> bool {
     !is_nonvisual(class)
-        && !["tlabel", "tspeedbutton", "timage", "tshape", "tbevel"]
+        && ![
+            "tlabel", "tspeedbutton", "timage", "tshape", "tbevel", "tdbtext", "tdbimage",
+        ]
             .contains(&class.to_ascii_lowercase().as_str())
 }
 
@@ -337,11 +468,80 @@ pub fn default_event(class: &str) -> &'static str {
     }
 }
 
+/// The form a form inherits from (its `.lfm` starts with `inherited`): the ancestor's class, and the
+/// unit of the project that declares it when there is one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ancestor {
+    pub class: String,
+    pub unit: Option<PathBuf>,
+}
+
+impl Ancestor {
+    /// What the designer says about the ancestor: its components are drawn, and changes to them are saved
+    /// as overrides.
+    pub fn note(&self) -> String {
+        match &self.unit {
+            Some(unit) => {
+                let file = unit.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                format!("Inherits from {} ({file}): its components are shown; moving or changing them saves as an override; they cannot be deleted or renamed here.", self.class)
+            }
+            None => format!("Inherits from {}, which is not in the project: its components are not shown.", self.class),
+        }
+    }
+}
+
+/// The base class a class declaration names: `TForm2 = class(TForm1)` gives `TForm1` for `TForm2`.
+pub fn base_class(pas_text: &str, class: &str) -> Option<String> {
+    let lower = pas_text.to_ascii_lowercase();
+    let decl = format!("{} = class(", class.to_ascii_lowercase());
+    let start = lower.find(&decl)? + decl.len();
+    let end = pas_text[start..].find(')')? + start;
+    let base = pas_text[start..end].trim();
+    (!base.is_empty()).then(|| base.to_string())
+}
+
+/// The unit of the project (a `.pas` below `folder`) that declares `class`.
+fn declaring_unit(folder: &Path, class: &str) -> Option<PathBuf> {
+    fn walk(dir: &Path, depth: usize, class: &str, out: &mut Option<PathBuf>) {
+        if out.is_some() {
+            return;
+        }
+        let Ok(read) = std::fs::read_dir(dir) else { return };
+        let mut entries: Vec<PathBuf> = read.filter_map(Result::ok).map(|e| e.path()).collect();
+        entries.sort();
+        for path in entries {
+            let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            if path.is_dir() {
+                let hidden = name.starts_with('.') || ["lib", "target", "vendor", "release"].contains(&name.as_str());
+                if depth < 6 && !hidden && !name.ends_with(".app") {
+                    walk(&path, depth + 1, class, out);
+                }
+            } else if is_unit_file(&path) {
+                let declares = std::fs::read_to_string(&path)
+                    .is_ok_and(|t| t.to_ascii_lowercase().contains(&format!("{} = class", class.to_ascii_lowercase())));
+                if declares {
+                    *out = Some(path);
+                    return;
+                }
+            }
+        }
+    }
+    let mut out = None;
+    walk(folder, 0, class, &mut out);
+    out
+}
+
 pub struct Designer {
     pub lfm_path: PathBuf,
     pub pas_path: PathBuf,
+    /// The form this one inherits from, when its `.lfm` starts with `inherited`.
+    pub ancestor: Option<Ancestor>,
+    /// The ancestor's form (merged with its own ancestors): what the working form is built on.
+    ancestor_root: Option<pascoda_forms::Component>,
     /// The project's custom components, set by the app whenever the project changes.
     pub custom_units: Arc<ClassUnits>,
+    /// The root is a `TDataModule`: a window-less surface for non-visual components only.
+    datamodule: bool,
     pub doc: FormDoc,
     saved: String,
     undo: Vec<String>,
@@ -369,6 +569,11 @@ pub enum DesignerError {
     Io(std::io::Error),
     Parse(pascoda_forms::ParseError),
     Edit(EditError),
+    /// A component the form inherits: it can be moved and changed, but not deleted or renamed (a
+    /// saved form could not express that).
+    Inherited(String),
+    /// A visual control on a data module, which holds only non-visual components.
+    NotOnDataModule(String),
 }
 
 impl std::fmt::Display for DesignerError {
@@ -377,6 +582,14 @@ impl std::fmt::Display for DesignerError {
             DesignerError::Io(e) => write!(f, "{e}"),
             DesignerError::Parse(e) => write!(f, "form file: {e}"),
             DesignerError::Edit(e) => write!(f, "{e}"),
+            DesignerError::Inherited(name) => write!(
+                f,
+                "{name} is inherited from the ancestor form: it can be moved and changed here, not deleted or renamed"
+            ),
+            DesignerError::NotOnDataModule(class) => write!(
+                f,
+                "{class} is a visual control: a data module holds only non-visual components"
+            ),
         }
     }
 }
@@ -451,22 +664,73 @@ pub fn sibling_lfm(pas: &Path) -> Option<PathBuf> {
         .find(|p| is_form_file(p))
 }
 
+/// The ancestor of a form whose class is `class` (declared in `pas_path`): the ancestor as the
+/// designer names it, and its form merged with its own ancestors (when it inherits too). Nothing when
+/// the class does not inherit, or its ancestor is not in the project.
+fn ancestor_of(pas_path: &Path, class: &str, depth: usize) -> (Option<Ancestor>, Option<pascoda_forms::Component>) {
+    let Some(pas) = std::fs::read_to_string(pas_path).ok() else { return (None, None) };
+    let Some(base) = base_class(&pas, class) else { return (None, None) };
+    let folder = pas_path.parent().unwrap_or(Path::new("."));
+    let unit = declaring_unit(folder, &base);
+    let note = Ancestor { class: base.clone(), unit: unit.clone() };
+    let root = unit.as_deref().and_then(|u| {
+        let lfm = sibling_lfm(u)?;
+        let parsed = pascoda_forms::lfm::parse(&std::fs::read_to_string(lfm).ok()?).ok()?;
+        if parsed.kind == pascoda_forms::Kind::Inherited && depth < 8 {
+            match ancestor_of(u, &parsed.class, depth + 1).1 {
+                Some(deeper) => Some(pascoda_forms::inherit::merge(&parsed, &deeper)),
+                None => Some(parsed),
+            }
+        } else {
+            Some(parsed)
+        }
+    });
+    (Some(note), root)
+}
+
+/// The working form for the disk text `text` of an inherited form: its own root and components merged
+/// onto the ancestor.
+fn working_text(text: &str, ancestor_root: &pascoda_forms::Component) -> Result<String, DesignerError> {
+    let own = pascoda_forms::lfm::parse(text).map_err(DesignerError::Parse)?;
+    let merged = pascoda_forms::inherit::merge(&own, ancestor_root);
+    let mut out = pascoda_forms::lfm::write_component(&merged, "", "\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 impl Designer {
+    /// Whether the open unit is a data module (see `datamodule`).
+    pub fn is_datamodule(&self) -> bool {
+        self.datamodule
+    }
+
     pub fn open(pas_path: &Path) -> Result<Self, DesignerError> {
         let lfm_path = sibling_lfm(pas_path).ok_or_else(|| {
             DesignerError::Io(std::io::Error::other("no .lfm file next to this unit"))
         })?;
         let text = std::fs::read_to_string(&lfm_path).map_err(DesignerError::Io)?;
-        let doc = FormDoc::parse(&text).map_err(DesignerError::Parse)?;
-        let synced_fields = sync::wanted(doc.root())
-            .fields
-            .into_iter()
-            .map(|f| f.0)
-            .collect();
+        let child = FormDoc::parse(&text).map_err(DesignerError::Parse)?;
+        let (ancestor, ancestor_root) = if child.root().kind == pascoda_forms::Kind::Inherited {
+            ancestor_of(pas_path, &child.root().class, 0)
+        } else {
+            (None, None)
+        };
+        // The designer edits the merged form: the ancestor's components with the changes applied.
+        let working = match &ancestor_root {
+            Some(root) => working_text(&text, root)?,
+            None => text.clone(),
+        };
+        let doc = FormDoc::parse(&working).map_err(DesignerError::Parse)?;
+        let datamodule = is_datamodule(pas_path, &doc.root().class);
         let mut d = Self {
             lfm_path,
             pas_path: pas_path.to_path_buf(),
-            saved: doc.source().to_string(),
+            datamodule,
+            saved: text,
+            ancestor,
+            ancestor_root,
             doc,
             undo: Vec::new(),
             custom_units: Arc::default(),
@@ -474,23 +738,53 @@ impl Designer {
             selected: Vec::new(),
             also: Vec::new(),
             batching: false,
-            synced_fields,
+            synced_fields: Vec::new(),
             sync_error: None,
             last_prop: None,
             autosize_seen: HashMap::new(),
         };
         d.snapshot_autosize();
+        d.synced_fields = sync::wanted(&d.own_root())
+            .fields
+            .into_iter()
+            .map(|f| f.0)
+            .collect();
         Ok(d)
     }
 
+    /// The form as it is on disk: the working form, saved the way Lazarus saves an inherited form when
+    /// it inherits one.
+    fn disk_source(&self) -> String {
+        match &self.ancestor_root {
+            Some(root) => pascoda_forms::inherit::inherited_text(self.doc.root(), root, "\n"),
+            None => self.doc.source().to_string(),
+        }
+    }
+
+    /// The form's own components: the working form without what the ancestor declares.
+    fn own_root(&self) -> pascoda_forms::Component {
+        match &self.ancestor_root {
+            Some(root) => pascoda_forms::inherit::own_components(self.doc.root(), root),
+            None => self.doc.root().clone(),
+        }
+    }
+
+    /// Whether `path` names a component the ancestor declares (it cannot be deleted or renamed here).
+    fn is_inherited(&self, path: &[usize]) -> bool {
+        let (Some(root), Some(c)) = (&self.ancestor_root, self.doc.component(path)) else {
+            return false;
+        };
+        root.children.iter().any(|a| a.name.eq_ignore_ascii_case(&c.name))
+    }
+
     pub fn dirty(&self) -> bool {
-        self.doc.source() != self.saved
+        self.disk_source() != self.saved
     }
 
     /// The form text is what the disk has (after the file was written by someone else and
     /// loaded with `replace_source`).
     pub fn mark_saved(&mut self) {
-        self.saved = self.doc.source().to_string();
+        self.saved = self.disk_source();
     }
 
     /// The form text as the disk last had it (written or loaded by us).
@@ -505,8 +799,9 @@ impl Designer {
 
     pub fn save(&mut self) -> std::io::Result<()> {
         if self.dirty() {
-            std::fs::write(&self.lfm_path, self.doc.source())?;
-            self.saved = self.doc.source().to_string();
+            let text = self.disk_source();
+            std::fs::write(&self.lfm_path, &text)?;
+            self.saved = text;
         }
         Ok(())
     }
@@ -607,8 +902,12 @@ impl Designer {
     /// step. The selection is kept where the components still exist.
     pub fn replace_source(&mut self, text: &str) -> Result<(), DesignerError> {
         FormDoc::parse(text).map_err(DesignerError::Parse)?;
+        let working = match &self.ancestor_root {
+            Some(root) => working_text(text, root)?,
+            None => text.to_string(),
+        };
         self.checkpoint();
-        self.restore(text);
+        self.restore(&working);
         self.sync_error = None;
         Ok(())
     }
@@ -790,6 +1089,17 @@ impl Designer {
         let Ok(holder) = pascoda_forms::lfm::parse(&wrapped) else {
             return Ok(Vec::new());
         };
+        if self.datamodule {
+            // A data module takes non-visual components only, at any depth.
+            fn visual(children: &[Component]) -> Option<&str> {
+                children
+                    .iter()
+                    .find_map(|c| (!is_nonvisual(&c.class)).then_some(c.class.as_str()).or_else(|| visual(&c.children)))
+            }
+            if let Some(class) = visual(&holder.children) {
+                return Err(DesignerError::NotOnDataModule(class.to_string()));
+            }
+        }
         let target = match self.selected_component() {
             Some(c) if self.also.is_empty() && is_container(&c.class) => self.selected.clone(),
             _ => self.current_container(),
@@ -934,6 +1244,9 @@ impl Designer {
         x: i64,
         y: i64,
     ) -> Result<Vec<usize>, DesignerError> {
+        if self.datamodule && !is_nonvisual(class) {
+            return Err(DesignerError::NotOnDataModule(class.to_string()));
+        }
         if is_nonvisual(class) {
             return self.add_nonvisual(class);
         }
@@ -1088,6 +1401,10 @@ impl Designer {
     pub fn delete_selected(&mut self) -> Result<(), DesignerError> {
         if self.selected.is_empty() {
             return Ok(());
+        }
+        if let Some(path) = self.selection().into_iter().find(|p| self.is_inherited(p)) {
+            let name = self.doc.component(&path).map_or_else(String::new, |c| c.name.clone());
+            return Err(DesignerError::Inherited(name));
         }
         let mut roots = self.selection_roots();
         // Last first: removing a component only shifts the indexes of later siblings.
@@ -1361,6 +1678,10 @@ impl Designer {
         &mut self,
         new_name: &str,
     ) -> Result<Vec<(String, String)>, DesignerError> {
+        if self.is_inherited(&self.selected) {
+            let name = self.selected_component().map_or_else(String::new, |c| c.name.clone());
+            return Err(DesignerError::Inherited(name));
+        }
         let Some(c) = self.selected_component() else {
             return Ok(Vec::new());
         };
@@ -1839,7 +2160,7 @@ impl Designer {
 
     fn try_sync(&mut self, unit: &mut String) -> Result<(), SyncError> {
         let class = self.doc.root().class.clone();
-        let wanted = sync::wanted(self.doc.root());
+        let wanted = sync::wanted(&self.own_root());
         let current: Vec<String> = wanted.fields.iter().map(|f| f.0.clone()).collect();
         let removed: Vec<String> = self
             .synced_fields
@@ -1864,7 +2185,13 @@ impl Designer {
         let plan = sync::plan_uses(&text, &units)?;
         text = sync::apply_edits(&text, &plan.edits);
         // A custom class must be registered before a form that names it in a `.lfm` loads.
-        let used = custom_used(self.doc.root(), &custom);
+        // Imported classes are registered the same way: the form loader needs them too.
+        let mut used = custom_used(self.doc.root(), &custom);
+        for class in imported_used(self.doc.root()) {
+            if !used.contains(&class) {
+                used.push(class);
+            }
+        }
         let plan = sync::plan_register(&text, &used)?;
         text = sync::apply_edits(&text, &plan.edits);
         let plan = sync::plan(&text, &class, &wanted)?;
@@ -1920,8 +2247,11 @@ mod tests {
         Designer {
             lfm_path: PathBuf::from("unit1.lfm"),
             pas_path: PathBuf::from("unit1.pas"),
+            ancestor: None,
+            ancestor_root: None,
             saved: LFM.to_string(),
             doc,
+            datamodule: false,
             undo: vec![],
             custom_units: Arc::default(),
             redo: vec![],
@@ -2948,7 +3278,7 @@ mod tests {
 
     /// Saves the form and unit, builds with the LCL and checks the program stays up (a form
     /// that fails to load ends it at startup).
-    fn build_and_start(d: &mut Designer, unit: &str, dir: &Path, lcl: &pascoda_fpc::lcl::Lcl) {
+    pub(super) fn build_and_start(d: &mut Designer, unit: &str, dir: &Path, lcl: &pascoda_fpc::lcl::Lcl) {
         d.save().unwrap();
         std::fs::write(dir.join("unit1.pas"), unit).unwrap();
         let built =
@@ -3142,64 +3472,358 @@ mod pairing_tests {
 }
 
 #[cfg(test)]
-mod custom_tests {
+mod inherited_tests {
     use super::*;
 
-    /// A project with the gui fixture's form and a custom component in its own unit.
-    fn project(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("pascoda-custom-{name}-{}", std::process::id()));
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("pascoda-inh-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A form that inherits from another form: the designer names the ancestor and the unit that
+    /// declares it, and the form's own components are still there.
+    #[test]
+    fn an_inherited_form_names_its_ancestor_and_its_unit() {
+        let d = tmp("open");
+        std::fs::write(d.join("base.lfm"), "object Form1: TForm1\n  Caption = 'Base'\n  object Button1: TButton\n    Caption = 'OK'\n  end\nend\n").unwrap();
+        std::fs::write(d.join("base.pas"), "unit base;\n\ninterface\n\ntype\n  TForm1 = class(TForm)\n    Button1: TButton;\n  end;\n\nimplementation\n\nend.\n").unwrap();
+        std::fs::write(d.join("child.lfm"), "inherited Form2: TForm2\n  Caption = 'Child'\n  object Label9: TLabel\n    Caption = 'extra'\n  end\nend\n").unwrap();
+        std::fs::write(d.join("child.pas"), "unit child;\n\ninterface\n\nuses base;\n\ntype\n  TForm2 = class(TForm1)\n    Label9: TLabel;\n  end;\n\nimplementation\n\nend.\n").unwrap();
+        let f = Designer::open(&d.join("child.pas")).unwrap();
+        let a = f.ancestor.clone().expect("inherits");
+        assert_eq!(a.class, "TForm1");
+        assert_eq!(a.unit.as_deref(), Some(d.join("base.pas").as_path()));
+        assert!(a.note().contains("TForm1") && a.note().contains("base.pas"), "{}", a.note());
+        assert!(f.doc.root().children.iter().any(|c| c.name == "Label9"), "its own components stay");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The ancestor's button is on the canvas and can be moved. Saving writes only the change, as an
+    /// `inherited` entry; reopening gives the same form back.
+    #[test]
+    fn an_inherited_component_is_edited_and_saved_as_an_override() {
+        let d = tmp("edit");
+        std::fs::write(d.join("base.lfm"), "object Form1: TForm1\n  Caption = 'Base'\n  object Button1: TButton\n    Left = 16\n    Caption = 'OK'\n  end\nend\n").unwrap();
+        std::fs::write(d.join("base.pas"), "unit base;\n\ninterface\n\ntype\n  TForm1 = class(TForm)\n    Button1: TButton;\n  end;\n\nimplementation\n\nend.\n").unwrap();
+        std::fs::write(d.join("child.lfm"), "inherited Form2: TForm2\n  Caption = 'Child'\n  object Label9: TLabel\n    Caption = 'extra'\n  end\nend\n").unwrap();
+        std::fs::write(d.join("child.pas"), "unit child;\n\ninterface\n\nuses base;\n\ntype\n  TForm2 = class(TForm1)\n    Label9: TLabel;\n  end;\n\nimplementation\n\nend.\n").unwrap();
+        let mut f = Designer::open(&d.join("child.pas")).unwrap();
+        let button = f.doc.root().children.iter().position(|c| c.name == "Button1").expect("the ancestor's button is on the canvas");
+        assert!(!f.dirty());
+        f.set_prop(&[button], "Left", PropValue::Int(40)).unwrap();
+        assert!(f.dirty(), "the move is unsaved");
+        let disk = f.disk_source();
+        assert!(disk.contains("inherited Button1: TButton\n    Left = 40\n  end"), "{disk}");
+        assert!(!disk.contains("'OK'"), "the ancestor's caption is not written again");
+        f.save().unwrap();
+        assert!(!f.dirty());
+        let back = Designer::open(&d.join("child.pas")).unwrap();
+        let b = back.doc.root().children.iter().find(|c| c.name == "Button1").unwrap();
+        assert_eq!(b.prop("Left"), Some(&PropValue::Int(40)), "the override is kept");
+        assert_eq!(b.prop("Caption"), Some(&PropValue::Str("OK".into())), "the ancestor's value is kept");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// An inherited component cannot be deleted or renamed here (a saved form could not express that);
+    /// the form's own components can be.
+    #[test]
+    fn an_inherited_component_cannot_be_deleted_or_renamed() {
+        let d = tmp("refuse");
+        std::fs::write(d.join("base.lfm"), "object Form1: TForm1\n  object Button1: TButton\n  end\nend\n").unwrap();
+        std::fs::write(d.join("base.pas"), "unit base;\n\ninterface\n\ntype\n  TForm1 = class(TForm)\n    Button1: TButton;\n  end;\n\nimplementation\n\nend.\n").unwrap();
+        std::fs::write(d.join("child.lfm"), "inherited Form2: TForm2\n  object Label9: TLabel\n  end\nend\n").unwrap();
+        std::fs::write(d.join("child.pas"), "unit child;\n\ninterface\n\nuses base;\n\ntype\n  TForm2 = class(TForm1)\n    Label9: TLabel;\n  end;\n\nimplementation\n\nend.\n").unwrap();
+        let mut f = Designer::open(&d.join("child.pas")).unwrap();
+        let button = f.doc.root().children.iter().position(|c| c.name == "Button1").unwrap();
+        f.select(vec![button]);
+        assert!(matches!(f.delete_selected(), Err(DesignerError::Inherited(_))));
+        assert!(matches!(f.rename_selected("Other"), Err(DesignerError::Inherited(_))));
+        let label = f.doc.root().children.iter().position(|c| c.name == "Label9").unwrap();
+        f.select(vec![label]);
+        assert!(f.delete_selected().is_ok(), "the form's own component can go");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Sync does not declare the ancestor's components again: the child's unit gets no field for them.
+    #[test]
+    fn sync_leaves_the_ancestors_components_to_the_ancestor() {
+        let d = tmp("sync");
+        std::fs::write(d.join("base.lfm"), "object Form1: TForm1\n  object Button1: TButton\n  end\nend\n").unwrap();
+        std::fs::write(d.join("base.pas"), "unit base;\n\ninterface\n\ntype\n  TForm1 = class(TForm)\n    Button1: TButton;\n  end;\n\nimplementation\n\nend.\n").unwrap();
+        std::fs::write(d.join("child.lfm"), "inherited Form2: TForm2\n  object Label9: TLabel\n  end\nend\n").unwrap();
+        let pas = "unit child;\n\ninterface\n\nuses base;\n\ntype\n  TForm2 = class(TForm1)\n    Label9: TLabel;\n  end;\n\nimplementation\n\nend.\n";
+        std::fs::write(d.join("child.pas"), pas).unwrap();
+        let mut f = Designer::open(&d.join("child.pas")).unwrap();
+        let mut unit = pas.to_string();
+        f.sync_unit(&mut unit);
+        assert!(f.sync_error.is_none(), "{:?}", f.sync_error);
+        assert!(!unit.contains("Button1: TButton"), "the base declares it: {unit}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A form that inherits from a class the project does not declare says so, and a plain form has no
+    /// ancestor.
+    #[test]
+    fn a_missing_ancestor_is_named_and_a_plain_form_has_none() {
+        let d = tmp("missing");
+        std::fs::write(d.join("child.lfm"), "inherited Form2: TForm2\nend\n").unwrap();
+        std::fs::write(d.join("child.pas"), "unit child;\n\ninterface\n\ntype\n  TForm2 = class(TLibForm)\n  end;\n\nimplementation\n\nend.\n").unwrap();
+        let f = Designer::open(&d.join("child.pas")).unwrap();
+        let a = f.ancestor.clone().unwrap();
+        assert_eq!(a.class, "TLibForm");
+        assert!(a.unit.is_none());
+        assert!(a.note().contains("not in the project"));
+        std::fs::write(d.join("plain.lfm"), "object Form3: TForm3\nend\n").unwrap();
+        std::fs::write(d.join("plain.pas"), "unit plain;\n\ninterface\n\ntype\n  TForm3 = class(TForm)\n  end;\n\nimplementation\n\nend.\n").unwrap();
+        assert!(Designer::open(&d.join("plain.pas")).unwrap().ancestor.is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+
+    /// A project with a form (`unit1`) and a frame (`frame1`, a button inside it), built as a GUI
+    /// program in its own scratch folder.
+    fn frame_project(name: &str) -> Option<(PathBuf, pascoda_fpc::lcl::Lcl)> {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/gui");
+        let dir = crate::target_tmp().join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        for f in ["unit1.pas", "unit1.lfm"] {
-            std::fs::copy(
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../tests/fixtures/gui")
-                    .join(f),
-                dir.join(f),
-            )
-            .unwrap();
+        for f in ["hello.lpr", "unit1.pas", "unit1.lfm"] {
+            std::fs::copy(fixtures.join(f), dir.join(f)).unwrap();
         }
         std::fs::write(
-            dir.join("mylabel.pas"),
-            "unit mylabel;\n\n{$mode objfpc}{$H+}\n\ninterface\n\nuses\n  Classes, Controls, StdCtrls;\n\ntype\n  TMyLabel = class(TLabel)\n  end;\n\nimplementation\n\nend.\n",
+            dir.join("frame1.pas"),
+            "unit frame1;\n\n{$mode objfpc}{$H+}\n\ninterface\n\nuses\n  Classes, SysUtils, Forms, Controls, Graphics, Dialogs, StdCtrls;\n\ntype\n  TFrame1 = class(TFrame)\n    Button1: TButton;\n  end;\n\nimplementation\n\n{$R *.lfm}\n\nend.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("frame1.lfm"),
+            "object Frame1: TFrame1\n  Left = 0\n  Height = 100\n  Top = 0\n  Width = 200\n  ClientHeight = 100\n  ClientWidth = 200\n  object Button1: TButton\n    Left = 10\n    Height = 30\n    Top = 10\n    Width = 100\n    Caption = 'In frame'\n    TabOrder = 0\n  end\nend\n",
+        )
+        .unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let lcl = pascoda_fpc::lcl::Lcl::find(&dir)?;
+        Some((dir, lcl))
+    }
+
+    #[test]
+    fn a_frame_is_placed_on_a_form_and_the_program_starts() {
+        let _fpc = crate::FPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((dir, lcl)) = frame_project("frame-placed") else {
+            return;
+        };
+        // The scan offers the frame and not the form.
+        let custom = custom_classes(&dir);
+        assert_eq!(custom.get("TFrame1").copied(), Some("frame1"), "the frame is a placeable class");
+        assert!(!custom.contains_key("TForm1"), "a form is not placed on a form");
+
+        let mut d = Designer::open(&dir.join("unit1.pas")).unwrap();
+        d.custom_units = Arc::new(custom);
+        d.add_component("TFrame1", &[], 20, 20).unwrap();
+        let mut unit = std::fs::read_to_string(dir.join("unit1.pas")).unwrap();
+        d.sync_unit(&mut unit);
+        assert!(d.sync_error.is_none(), "{:?}", d.sync_error);
+        assert!(unit.contains("frame1"), "the frame's unit is used: {unit}");
+        assert!(unit.contains("RegisterClass(TFrame1);"), "the frame class is registered: {unit}");
+
+        super::tests::build_and_start(&mut d, &unit, &dir, &lcl);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod datamodule_flag_tests {
+    use super::*;
+
+    #[test]
+    fn a_data_module_unit_is_marked_and_a_form_is_not() {
+        let dir = std::env::temp_dir().join(format!("pascoda-dm-flag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("unit2.pas"),
+            "unit Unit2;\n\ninterface\n\nuses\n  Classes, SysUtils;\n\ntype\n  TDataModule2 = class(TDataModule)\n  end;\n\nvar\n  DataModule2: TDataModule2;\n\nimplementation\n\n{$R *.lfm}\n\nend.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("unit2.lfm"),
+            "object DataModule2: TDataModule2\n  OldCreateOrder = False\n  Height = 150\n  HorizontalOffset = 300\n  VerticalOffset = 200\n  Width = 200\nend\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("unit1.pas"),
+            "unit Unit1;\n\ninterface\n\nuses\n  Classes, Forms;\n\ntype\n  TForm1 = class(TForm)\n  end;\n\nvar\n  Form1: TForm1;\n\nimplementation\n\n{$R *.lfm}\n\nend.\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("unit1.lfm"), "object Form1: TForm1\nend\n").unwrap();
+        assert!(Designer::open(&dir.join("unit2.pas")).unwrap().is_datamodule());
+        assert!(!Designer::open(&dir.join("unit1.pas")).unwrap().is_datamodule());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod datamodule_placement_tests {
+    use super::*;
+
+    #[test]
+    fn a_data_module_takes_non_visual_components_only() {
+        let dir = std::env::temp_dir().join(format!("pascoda-dm-place-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("unit2.pas"),
+            "unit Unit2;\n\ninterface\n\nuses\n  Classes, SysUtils;\n\ntype\n  TDataModule2 = class(TDataModule)\n  end;\n\nvar\n  DataModule2: TDataModule2;\n\nimplementation\n\n{$R *.lfm}\n\nend.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("unit2.lfm"),
+            "object DataModule2: TDataModule2\n  OldCreateOrder = False\n  Height = 150\n  HorizontalOffset = 300\n  VerticalOffset = 200\n  Width = 200\nend\n",
+        )
+        .unwrap();
+        let mut d = Designer::open(&dir.join("unit2.pas")).unwrap();
+        assert!(matches!(d.add_component("TButton", &[], 10, 10), Err(DesignerError::NotOnDataModule(c)) if c == "TButton"));
+        assert!(d.add_component("TTimer", &[], 0, 0).is_ok(), "non-visual components are placed");
+        // A visual control pasted from the clipboard is refused too.
+        let text = "object Button1: TButton\n  Left = 1\n  Top = 1\n  Width = 50\n  Height = 20\nend\n";
+        assert!(matches!(d.paste(text), Err(DesignerError::NotOnDataModule(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod datamodule_build_tests {
+    use super::*;
+
+    /// A data module with a timer, used by a form whose `OnCreate` reads the timer's interval. The
+    /// project builds with the LCL and the program stays up (the form and the data module load).
+    #[test]
+    fn a_form_uses_a_data_modules_timer_and_the_program_starts() {
+        let _fpc = crate::FPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = crate::target_tmp().join("datamodule-build");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The data module is unit1 (no units yet); the form is unit2.
+        let pas = pascoda_project::new_data_module_unit(&dir, &dir).unwrap();
+        assert_eq!(pas, dir.join("unit1.pas"));
+        let mut d = Designer::open(&pas).unwrap();
+        d.add_component("TTimer", &[], 0, 0).unwrap();
+        let mut unit = std::fs::read_to_string(&pas).unwrap();
+        d.sync_unit(&mut unit);
+        assert!(d.sync_error.is_none(), "{:?}", d.sync_error);
+        assert!(unit.contains("Timer1: TTimer;"), "the timer is a field of the data module: {unit}");
+        std::fs::write(&pas, &unit).unwrap();
+        d.save().unwrap();
+        // The timer's interval is set in the data module's form file.
+        let lfm = std::fs::read_to_string(dir.join("unit1.lfm")).unwrap();
+        std::fs::write(
+            dir.join("unit1.lfm"),
+            lfm.replace("object DataModule1: TDataModule1\n", "object DataModule1: TDataModule1\n").replace(
+                "end\n",
+                "  object Timer1: TTimer\n    Interval = 750\n    Left = 40\n    Top = 40\n  end\nend\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("unit2.pas"),
+            "unit unit2;\n\n{$mode objfpc}{$H+}\n\ninterface\n\nuses\n  Classes, SysUtils, Forms, Controls, Graphics, Dialogs, StdCtrls, unit1;\n\ntype\n  TForm2 = class(TForm)\n    procedure FormCreate(Sender: TObject);\n  end;\n\nvar\n  Form2: TForm2;\n\nimplementation\n\n{$R *.lfm}\n\nprocedure TForm2.FormCreate(Sender: TObject);\nbegin\n  Caption := IntToStr(DataModule1.Timer1.Interval);\nend;\n\nend.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("unit2.lfm"),
+            "object Form2: TForm2\n  Left = 300\n  Height = 300\n  Top = 200\n  Width = 400\n  Caption = 'Form2'\n  OnCreate = FormCreate\nend\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("hello.lpr"),
+            "program hello;\n\n{$mode objfpc}{$H+}\n\nuses\n  Interfaces, Forms, unit1, unit2;\n\nbegin\n  Application.Initialize;\n  Application.CreateForm(TDataModule1, DataModule1);\n  Application.CreateForm(TForm2, Form2);\n  Application.Run;\nend.\n",
+        )
+        .unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let lcl = pascoda_fpc::lcl::Lcl::find(&dir).expect("vendor/lazarus is needed");
+        let built = pascoda_fpc::lcl::build_gui(&dir.join("hello.lpr"), pascoda_fpc::Mode::ObjFpc, &lcl).unwrap();
+        assert!(built.success, "the project does not build:\n{}", built.raw_output);
+        let mut child = std::process::Command::new(dir.join("hello")).spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        assert!(child.try_wait().unwrap().is_none(), "the program ended: the data module or the form did not load");
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod database_form_tests {
+    use super::*;
+
+    /// A form with a SQLdb connector (SQLite3) and a data-bound grid, in a scratch folder.
+    fn database_form(name: &str) -> PathBuf {
+        let dir = crate::target_tmp().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("unit1.pas"),
+            "unit unit1;\n\n{$mode objfpc}{$H+}\n\ninterface\n\nuses\n  Classes, SysUtils, Forms, Controls, Graphics, Dialogs, StdCtrls;\n\ntype\n  TForm1 = class(TForm)\n  end;\n\nvar\n  Form1: TForm1;\n\nimplementation\n\n{$R *.lfm}\n\nend.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("unit1.lfm"),
+            "object Form1: TForm1\n  Left = 300\n  Height = 300\n  Top = 200\n  Width = 400\n  Caption = 'Form1'\n  object SQLConnector1: TSQLConnector\n    ConnectorType = 'SQLite3'\n    Left = 40\n    Top = 40\n  end\nend\n",
         )
         .unwrap();
         dir
     }
 
     #[test]
-    fn the_scan_finds_custom_components_but_not_forms() {
-        let dir = project("scan");
-        let found = custom_classes(&dir);
-        assert_eq!(found.get("TMyLabel"), Some(&"mylabel"));
-        assert!(!found.contains_key("TForm1"), "a form is not a component");
+    fn the_connection_editor_writes_the_connector_and_its_driver_unit_is_used() {
+        let dir = database_form("database-connection");
+        let mut d = Designer::open(&dir.join("unit1.pas")).unwrap();
+        let mut edit = d.connection_of(&[0]).expect("the connector is a SQLdb connector");
+        assert_eq!(edit.connector, "SQLite3");
+        assert!(d.connection_of(&[]).is_none(), "the form is not a connector");
+        edit.database = "/tmp/shop.db".into();
+        edit.user = "app".into();
+        d.apply_connection(&edit).unwrap();
+        let read = d.connection_of(&[0]).unwrap();
+        assert_eq!(read.database, "/tmp/shop.db");
+        assert_eq!(read.user, "app");
+        assert!(units_for(d.doc.root(), "unit1", &Default::default()).contains(&"sqlite3conn"), "the driver is used");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A form with a grid bound to a data source and a SQLite connector, built with the LCL: the
+    /// program starts and stays up (the grid and the connector load).
     #[test]
-    fn a_custom_component_is_placed_without_a_caption_and_synced_with_its_unit() {
-        let dir = project("place");
-        let mut d = Designer::open(&dir.join("unit1.pas")).unwrap();
-        let mut custom = ClassUnits::new();
-        custom.insert("TMyLabel", "mylabel");
-        d.custom_units = Arc::new(custom);
-
-        let path = d.add_component("TMyLabel", &[], 16, 16).unwrap();
-        assert_eq!(d.doc.component(&path).unwrap().class, "TMyLabel");
-        assert!(
-            !d.doc.source().contains("Caption = 'MyLabel"),
-            "the class may have no Caption: {}",
-            d.doc.source()
-        );
-
-        let mut unit = std::fs::read_to_string(dir.join("unit1.pas")).unwrap();
-        d.sync_unit(&mut unit);
-        assert!(d.sync_error.is_none(), "{:?}", d.sync_error);
-        assert!(unit.contains("mylabel"), "the unit is used:\n{unit}");
-        assert!(unit.contains("RegisterClass(TMyLabel)"), "and registered:\n{unit}");
-        let once = unit.clone();
-        d.sync_unit(&mut unit);
-        assert_eq!(unit, once, "syncing again changes nothing");
+    fn a_data_grid_on_a_form_builds_and_the_program_starts() {
+        let _fpc = crate::FPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = database_form("database-build");
+        std::fs::write(
+            dir.join("unit1.pas"),
+            "unit unit1;\n\n{$mode objfpc}{$H+}\n\ninterface\n\nuses\n  Classes, SysUtils, Forms, Controls, Graphics, Dialogs, StdCtrls, DBGrids, DB, sqldb, sqlite3conn;\n\ntype\n  TForm1 = class(TForm)\n    DBGrid1: TDBGrid;\n    DataSource1: TDataSource;\n    SQLConnector1: TSQLConnector;\n  end;\n\nvar\n  Form1: TForm1;\n\nimplementation\n\n{$R *.lfm}\n\nend.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("unit1.lfm"),
+            "object Form1: TForm1\n  Left = 300\n  Height = 300\n  Top = 200\n  Width = 400\n  Caption = 'Form1'\n  object DBGrid1: TDBGrid\n    Left = 10\n    Height = 200\n    Top = 10\n    Width = 380\n    DataSource = DataSource1\n  end\n  object DataSource1: TDataSource\n    Left = 40\n    Top = 240\n  end\n  object SQLConnector1: TSQLConnector\n    ConnectorType = 'SQLite3'\n    DatabaseName = 'shop.db'\n    Left = 120\n    Top = 240\n  end\nend\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("hello.lpr"),
+            "program hello;\n\n{$mode objfpc}{$H+}\n\nuses\n  Interfaces, Forms, unit1;\n\nbegin\n  Application.Initialize;\n  Application.CreateForm(TForm1, Form1);\n  Application.Run;\nend.\n",
+        )
+        .unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let lcl = pascoda_fpc::lcl::Lcl::find(&dir).expect("vendor/lazarus is needed");
+        let built = pascoda_fpc::lcl::build_gui(&dir.join("hello.lpr"), pascoda_fpc::Mode::ObjFpc, &lcl).unwrap();
+        assert!(built.success, "the project does not build:\n{}", built.raw_output);
+        let mut child = std::process::Command::new(dir.join("hello")).spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        assert!(child.try_wait().unwrap().is_none(), "the program ended: the grid or the connector did not load");
+        let _ = child.kill();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

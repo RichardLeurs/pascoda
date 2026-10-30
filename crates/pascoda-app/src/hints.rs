@@ -310,8 +310,55 @@ pub fn show_popup(
         });
 }
 
+/// The parts of a signature's label, in order, with the active parameter's part marked. Parameters
+/// are found in the label one after another, so a repeated name is matched where it comes.
+pub fn highlight_parameter(label: &str, parameters: &[String], active: Option<usize>) -> Vec<(String, bool)> {
+    let mut spans: Vec<(usize, usize, bool)> = Vec::new();
+    let mut from = 0;
+    for (i, p) in parameters.iter().enumerate() {
+        if p.is_empty() {
+            continue;
+        }
+        if let Some(off) = label[from..].find(p.as_str()) {
+            let start = from + off;
+            spans.push((start, start + p.len(), Some(i) == active));
+            from = start + p.len();
+        }
+    }
+    let mut out = Vec::new();
+    let mut at = 0;
+    for (start, end, marked) in spans {
+        if start > at {
+            out.push((label[at..start].to_string(), false));
+        }
+        out.push((label[start..end].to_string(), marked));
+        at = end;
+    }
+    if at < label.len() {
+        out.push((label[at..].to_string(), false));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_active_parameter_is_marked_in_the_label() {
+        let params = vec!["a: Integer".to_string(), "b: Integer".to_string()];
+        let got = highlight_parameter("Add(a: Integer; b: Integer):Integer", &params, Some(1));
+        assert_eq!(
+            got,
+            vec![
+                ("Add(".to_string(), false),
+                ("a: Integer".to_string(), false),
+                ("; ".to_string(), false),
+                ("b: Integer".to_string(), true),
+                ("):Integer".to_string(), false),
+            ]
+        );
+        assert!(highlight_parameter("Sq(x: Integer)", &[], None).iter().all(|(_, m)| !m));
+    }
+
     use super::*;
 
     #[test]
@@ -452,7 +499,7 @@ mod tests {
         let out = ctx.run_pass(Default::default(), |ctx| {
             let pal = crate::style::Palette::of(ctx);
             let job =
-                crate::highlight::layout(text, &pal, crate::editor_font(), crate::shell::LINE_H);
+                crate::highlight::layout(text, &pal, crate::editor_font(), crate::prefs::line_height());
             let galley = ctx.fonts_mut(|f| f.layout_job(job));
             // Centre of char `idx` on its row.
             let centre = |idx: usize| {
@@ -462,10 +509,10 @@ mod tests {
             let first = text.find("total").unwrap();
             let t = target_at(&galley, text, centre(first + 2), &[]).unwrap();
             assert_eq!(t.range, first..first + 5);
-            // Rows are LINE_H apart, so the second line is hit by its y.
+            // Rows are one line height apart, so the second line is hit by its y.
             assert_eq!(
                 galley.pos_from_cursor(CCursor::new(first)).min.y,
-                crate::shell::LINE_H
+                crate::prefs::line_height()
             );
             // Whitespace between words, and the space past the end of a line, are no target.
             assert!(target_at(&galley, text, centre(first + 5), &[]).is_none());

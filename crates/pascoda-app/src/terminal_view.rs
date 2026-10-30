@@ -5,7 +5,9 @@ use crate::terminal::{self, Cell, Terminal};
 use eframe::egui::{self, Color32, FontId, Rect, Sense, Stroke, vec2};
 
 /// Row height of the grid; the same as the code editor's lines.
-const CELL_H: f32 = crate::shell::LINE_H;
+const CELL_H: f32 = 18.0;
+/// The terminal keeps its own size: the editor preference does not change it.
+const TERMINAL_FONT_SIZE: f32 = 13.0;
 const PAD: egui::Vec2 = vec2(10.0, 4.0);
 /// Width of the scroll bar on the right edge.
 const BAR_W: f32 = 10.0;
@@ -142,7 +144,7 @@ fn cell_width(ui: &egui::Ui) -> f32 {
     ui.painter()
         .layout_no_wrap(
             "M".into(),
-            FontId::monospace(crate::EDITOR_FONT_SIZE),
+            FontId::monospace(TERMINAL_FONT_SIZE),
             Color32::WHITE,
         )
         .size()
@@ -164,7 +166,7 @@ pub(crate) fn show(
     st: &mut ViewState,
     focus: bool,
 ) -> bool {
-    let font = FontId::monospace(crate::EDITOR_FONT_SIZE);
+    let font = FontId::monospace(TERMINAL_FONT_SIZE);
     let cell_w = cell_width(ui);
     let avail = ui.available_size();
     let (area, resp) = ui.allocate_exact_size(avail, Sense::click_and_drag());

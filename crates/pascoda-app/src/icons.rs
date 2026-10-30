@@ -5,10 +5,19 @@
 use eframe::egui;
 
 const ICONS: &[(&str, &[u8])] = &[
-    (
-        "tbutton",
-        include_bytes!("../assets/components/tbutton.png"),
-    ),
+    ("tbutton", include_bytes!("../assets/components/tbutton.png")),
+    ("tdbgrid", include_bytes!("../assets/components/tdbgrid.png")),
+    ("tdbnavigator", include_bytes!("../assets/components/tdbnavigator.png")),
+    ("tdbedit", include_bytes!("../assets/components/tdbedit.png")),
+    ("tdbtext", include_bytes!("../assets/components/tdbtext.png")),
+    ("tdbmemo", include_bytes!("../assets/components/tdbmemo.png")),
+    ("tdbcheckbox", include_bytes!("../assets/components/tdbcheckbox.png")),
+    ("tdbcombobox", include_bytes!("../assets/components/tdbcombobox.png")),
+    ("tdblistbox", include_bytes!("../assets/components/tdblistbox.png")),
+    ("tdblookupcombobox", include_bytes!("../assets/components/tdblookupcombobox.png")),
+    ("tdblookuplistbox", include_bytes!("../assets/components/tdblookuplistbox.png")),
+    ("tdbradiogroup", include_bytes!("../assets/components/tdbradiogroup.png")),
+    ("tdbimage", include_bytes!("../assets/components/tdbimage.png")),
     ("tlabel", include_bytes!("../assets/components/tlabel.png")),
     ("tedit", include_bytes!("../assets/components/tedit.png")),
     ("tmemo", include_bytes!("../assets/components/tmemo.png")),
@@ -156,13 +165,32 @@ const ICONS: &[(&str, &[u8])] = &[
 ];
 const DEFAULT: &[u8] = include_bytes!("../assets/components/default.png");
 
-/// The icon bytes for a class (case-insensitive); the generic component icon when it has none.
-fn bytes(class: &str) -> &'static [u8] {
+/// Icon files of imported classes (`class`, file), set from the packages (see `designer::imports`).
+static ICON_FILES: std::sync::RwLock<Vec<(String, std::path::PathBuf)>> = std::sync::RwLock::new(Vec::new());
+
+/// Replaces the icon files of imported classes.
+pub fn set_icon_files(files: Vec<(String, std::path::PathBuf)>) {
+    *ICON_FILES.write().unwrap_or_else(|e| e.into_inner()) = files;
+}
+
+/// The icon bytes for a class (case-insensitive): the package's icon file when it has one, else the
+/// built-in icon, else the generic component icon.
+fn bytes(class: &str) -> Vec<u8> {
+    let file = ICON_FILES
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(c, _)| c.eq_ignore_ascii_case(class))
+        .map(|(_, p)| p.clone());
+    if let Some(data) = file.and_then(|p| std::fs::read(p).ok()) {
+        return data;
+    }
     let class = class.to_ascii_lowercase();
     ICONS
         .iter()
         .find(|(c, _)| *c == class)
         .map_or(DEFAULT, |(_, b)| b)
+        .to_vec()
 }
 
 /// The icon of a component class as a texture, decoded once per class.
@@ -172,7 +200,7 @@ pub fn texture(ctx: &egui::Context, class: &str) -> egui::TextureHandle {
     if let Some(t) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
         return t;
     }
-    let img = image::load_from_memory(bytes(&class)).expect("embedded icons are valid PNGs");
+    let img = image::load_from_memory(&bytes(&class)).expect("embedded icons are valid PNGs");
     let rgba = img.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
@@ -201,8 +229,18 @@ mod tests {
         for en in crate::designer::PALETTE {
             let b = bytes(en.class);
             assert!(b != DEFAULT, "{} has no icon", en.class);
-            assert!(image::load_from_memory(b).is_ok(), "{}", en.class);
+            assert!(image::load_from_memory(&b).is_ok(), "{}", en.class);
         }
         assert!(bytes("TNoSuchThing") == DEFAULT);
+    }
+
+    #[test]
+    fn a_package_icon_file_replaces_the_built_in_for_its_class() {
+        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../components/pascoda-vlc/tpascodavlcplayer.png");
+        set_icon_files(vec![("TPascodaVlcPlayer".to_string(), file.clone())]);
+        assert_eq!(bytes("tpascodavlcplayer"), std::fs::read(&file).unwrap(), "the file, case-insensitively");
+        assert!(bytes("TPascodaVlcListPlayer") == DEFAULT, "no file: the generic icon");
+        set_icon_files(Vec::new());
+        assert!(bytes("TPascodaVlcPlayer") == DEFAULT);
     }
 }

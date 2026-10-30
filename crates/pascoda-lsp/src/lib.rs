@@ -21,24 +21,12 @@ pub struct Config {
 }
 
 impl Config {
-    /// Looks for `vendor/pasls/dist/aarch64-darwin/pasls` in `start` and its parents, then in
-    /// `$PASCODA_HOME`, then in the app bundle's `Resources` folder, and (debug builds only) in
-    /// the source tree this crate was built from.
+    /// Looks for `vendor/pasls/dist/aarch64-darwin/pasls` in the folders the builds search too
+    /// (`pascoda_fpc::lcl::search_dirs`): `start` and its parents, `$PASCODA_HOME`, the app bundle's
+    /// `Resources`, the user's `Application Support/Pascoda` folder, and (debug builds only) the
+    /// source tree this crate was built from.
     pub fn find(start: &Path) -> Option<Self> {
-        let mut dirs: Vec<PathBuf> = start.ancestors().map(Path::to_path_buf).collect();
-        dirs.extend(std::env::var_os("PASCODA_HOME").map(PathBuf::from));
-        if let Ok(exe) = std::env::current_exe()
-            && let Some(contents) = exe.parent().and_then(Path::parent)
-        {
-            dirs.push(contents.join("Resources"));
-        }
-        if cfg!(debug_assertions) {
-            dirs.extend(
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .ancestors()
-                    .map(Path::to_path_buf),
-            );
-        }
+        let dirs = pascoda_fpc::lcl::search_dirs(start);
         // `pasls` needs the compiler's path (`PP`); wherever fpc is installed, not only Homebrew.
         let fpc = pascoda_fpc::locate_fpc()?;
         Self::find_in(dirs.iter().map(PathBuf::as_path), &fpc)
@@ -70,6 +58,42 @@ pub struct Location {
     pub path: PathBuf,
     pub line: u32,
     pub col: u32,
+}
+
+/// A declaration in a file: its name, its LSP `SymbolKind` number, and its 0-based position. `depth`
+/// is 0 for a top-level declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Symbol {
+    pub name: String,
+    pub kind: u32,
+    pub line: u32,
+    pub col: u32,
+    pub depth: u32,
+}
+
+/// The signature of the call being typed: its label (`WriteLn(...)`), the labels of its
+/// parameters, and which parameter the caret is in (`None` when the server does not say).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signature {
+    pub label: String,
+    pub parameters: Vec<String>,
+    pub active: Option<usize>,
+}
+
+/// A replacement in a file: the range (0-based line and character column, end exclusive) and the
+/// new text. What a rename sends back for each file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextEdit {
+    pub start: (u32, u32),
+    pub end: (u32, u32),
+    pub new_text: String,
+}
+
+/// All the replacements of a rename in one file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEdit {
+    pub path: PathBuf,
+    pub edits: Vec<TextEdit>,
 }
 
 pub struct Client {
@@ -175,17 +199,11 @@ fn fpc_options(lazarus: &Path, root: &Path) -> Vec<String> {
     options
 }
 
-/// The `-Fu`, `-Fi` and `-d` switches of the Lazarus or Delphi project file in `root`, the same
-/// ones builds use. The server reads them when it starts, so a changed project needs a restart.
+/// The `-Fu`, `-Fi` and `-d` switches builds use for the project in `root`: those of its `.lpi` or
+/// `.dproj` and its `pascoda.toml` settings. The server reads them when it starts, so a changed
+/// project needs a restart.
 fn project_options(root: &Path) -> Vec<String> {
-    let Some(file) = pascoda_project::foreign::find(root) else {
-        return Vec::new();
-    };
-    let Ok(project) = pascoda_project::foreign::read(&file) else {
-        return Vec::new();
-    };
-    project
-        .compiler_args()
+    pascoda_project::compiler_args(root)
         .into_iter()
         .map(|a| a.to_string_lossy().into_owned())
         .filter(|a| a.starts_with("-d") || a.starts_with("-Fu") || a.starts_with("-Fi"))
@@ -391,6 +409,161 @@ impl Client {
         }))
     }
 
+    /// The symbols declared in a file (types, fields, routines, ...), in document order. Nested ones
+    /// (a class's fields, a routine's locals) carry their depth. Both answers the spec allows are
+    /// read: the nested `DocumentSymbol` tree and the flat `SymbolInformation` list.
+    pub fn document_symbols(&mut self, path: &Path) -> Result<Vec<Symbol>, String> {
+        let params = json!({"textDocument": {"uri": uri(path)}});
+        let result = self.request("textDocument/documentSymbol", params)?;
+        let mut out = Vec::new();
+        for s in result.as_array().into_iter().flatten() {
+            self.push_symbol(path, s, 0, &mut out);
+        }
+        Ok(out)
+    }
+
+    fn push_symbol(&self, path: &Path, s: &Value, depth: u32, out: &mut Vec<Symbol>) {
+        let mut name = s["name"].as_str().unwrap_or_default().to_string();
+        // A DocumentSymbol has `selectionRange`; a SymbolInformation has `location`, and pasls names
+        // its members `Class.Member` there instead of nesting them.
+        let flat = s.get("selectionRange").is_none() && s.get("range").is_none();
+        let (range, file) = if !flat {
+            (&s["selectionRange"], path.to_path_buf())
+        } else {
+            (&s["location"]["range"], path_of(s["location"]["uri"].as_str().unwrap_or_default()))
+        };
+        let mut depth = depth;
+        if flat && let Some((_, last)) = name.rsplit_once('.') {
+            depth += name.matches('.').count() as u32;
+            name = last.to_string();
+        }
+        let line = range["start"]["line"].as_u64().unwrap_or(0) as u32;
+        let units = range["start"]["character"].as_u64().unwrap_or(0) as u32;
+        let col = self.char_col_in(&file, line, units);
+        // `interface` and `implementation` are section markers, not declarations.
+        let marker = matches!(name.to_ascii_lowercase().as_str(), "interface" | "implementation");
+        if !name.is_empty() && !marker {
+            out.push(Symbol {
+                name,
+                kind: s["kind"].as_u64().unwrap_or(0) as u32,
+                line,
+                col,
+                depth,
+            });
+        }
+        for child in s["children"].as_array().into_iter().flatten() {
+            self.push_symbol(path, child, depth + 1, out);
+        }
+    }
+
+    /// The signature of the routine called at the position, while a call is being typed. `None`
+    /// when the position is not in a call the server knows.
+    pub fn signature_help(&mut self, path: &Path, line: u32, col: u32) -> Result<Option<Signature>, String> {
+        let result = self.request("textDocument/signatureHelp", self.at(path, line, col))?;
+        let sigs = result["signatures"].as_array();
+        let Some(sig) = sigs.and_then(|s| {
+            let i = result["activeSignature"].as_u64().unwrap_or(0) as usize;
+            s.get(i).or_else(|| s.first())
+        }) else {
+            return Ok(None);
+        };
+        let label = sig["label"].as_str().unwrap_or_default().to_string();
+        let parameters = sig["parameters"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|p| match &p["label"] {
+                // A parameter label is either its text or a [start, end) range in the label.
+                Value::String(s) => s.clone(),
+                Value::Array(r) => {
+                    let (a, b) = (r.first().and_then(Value::as_u64), r.get(1).and_then(Value::as_u64));
+                    match (a, b) {
+                        (Some(a), Some(b)) => label
+                            .chars()
+                            .skip(a as usize)
+                            .take(b.saturating_sub(a) as usize)
+                            .collect(),
+                        _ => String::new(),
+                    }
+                }
+                _ => String::new(),
+            })
+            .collect();
+        let active = result["activeParameter"]
+            .as_u64()
+            .or_else(|| sig["activeParameter"].as_u64())
+            .map(|i| i as usize);
+        if label.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Signature { label, parameters, active }))
+    }
+
+    /// Every place the symbol at the position is used, the declaration included.
+    pub fn references(&mut self, path: &Path, line: u32, col: u32) -> Result<Vec<Location>, String> {
+        let mut params = self.at(path, line, col);
+        params["context"] = json!({"includeDeclaration": true});
+        let result = self.request("textDocument/references", params)?;
+        Ok(result
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|loc| self.location_of(loc))
+            .collect())
+    }
+
+    /// Renames the symbol at the position to `new_name`. Returns the replacements per file: the
+    /// server answers with either `changes` or `documentChanges`.
+    pub fn rename(&mut self, path: &Path, line: u32, col: u32, new_name: &str) -> Result<Vec<FileEdit>, String> {
+        let mut params = self.at(path, line, col);
+        params["newName"] = json!(new_name);
+        let result = self.request("textDocument/rename", params)?;
+        let mut files: Vec<FileEdit> = Vec::new();
+        let mut add = |this: &Self, uri: &str, edits: &Value| {
+            let path = path_of(uri);
+            let edits = edits
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|e| this.text_edit_in(&path, e))
+                .collect();
+            files.push(FileEdit { path, edits });
+        };
+        if let Some(changes) = result["changes"].as_object() {
+            for (uri, edits) in changes {
+                add(self, uri, edits);
+            }
+        } else if let Some(docs) = result["documentChanges"].as_array() {
+            for d in docs {
+                if let Some(uri) = d["textDocument"]["uri"].as_str() {
+                    add(self, uri, &d["edits"]);
+                }
+            }
+        }
+        Ok(files)
+    }
+
+    fn location_of(&self, loc: &Value) -> Option<Location> {
+        let path = path_of(loc["uri"].as_str()?);
+        let line = loc["range"]["start"]["line"].as_u64()? as u32;
+        let units = loc["range"]["start"]["character"].as_u64().unwrap_or(0) as u32;
+        let col = self.char_col_in(&path, line, units);
+        Some(Location { path, line, col })
+    }
+
+    fn text_edit_in(&self, path: &Path, e: &Value) -> TextEdit {
+        let point = |p: &Value| {
+            let line = p["line"].as_u64().unwrap_or(0) as u32;
+            let units = p["character"].as_u64().unwrap_or(0) as u32;
+            (line, self.char_col_in(path, line, units))
+        };
+        TextEdit {
+            start: point(&e["range"]["start"]),
+            end: point(&e["range"]["end"]),
+            new_text: e["newText"].as_str().unwrap_or_default().to_string(),
+        }
+    }
+
     /// Converts a UTF-16 column in `path` to chars, using the synced text or else the file.
     fn char_col_in(&self, path: &Path, line: u32, units: u32) -> u32 {
         match self.texts.get(path) {
@@ -558,7 +731,11 @@ mod project_tests {
         assert!(options.contains(&format!("-Fu{}", dir.join("lib").display())));
         assert!(options.contains(&"-dFOO".to_string()));
         assert!(!options.iter().any(|o| o.starts_with("-O")), "switches stay with builds");
-        assert!(project_options(&dir.join("lib")).is_empty(), "no project, no options");
+        // No project file in `lib`: none of the project's options (the packages that come with Pascoda
+        // are on every project's path, so the list is not empty).
+        let none = project_options(&dir.join("lib"));
+        assert!(!none.iter().any(|o| o.starts_with("-d")), "no project, no defines: {none:?}");
+        assert!(!none.contains(&format!("-Fu{}", dir.join("lib").display())), "{none:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

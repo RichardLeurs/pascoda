@@ -76,6 +76,16 @@ fn run(
     lcl: Option<&crate::lcl::Lcl>,
 ) -> std::io::Result<Vec<Diagnostic>> {
     std::fs::write(work.join(name), text)?;
+    // `{$R *.lfm}` (and `.dfm`) is read beside the unit, so the scratch copy needs the unit's form
+    // files, as a build has them. A form that cannot be copied is left for fpc to report.
+    if let Some(stem) = Path::new(name).file_stem() {
+        for ext in ["lfm", "dfm"] {
+            let form = dir.join(format!("{}.{ext}", stem.to_string_lossy()));
+            if form.is_file() {
+                let _ = std::fs::copy(&form, work.join(form.file_name().unwrap_or_default()));
+            }
+        }
+    }
     let mut args: Vec<OsString> = vec![
         "-s".into(),
         mode.flag().into(),
@@ -94,6 +104,7 @@ fn run(
     }
     args.push(format!("-Fu{}", dir.display()).into());
     let mut child = Command::new(fpc)
+        .args(crate::config_args(fpc, work))
         .args(&args)
         .arg(name)
         .current_dir(work)
@@ -218,5 +229,47 @@ mod tests {
         let e = squiggles(&d).next().expect("fatal for the unit");
         assert!(e.message.contains("NoSuchUnitXyz"), "{e:?}");
         assert_eq!(e.line, 2);
+    }
+
+    #[test]
+    fn a_unit_with_a_form_file_is_checked_with_the_form_beside_it() {
+        if locate_fpc().is_none() {
+            return;
+        }
+        // The form file is found the way the compiler finds `{$R *.lfm}`: beside the unit.
+        let proj = std::env::temp_dir().join(format!("pascoda-check-form-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&proj);
+        std::fs::create_dir_all(&proj).unwrap();
+        let src = proj.join("mainunit.pas");
+        std::fs::write(&src, "unit mainunit;\n\ninterface\n\nimplementation\n\n{$R *.lfm}\n\nend.\n").unwrap();
+        std::fs::write(proj.join("mainunit.lfm"), "object Form1: TForm1\nend\n").unwrap();
+        let text = std::fs::read_to_string(&src).unwrap();
+        let d = check_text(&src, &text, Mode::default(), None).unwrap();
+        assert!(
+            squiggles(&d).all(|e| !e.message.contains(".lfm")),
+            "the form file is found: {d:?}"
+        );
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    /// The GUI demo's form units are checked with their `.lfm` beside them, as the IDE checks them
+    /// while typing: no error (the form file used to be missing from the check's scratch folder).
+    #[test]
+    fn the_gui_demo_form_units_check_without_errors() {
+        if locate_fpc().is_none() {
+            return;
+        }
+        let demo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/gui-demo");
+        let Some(lcl) = crate::lcl::Lcl::find(&demo) else { return };
+        for unit in ["mainunit.pas", "aboutunit.pas", "settingsunit.pas"] {
+            let src = demo.join(unit);
+            let text = std::fs::read_to_string(&src).unwrap();
+            let d = check_text(&src, &text, Mode::ObjFpc, Some(&lcl)).unwrap();
+            let errors: Vec<&Diagnostic> = d
+                .iter()
+                .filter(|x| matches!(x.severity, Severity::Error | Severity::Fatal))
+                .collect();
+            assert!(errors.is_empty(), "{unit}: {errors:?}");
+        }
     }
 }

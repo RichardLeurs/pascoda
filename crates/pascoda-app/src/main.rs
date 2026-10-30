@@ -1,10 +1,21 @@
 mod about;
 mod assistant;
 mod bottom;
+mod editor_lines;
+mod prefs;
+mod unit_tests;
+mod vendor_ui;
+#[cfg(test)]
+mod demo_tests;
+mod recent;
+mod system_menus;
+mod session;
+mod project_options;
 mod chrome;
 mod debugger;
 mod designer;
 mod export_dialog;
+mod find;
 mod files;
 mod external;
 mod highlight;
@@ -29,7 +40,6 @@ use std::process::Command;
 use std::sync::mpsc::{Receiver, channel};
 
 const SOURCE_EXTENSIONS: &[&str] = &["pas", "pp", "lpr", "dpr", "inc"];
-const EDITOR_FONT_SIZE: f32 = 13.0;
 
 struct Doc {
     path: PathBuf,
@@ -38,6 +48,10 @@ struct Doc {
     editor_id: egui::Id,
     /// 1-based lines with a breakpoint.
     breakpoints: BTreeSet<u32>,
+    /// The condition and hit condition of breakpoints that have them, by line.
+    stops: std::collections::BTreeMap<u32, debugger::Stop>,
+    /// Breakpoint lines that are kept but not sent to the debugger.
+    disabled: BTreeSet<u32>,
 }
 
 impl Doc {
@@ -64,9 +78,14 @@ struct App {
     export_source: PathBuf,
     /// A question about unsaved changes that is waiting for an answer.
     confirm: Option<Confirm>,
+    /// A change of project waiting for the answer to `confirm`: the new folder, and what to do in
+    /// it once the old project's tabs are closed.
+    project_switch: Option<(PathBuf, Box<dyn FnOnce(&mut App)>)>,
     /// The user chose to quit despite (or after saving) unsaved changes.
     quit_confirmed: bool,
     export_dialog: Option<export_dialog::ExportDialog>,
+    /// The Component Packages dialog (File > Import Component Package...) is open.
+    import_packages_open: bool,
     build_progress: Option<pascoda_fpc::Progress>,
     unit_counts: std::collections::HashMap<PathBuf, usize>,
     build_source: PathBuf,
@@ -104,6 +123,12 @@ struct App {
     designers: Vec<designer::Designer>,
     /// Show the form designer instead of the code for the active unit.
     form_view: bool,
+    /// The `.lfm` file whose form is showing (selected in the tree): Code shows its text.
+    form_lfm: Option<PathBuf>,
+    /// Tools that are missing, shown in the "Some tools are missing" window (see `vendor_ui`).
+    vendor_dialog: Option<Vec<pascoda_fpc::vendor::Part>>,
+    /// The missing language server was already pointed out this session.
+    vendor_asked_pasls: bool,
     designer_ui: designer::ui::UiState,
     native: Option<designer::native::Native>,
     selftest: Option<SelfTest>,
@@ -124,12 +149,42 @@ struct App {
     run_after_build: bool,
     /// Changes made to open files by other programs, and the watcher that notices them.
     external: external::External,
+    unit_tests: unit_tests::UnitTests,
     /// Project tree: the selected file or folder, a name being typed for a new item, and an
     /// item waiting for the user to confirm its deletion.
     tree_sel: Option<PathBuf>,
     tree_new: Option<shell::TreeNew>,
     tree_delete: Option<PathBuf>,
     tree_rename: Option<shell::TreeRename>,
+    outline: shell::Outline,
+    /// File > Open Recent: the lists, and the file they are kept in (`None` in tests, so they are
+    /// not written to the user's folder).
+    recent: recent::Recent,
+    recent_file: Option<PathBuf>,
+    /// A character range the editor scrolls into view on its next frame (set by go-to).
+    reveal: Option<std::ops::Range<usize>>,
+    /// The session file the app restores at launch and writes at exit (`None` in tests).
+    session_file: Option<PathBuf>,
+    /// The breakpoint box open in the gutter's secondary click: the file and line, and the fields.
+    bp_edit: Option<shell::BpEdit>,
+    /// The Change Value box, while a variable's new value is being assigned.
+    value_edit: Option<shell::ValueEdit>,
+    /// Stop where a Pascal exception is raised (kept across debug sessions, set when one starts).
+    exception_stops: bool,
+    /// The signature of the call at the caret (parameter hints while a call is typed).
+    signature: Option<shell::SigHint>,
+    /// The watch expressions (kept across debug sessions), the text in their box, and the last
+    /// Evaluate result.
+    watch_list: Vec<String>,
+    watch_input: String,
+    watch_eval: Option<(String, Result<debugger::Var, String>)>,
+    prefs: prefs::Prefs,
+    project_options: project_options::Editor,
+    preferences_open: bool,
+    find: find::Bar,
+    project_bar: find::ProjectBar,
+    go_to: find::GoTo,
+    rename: find::Rename,
     /// The project's custom components, and the project (and file-tree revision) they were read for.
     custom_units: std::sync::Arc<designer::ClassUnits>,
     custom_scan: Option<(PathBuf, u64)>,
@@ -181,6 +236,7 @@ impl App {
             exporting: None,
             export_source: PathBuf::new(),
             confirm: None,
+            project_switch: None,
             quit_confirmed: false,
             export_dialog: None,
             build_progress: None,
@@ -209,6 +265,9 @@ impl App {
             build_texts: Vec::new(),
             designers: Vec::new(),
             form_view: false,
+            form_lfm: None,
+            vendor_dialog: None,
+            vendor_asked_pasls: false,
             designer_ui: designer::ui::UiState::default(),
             native: None,
             selftest: None,
@@ -223,10 +282,31 @@ impl App {
             assistant_build_reply: None,
             run_after_build: true,
             external: Default::default(),
+            unit_tests: Default::default(),
             tree_sel: None,
             tree_new: None,
             tree_delete: None,
             tree_rename: None,
+            outline: Default::default(),
+            recent: Default::default(),
+            recent_file: None,
+            reveal: None,
+            session_file: None,
+            bp_edit: None,
+            value_edit: None,
+            exception_stops: false,
+            signature: None,
+            watch_list: Vec::new(),
+            watch_input: String::new(),
+            watch_eval: None,
+            prefs: Default::default(),
+            project_options: Default::default(),
+            preferences_open: false,
+            find: Default::default(),
+            project_bar: Default::default(),
+            go_to: Default::default(),
+            rename: Default::default(),
+            import_packages_open: false,
             custom_units: Default::default(),
             custom_scan: None,
         };
@@ -237,8 +317,21 @@ impl App {
     }
 
     fn new(path: Option<PathBuf>, ctx: &egui::Context) -> Self {
+        let given = path.is_some();
         let mut app = Self::bare(path);
+        let file = session::Session::file();
+        app.session_file = file.clone();
+        if let Some(saved) = file.as_deref().and_then(session::Session::load) {
+            app.restore(saved, given);
+        }
+        app.prefs = prefs::Prefs::load();
+        app.prefs.apply();
+        designer::imports::refresh();
         app.menu = NativeMenu::install(ctx);
+        let file = recent::Recent::file();
+        app.recent = file.as_deref().map(recent::Recent::load).unwrap_or_default();
+        app.recent_file = file;
+        app.refresh_recent_menu();
         app.start_watching(ctx);
         app.live.enabled = true;
         if pascoda_fpc::locate_fpc().is_none() {
@@ -251,6 +344,62 @@ impl App {
             scroll: std::env::var_os("PASCODA_SELFTEST_SCROLL").is_some(),
         });
         app
+    }
+
+    /// What the session file keeps: the project, the open tabs and the active one.
+    fn snapshot(&self) -> session::Session {
+        session::Session {
+            root: Some(self.root.clone()),
+            tabs: self.docs.iter().map(|d| d.path.clone()).collect(),
+            active: self.docs.get(self.active).map(|d| d.path.clone()),
+            form_view: self.form_view,
+        }
+    }
+
+    /// A project was opened or created: the problems and build errors of the previous project
+    /// (the Problems list, the squiggles and the live check) do not belong to it any more.
+    fn clear_build_results(&mut self) {
+        self.diagnostics.clear();
+        self.marks.clear();
+        self.build_texts.clear();
+        self.live.forget();
+        if !self.unit_tests.busy() {
+            // The tests listed belong to the previous project.
+            self.unit_tests = Default::default();
+        }
+    }
+
+    /// Reopens the saved session: its project folder (unless a file was given on the command line,
+    /// which keeps the folder it is in), its tabs that still exist, and the active tab. A file given on
+    /// the command line is the active tab.
+    fn restore(&mut self, saved: session::Session, given: bool) {
+        if !given && let Some(root) = saved.root.filter(|r| r.is_dir()) {
+            self.root = root.clone();
+            self.build_dir = root;
+            self.clear_build_results();
+        }
+        // The file given on the command line is open already, as the first tab. Opening a tab makes
+        // it active, so the first tab is made active again below.
+        let given_tab = self.active;
+        for tab in saved.tabs.iter().filter(|t| t.is_file()) {
+            if !self.docs.iter().any(|d| &d.path == tab) {
+                self.open_path(tab.clone());
+            }
+        }
+        if given {
+            self.active = given_tab;
+        }
+        if !given
+            && let Some(i) = saved
+                .active
+                .as_ref()
+                .and_then(|a| self.docs.iter().position(|d| &d.path == a))
+        {
+            self.active = i;
+        }
+        if saved.form_view {
+            self.show_form();
+        }
     }
 
     /// Opens `path` in a tab, or switches to it if it is already open.
@@ -283,6 +432,8 @@ impl App {
             text,
             editor_id: egui::Id::unique(("pascoda-editor", self.next_editor_id)),
             breakpoints: BTreeSet::new(),
+            stops: Default::default(),
+            disabled: BTreeSet::new(),
         });
         self.active = self.docs.len() - 1;
     }
@@ -290,12 +441,79 @@ impl App {
     fn pick_file(&mut self) {
         if let Some(p) = rfd::FileDialog::new()
             .add_filter("Pascal", SOURCE_EXTENSIONS)
+            // Everything the project tree lists: forms, project files, packages and text files too.
+            .add_filter("Pascal, form, project and package files", files::TREE_EXTENSIONS)
             .pick_file()
         {
-            if let Some(dir) = p.parent() {
-                self.root = dir.to_path_buf();
+            match p.parent().map(Path::to_path_buf) {
+                Some(dir) => self.switch_project(dir.clone(), move |app| {
+                    app.remember(|r| r.note_project(&dir));
+                    app.remember(|r| r.note_file(&p));
+                    app.open_path(p);
+                }),
+                None => {
+                    self.remember(|r| r.note_file(&p));
+                    self.open_path(p);
+                }
             }
-            self.open_path(p);
+        }
+    }
+
+    /// Changes the recent lists with `change`, saves them, and rebuilds the Open Recent menu.
+    fn remember(&mut self, change: impl FnOnce(&mut recent::Recent)) {
+        change(&mut self.recent);
+        if let Some(file) = &self.recent_file {
+            self.recent.save(file);
+        }
+        self.refresh_recent_menu();
+    }
+
+    fn refresh_recent_menu(&mut self) {
+        let entries = self.recent.menu_entries();
+        if let Some(m) = self.menu.as_mut() {
+            m.set_recent(entries);
+        }
+    }
+
+    /// Opens an item of Open Recent: a project's main program (its `.lpr`, else its first unit) or a
+    /// file, with its folder as the project.
+    fn open_recent(&mut self, index: usize) {
+        let Some(entry) = self.menu.as_ref().and_then(|m| m.recent_entries.get(index).cloned()) else {
+            return;
+        };
+        self.open_recent_entry(entry);
+    }
+
+    fn open_recent_entry(&mut self, entry: recent::Entry) {
+        if entry.project {
+            let folder = entry.path.clone();
+            self.switch_project(folder.clone(), move |app| {
+                let main = pascoda_project::program::program_for(&folder, &folder).or_else(|| {
+                    let mut units: Vec<PathBuf> = std::fs::read_dir(&folder)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Result::ok)
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("pas")))
+                        .collect();
+                    units.sort();
+                    units.into_iter().next()
+                });
+                if let Some(main) = main {
+                    app.open_path(main);
+                }
+                app.remember(|r| r.note_project(&folder));
+            });
+        } else {
+            let dir = entry.path.parent().map(Path::to_path_buf).unwrap_or_default();
+            let file = entry.path.clone();
+            self.switch_project(dir.clone(), move |app| {
+                app.open_path(file.clone());
+                app.remember(|r| {
+                    r.note_file(&file);
+                    r.note_project(&dir);
+                });
+            });
         }
     }
 
@@ -330,7 +548,7 @@ impl App {
                 || self
                     .designers
                     .iter()
-                    .any(|f| f.pas_path == d.path && f.dirty())
+                    .any(|f| designer::form_unit(&d.path).is_some_and(|u| u == f.pas_path) && f.dirty())
         })
     }
 
@@ -343,10 +561,53 @@ impl App {
         }
     }
 
+    /// Makes `dir` the project, then runs `then` (what to open or record there). The tabs of the old
+    /// project are closed first; when some of them have unsaved changes the user is asked, and the
+    /// switch waits for the answer. Staying in the same folder keeps the tabs.
+    fn switch_project(&mut self, dir: PathBuf, then: impl FnOnce(&mut App) + 'static) {
+        if dir == self.root {
+            then(self);
+            return;
+        }
+        let dirty = (0..self.docs.len())
+            .any(|i| !self.docs[i].path.starts_with(&dir) && self.is_dirty(i));
+        if dirty {
+            self.confirm = Some(Confirm::Project(dir.clone()));
+            self.project_switch = Some((dir, Box::new(then)));
+            return;
+        }
+        self.close_tabs_outside(&dir, false);
+        self.enter_project(dir);
+        then(self);
+    }
+
+    /// The project folder is now `dir`; the build results belong to the old one.
+    fn enter_project(&mut self, dir: PathBuf) {
+        self.root = dir;
+        self.clear_build_results();
+    }
+
+    /// Closes the tabs whose files are not in `dir`. With `save`, the unsaved ones are saved first.
+    fn close_tabs_outside(&mut self, dir: &Path, save: bool) {
+        let mut i = 0;
+        while i < self.docs.len() {
+            if self.docs[i].path.starts_with(dir) {
+                i += 1;
+            } else if save {
+                if self.is_dirty(i) {
+                    self.save_doc(i);
+                }
+                self.close_doc(i);
+            } else {
+                self.discard_doc(i);
+            }
+        }
+    }
+
     /// Closes tab `i` without saving it: its form edits are dropped too.
     fn discard_doc(&mut self, i: usize) {
         if let Some(path) = self.docs.get(i).map(|d| d.path.clone()) {
-            self.designers.retain(|f| f.pas_path != path);
+            self.forget_designer_if_unused(&path);
         }
         self.remove_doc(i);
     }
@@ -364,15 +625,33 @@ impl App {
         }
     }
 
-    /// Writes the form of the unit in tab `i` (closing a tab must not lose form edits).
+    /// Writes the form of tab `i`'s unit (closing a tab must not lose form edits). A `.lfm` tab
+    /// shows the form of its unit, so both tabs of the pair reach the same designer.
     fn save_doc_form(&mut self, i: usize) {
         let Some(path) = self.docs.get(i).map(|d| d.path.clone()) else {
             return;
         };
-        if let Some(form) = self.designers.iter_mut().find(|f| f.pas_path == path) {
+        let Some(unit) = designer::form_unit(&path) else {
+            return;
+        };
+        if let Some(form) = self.designers.iter_mut().find(|f| f.pas_path == unit) {
             let _ = form.save();
         }
-        self.designers.retain(|f| f.pas_path != path);
+        self.forget_designer_if_unused(&path);
+    }
+
+    /// Drops the designer of the unit of `path` once neither tab of the pair (unit, `.lfm`) is
+    /// open; while one of them is open, the form stays available to it.
+    fn forget_designer_if_unused(&mut self, path: &Path) {
+        let Some(unit) = designer::form_unit(path) else {
+            return;
+        };
+        let open_elsewhere = self.docs.iter().any(|d| {
+            d.path != path && designer::form_unit(&d.path).as_ref() == Some(&unit)
+        });
+        if !open_elsewhere {
+            self.designers.retain(|f| f.pas_path != unit);
+        }
     }
 
     /// The active tab is half of a unit/form pair: the `.pas` or its `.lfm`.
@@ -382,20 +661,44 @@ impl App {
             .is_some_and(|d| designer::form_unit(&d.path).is_some())
     }
 
-    /// The active tab is a unit that has a form, the only tab the designer can show.
+    /// The active tab is half of a unit/form pair, so the designer can show its form (on the `.pas`
+    /// or on the `.lfm`).
     fn active_is_unit_with_form(&self) -> bool {
-        self.docs
-            .get(self.active)
-            .is_some_and(|d| designer::sibling_lfm(&d.path).is_some())
+        self.has_form()
+    }
+
+    /// A file was selected in the project tree: a form file (`.lfm` or `.dfm`) shows its form, any
+    /// other file shows its code (never the form that was showing before).
+    pub(crate) fn select_in_tree(&mut self, path: PathBuf) {
+        let is_form_file = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("lfm") || e.eq_ignore_ascii_case("dfm"));
+        self.form_lfm = is_form_file.then(|| path.clone());
+        self.open_path(path.clone());
+        if is_form_file {
+            if designer::form_unit(&path).is_some() {
+                self.show_form();
+            }
+        } else {
+            self.form_view = false;
+        }
+    }
+
+    /// The code view. A form opened from its `.lfm` file shows that file's text, not the unit's code.
+    pub(crate) fn show_code(&mut self) {
+        self.form_view = false;
+        if let Some(lfm) = self.form_lfm.clone() {
+            self.open_path(lfm);
+        }
     }
 
     /// The designer is what the window is showing right now.
     fn form_showing(&self) -> bool {
         self.form_view
-            && self
-                .docs
-                .get(self.active)
-                .is_some_and(|d| self.designers.iter().any(|f| f.pas_path == d.path))
+            && self.docs.get(self.active).is_some_and(|d| {
+                designer::form_unit(&d.path).is_some_and(|u| self.designers.iter().any(|f| f.pas_path == u))
+            })
     }
 
     /// While the `.lfm` is open as text, keep it in step with the designer: changes made in
@@ -434,9 +737,13 @@ impl App {
             return;
         };
         if unit != active {
-            self.save_doc(self.active);
+            // The form is shown on the `.lfm`'s own tab. The unit is opened for its text (the
+            // designer needs it), and the `.lfm` tab stays the one shown.
+            let form_tab = self.active;
+            self.save_doc(form_tab);
             self.designers.retain(|f| f.pas_path != unit);
             self.open_path(unit.clone());
+            self.active = form_tab;
         }
         if !self.designers.iter().any(|f| f.pas_path == unit) {
             match designer::Designer::open(&unit) {
@@ -450,8 +757,80 @@ impl App {
         self.form_view = true;
     }
 
+    /// File > New Form, and New Form in a folder's menu: a new unit and its form in `dir`, opened
+    /// with the form shown in the designer. The program is not changed, so the form is not built
+    /// until a program uses it.
+    fn new_form(&mut self, dir: &Path) {
+        self.new_unit(dir, false);
+    }
+
+    /// Creates a form (or, with `data_module`, a data module) in `dir`, opens it in the designer and
+    /// adds it to the project's program.
+    fn new_unit(&mut self, dir: &Path, data_module: bool) {
+        let created = if data_module {
+            pascoda_project::new_data_module_unit(dir, &self.root)
+        } else {
+            pascoda_project::new_form_unit(dir, &self.root)
+        };
+        let what = if data_module { "data module" } else { "form" };
+        match created {
+            Ok(pas) => {
+                let shown = pas.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                let unit = shell::unit_name(&pas);
+                let form = std::fs::read_to_string(pas.with_extension("lfm"))
+                    .ok()
+                    .and_then(|t| pascoda_project::program::form_of_lfm(&t));
+                self.expanded.insert(dir.to_path_buf());
+                self.tree_sel = Some(pas.clone());
+                self.open_path(pas);
+                self.show_form();
+                let mut message = format!("Created {shown} and its {what}.");
+                if let Some((class, var)) = form {
+                    message.push_str(&match self.add_to_program(dir, &unit, &class, &var) {
+                        Ok(Some(lpr)) => format!(" Added it to {lpr}."),
+                        Ok(None) => " No program (.lpr) in this project, so it is not built yet.".to_string(),
+                        Err(e) => format!(" The program was not changed: {e}."),
+                    });
+                }
+                self.console = format!("{message}\n");
+            }
+            Err(e) => self.console = format!("could not create the {what}: {e}\n"),
+        }
+    }
+
+    /// Adds a form's unit to the program of `dir` (see `program::program_for`). Returns the program's
+    /// file name, or `None` when the project has no program.
+    fn add_to_program(&mut self, dir: &Path, unit: &str, class: &str, var: &str) -> Result<Option<String>, String> {
+        let Some(lpr) = pascoda_project::program::program_for(dir, &self.root) else {
+            return Ok(None);
+        };
+        self.edit_program(&lpr, |src| pascoda_project::program::add_form(src, unit, class, var))?;
+        Ok(lpr.file_name().map(|n| n.to_string_lossy().into_owned()))
+    }
+
+    /// Applies `edit` to a program file and writes it when the text changes. Returns whether it did.
+    pub(crate) fn edit_program(
+        &mut self,
+        lpr: &Path,
+        edit: impl FnOnce(&str) -> Result<String, String>,
+    ) -> Result<bool, String> {
+        let src = std::fs::read_to_string(lpr).map_err(|e| format!("could not read {}: {e}", lpr.display()))?;
+        let out = edit(&src)?;
+        if out == src {
+            return Ok(false);
+        }
+        std::fs::write(lpr, out).map_err(|e| format!("could not write {}: {e}", lpr.display()))?;
+        Ok(true)
+    }
+
     /// File > New GUI Application: a project folder with a program and one form.
     fn new_gui_app(&mut self) {
+        self.new_project(pascoda_project::Template::Gui);
+    }
+
+    /// File > New ... Application or Library: a project folder in a chosen place, opened with its main
+    /// program (and, for the GUI and the library, the unit it starts from).
+    fn new_project(&mut self, template: pascoda_project::Template) {
         let Some(parent) = rfd::FileDialog::new()
             .set_title("Choose where to create the project")
             .pick_folder()
@@ -459,13 +838,27 @@ impl App {
             return;
         };
         let name = pascoda_project::free_project_name(&parent);
-        match pascoda_project::create_gui_app(&parent, &name) {
-            Ok(lpr) => {
-                let dir = lpr.parent().map(Path::to_path_buf).unwrap_or_default();
-                self.root = dir.clone();
-                self.open_path(lpr);
-                self.open_path(dir.join("unit1.pas"));
-                self.show_form();
+        match pascoda_project::create_project(&parent, &name, template) {
+            Ok(program) => {
+                let dir = program.parent().map(Path::to_path_buf).unwrap_or_default();
+                let opened = dir.clone();
+                self.switch_project(dir, move |app| {
+                    app.remember(|r| r.note_project(&opened));
+                    app.open_path(program);
+                    match template {
+                        pascoda_project::Template::Gui => {
+                            app.open_path(opened.join("unit1.pas"));
+                            app.show_form();
+                        }
+                        pascoda_project::Template::Library => {
+                            app.open_path(opened.join(format!("{name}.pas")));
+                        }
+                        pascoda_project::Template::Package => {
+                            app.open_path(opened.join(format!("{name}.pas")));
+                        }
+                        pascoda_project::Template::Console => {}
+                    }
+                });
             }
             Err(e) => self.console = format!("could not create the project: {e}\n"),
         }
@@ -496,8 +889,26 @@ impl App {
         self.build_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
         self.console = "Building...\n".into();
         // A Lazarus or Delphi project in the program's folder adds its search paths and defines.
-        let (project_args, project_note) = project_args(path.parent());
+        let (mut project_args, project_note) = project_args(path.parent());
         self.console.push_str(&project_note);
+        // Debugging always builds the debug configuration; Run builds the project's configuration.
+        let folder = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let configuration = if debug {
+            pascoda_project::Configuration::Debug
+        } else {
+            pascoda_project::load_configuration(&folder)
+        };
+        let release = configuration == pascoda_project::Configuration::Release;
+        if release {
+            // The release executable goes to its own folder (not the debug one, and not the
+            // project file's `-o`).
+            let exe = pascoda_project::executable_in(&path, configuration);
+            project_args.retain(|a| !a.to_string_lossy().starts_with("-o"));
+            project_args.push(format!("-o{}", exe.display()).into());
+            if let Some(dir) = exe.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+        }
         self.auto_tab(ctx, bottom::BottomTab::Output);
         let (tx, rx) = channel();
         let (ptx, prx) = channel();
@@ -528,7 +939,7 @@ impl App {
                     )),
                 }
             } else {
-                pascoda_fpc::build_progress_with(&path, mode, &project_args, total, &mut on)
+                pascoda_fpc::build_progress_configured(&path, mode, &project_args, total, release, &mut on)
             };
             let result = built.unwrap_or_else(|e| BuildResult {
                 success: false,
@@ -539,7 +950,10 @@ impl App {
                 if gui {
                     launch_app(&path)
                 } else {
-                    run(&pascoda_project::foreign::executable_of(&path))
+                    let folder = path.parent().map(Path::to_path_buf).unwrap_or_default();
+                    let exe = pascoda_project::executable_in(&path, configuration);
+                    let settings = pascoda_project::load_run(&folder);
+                    run(&exe, &settings.args, &pascoda_project::run_folder(&folder, &exe))
                 }
             } else {
                 String::new()
@@ -567,6 +981,9 @@ impl App {
             self.build_progress = None;
             self.build_progress_rx = None;
             self.console = result.raw_output.clone();
+            if !result.success {
+                self.offer_vendor_for_build(&result.raw_output, &result.diagnostics);
+            }
             if result.success && !self.debug_after_build && self.run_after_build {
                 self.console.push_str("\n--- program output ---\n");
                 self.console.push_str(&run_output);
@@ -638,6 +1055,21 @@ impl App {
                     "Don't Save",
                 )
             }
+            Confirm::Project(dir) => {
+                let n = (0..self.docs.len())
+                    .filter(|&i| !self.docs[i].path.starts_with(dir) && self.is_dirty(i))
+                    .count();
+                (
+                    format!(
+                        "Opening another project closes its tabs. {n} file{} with unsaved changes. Do you want to save {}?",
+                        if n == 1 { "" } else { "s" },
+                        if n == 1 { "it" } else { "them" }
+                    ),
+                    "Your changes will be lost if you don't save them.".to_string(),
+                    "Save",
+                    "Don't Save",
+                )
+            }
             Confirm::Quit => {
                 let n = (0..self.docs.len()).filter(|&i| self.is_dirty(i)).count();
                 (
@@ -688,7 +1120,14 @@ impl App {
         };
         self.confirm = None;
         match (what, answer) {
-            (_, Answer::Cancel) => {}
+            (_, Answer::Cancel) => self.project_switch = None,
+            (Confirm::Project(dir), a) => {
+                if let Some((_, then)) = self.project_switch.take() {
+                    self.close_tabs_outside(&dir, matches!(a, Answer::Save));
+                    self.enter_project(dir);
+                    then(self);
+                }
+            }
             (Confirm::Tab(path), a) => {
                 if let Some(i) = self.docs.iter().position(|d| d.path == path) {
                     match a {
@@ -959,18 +1398,29 @@ impl App {
     }
 
     fn start_debug(&mut self, ctx: &egui::Context) {
-        let exe = pascoda_project::foreign::executable_of(&self.build_source);
-        let cwd = self.build_dir.clone();
+        let exe = pascoda_project::executable_for(&self.build_source);
+        let folder = self.build_dir.clone();
+        let cwd = pascoda_project::run_folder(&folder, &exe);
+        let args = pascoda_project::load_run(&folder).args;
         let breakpoints = self
             .docs
             .iter()
             .filter(|d| !d.breakpoints.is_empty())
-            .map(|d| (d.path.clone(), d.breakpoints.iter().copied().collect()))
+            .map(|d| (d.path.clone(), debugger::breakpoint_specs(&d.breakpoints, &d.stops, &d.disabled)))
             .collect();
         self.console.push_str("\n--- debugging ---\n");
         self.auto_tab(ctx, bottom::BottomTab::Output);
         self.var_open.clear();
-        self.session = Some(debugger::spawn(exe, cwd, breakpoints, ctx.clone()));
+        self.session = Some(debugger::spawn(exe, cwd, args, breakpoints, ctx.clone()));
+        // The watches of earlier sessions are watched again, from the first stop.
+        self.send(debugger::Cmd::Watches(self.watch_list.clone()));
+        self.send(debugger::Cmd::ExceptionStops(self.exception_stops));
+    }
+
+    /// Replaces the watch expressions and, while the program is stopped, asks for their values now.
+    fn set_watches(&mut self, list: Vec<String>) {
+        self.watch_list = list.clone();
+        self.send(debugger::Cmd::Watches(list));
     }
 
     fn send(&self, cmd: debugger::Cmd) {
@@ -989,6 +1439,27 @@ impl App {
                     if let Some(v) = self.paused.as_mut().and_then(|p| p.var_mut(&path)) {
                         v.children = Some(kids);
                     }
+                }
+                debugger::Event::Watched(values) => {
+                    if let Some(p) = self.paused.as_mut() {
+                        p.set_scope(debugger::WATCH_SCOPE, values);
+                    }
+                }
+                debugger::Event::Assigned(result) => match result {
+                    Ok(()) => self.value_edit = None,
+                    Err(e) => {
+                        if let Some(v) = self.value_edit.as_mut() {
+                            v.error = e;
+                        }
+                    }
+                },
+                debugger::Event::Refreshed(vars) => {
+                    if let Some(p) = self.paused.as_mut() {
+                        p.vars = vars;
+                    }
+                }
+                debugger::Event::Evaluated(expr, result) => {
+                    self.watch_eval = Some((expr, result));
                 }
                 debugger::Event::Stopped(p) => {
                     self.auto_tab(ctx, bottom::BottomTab::Debug);
@@ -1028,6 +1499,11 @@ impl App {
             if !auto {
                 self.console
                     .push_str("completion: language server is off\n");
+                // Off because the server is not installed: say so once, with the way to install it.
+                if !self.vendor_asked_pasls {
+                    self.vendor_asked_pasls = true;
+                    self.offer_vendor_install(&[pascoda_fpc::vendor::Part::Pasls, pascoda_fpc::vendor::Part::Fpc]);
+                }
             }
             return;
         };
@@ -1066,10 +1542,68 @@ impl App {
         });
     }
 
+    /// Asks the server for the signature of the call at the caret (after `(` or `,`).
+    fn request_signature(&mut self, path: PathBuf, text: String, line: u32, col: u32, at: usize, key: u64) {
+        let Some(lsp) = self.lsp.as_ref().filter(|_| self.lsp_ready) else {
+            return;
+        };
+        let _ = lsp.requests.send(lsp::Req::Signature { path, text, line, col, at, key });
+    }
+
     fn request_definition(&mut self, ctx: &egui::Context) {
         if let Some(cursor) = self.cursor_index(ctx) {
             self.request_definition_at(cursor);
         }
+    }
+
+    /// Asks the server for every use of the symbol under the caret (Shift+F12).
+    fn request_references(&mut self, ctx: &egui::Context) {
+        let Some(index) = self.cursor_index(ctx) else { return };
+        let (Some(lsp), Some(doc)) = (&self.lsp, self.docs.get(self.active)) else {
+            self.console.push_str("language server is not running\n");
+            return;
+        };
+        let Some((_, name)) = find::word_at(&doc.text, index) else {
+            self.console.push_str("put the caret on a name first\n");
+            return;
+        };
+        let (line, col) = line_col(&doc.text, index);
+        self.project_bar.title = format!("References to {name}");
+        let _ = lsp.requests.send(lsp::Req::References {
+            path: doc.path.clone(),
+            text: doc.text.clone(),
+            line,
+            col,
+        });
+    }
+
+    /// Asks the server to rename the symbol in the rename box to `self.rename.name`.
+    fn send_rename(&mut self) {
+        let (Some(lsp), Some(path), Some(doc)) = (
+            &self.lsp,
+            self.rename.path.clone(),
+            self.docs.iter().find(|d| Some(&d.path) == self.rename.path.as_ref()),
+        ) else {
+            self.rename.error = "The language server is not running".into();
+            return;
+        };
+        // The open files as they are now: the server's answer is checked against them.
+        let open: Vec<(PathBuf, String)> = self.docs.iter().map(|d| (d.path.clone(), d.text.clone())).collect();
+        let new_name = self.rename.name.clone();
+        let _ = lsp.requests.send(lsp::Req::Rename {
+            path,
+            text: doc.text.clone(),
+            line: self.rename.line,
+            col: self.rename.col,
+            new_name: new_name.clone(),
+        });
+        self.rename.sent = Some(find::Sent {
+            old: self.rename.old.clone(),
+            new: new_name,
+            open,
+        });
+        self.rename.open = false;
+        self.rename.error.clear();
     }
 
     /// Asks the server where the symbol at char `index` of the active tab is defined.
@@ -1144,12 +1678,47 @@ impl App {
                     self.goto(ctx, &loc.path, loc.line + 1, loc.col + 1);
                 }
                 lsp::Resp::Definition(None) => {}
+                lsp::Resp::Signature { at, key, sig } => {
+                    let current = self
+                        .docs
+                        .get(self.active)
+                        .is_some_and(|d| shell::text_key(&d.text) == key);
+                    self.signature = if current {
+                        sig.map(|sig| shell::SigHint { key, at, sig })
+                    } else {
+                        None
+                    };
+                }
+                lsp::Resp::Symbols { path, key, symbols } => {
+                    if self.outline.pending.as_ref() == Some(&(path.clone(), key)) {
+                        self.outline.pending = None;
+                    }
+                    self.outline.shown = Some((path, key));
+                    self.outline.symbols = symbols;
+                }
+                lsp::Resp::References(locs) => {
+                    self.show_references(locs);
+                    self.nav_tab = shell::NavTab::Search;
+                    self.show_navigator = true;
+                }
+                lsp::Resp::Rename(files) => {
+                    if let Some(sent) = self.rename.sent.take() {
+                        self.apply_rename(files, &sent);
+                    }
+                }
                 lsp::Resp::Hover(line, col, text) => {
                     let pos = self.hover_pos;
                     self.hover.accept(line, col, text, pos);
                 }
                 lsp::Resp::Error(e) => {
                     self.console.push_str(&format!("language server: {e}\n"));
+                    let empty = self.empty_sources();
+                    if !empty.is_empty() {
+                        self.console.push_str(&format!(
+                            "pasls does not start while these files are empty: {}. Add some code to them and reopen the project.\n",
+                            empty.join(", ")
+                        ));
+                    }
                     self.lsp = None;
                     self.lsp_ready = false;
                     return;
@@ -1192,6 +1761,38 @@ impl App {
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F12)) {
             self.request_definition(ctx);
+        }
+        // Find (Cmd+F), replace (Cmd+Opt+F), next and previous match (Cmd+G, Shift+Cmd+G).
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::ALT, Key::F)) {
+            self.find.show(true);
+        } else if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F)) {
+            self.find.show(false);
+        }
+        // References (Shift+F12) and Rename Symbol (F2).
+        if ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::F12)) {
+            self.request_references(ctx);
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F2)) {
+            self.open_rename(ctx);
+        }
+        // Go to Line (Cmd+L) opens its box with the field focused.
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::L)) {
+            self.go_to.open = true;
+            self.go_to.focus = true;
+            self.go_to.error.clear();
+        }
+        // Project search (Cmd+Shift+F) opens its tab with the query focused.
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::F)) {
+            self.nav_tab = shell::NavTab::Search;
+            self.show_navigator = true;
+            self.project_bar.focus = true;
+        }
+        if self.find.open {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::G)) {
+                self.find.pending = Some(false);
+            } else if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::G)) {
+                self.find.pending = Some(true);
+            }
         }
         let Some(c) = &mut self.completion else {
             return;
@@ -1570,8 +2171,106 @@ impl App {
         }
     }
 
+    /// The package the Build Package command builds: the active file when it is a package, else the
+    /// first package in the active file's folder (the unit's own package when it has one).
+    fn active_package(&self) -> Option<PathBuf> {
+        let active = self.docs.get(self.active)?.path.clone();
+        if pascoda_project::packages::read(&active).is_some() {
+            return Some(active);
+        }
+        let folder = active.parent()?;
+        let packages: Vec<(PathBuf, pascoda_project::lpk::Package)> = pascoda_project::packages::in_folder(folder)
+            .into_iter()
+            .filter_map(|f| pascoda_project::packages::read(&f).map(|p| (f, p)))
+            .collect();
+        packages
+            .iter()
+            .find(|(_, p)| p.units.iter().any(|u| u == &active))
+            .or(packages.first())
+            .map(|(f, _)| f.clone())
+    }
+
+    /// Builds every unit of the package `file` on a background thread, with the folder's arguments
+    /// (the resolved packages included). The result shows like a build's.
+    fn build_package(&mut self, ctx: &egui::Context, file: PathBuf) {
+        let Some(pkg) = pascoda_project::packages::read(&file) else {
+            self.console = "Not a package\n".into();
+            return;
+        };
+        self.sync_mode();
+        let mode = self.mode;
+        self.save_all();
+        self.build_texts = self.docs.iter().map(|d| (d.path.clone(), d.text.clone())).collect();
+        self.debug_after_build = false;
+        self.run_after_build = false;
+        self.build_source = file.clone();
+        let folder = file.parent().map(Path::to_path_buf).unwrap_or_default();
+        self.build_dir = folder.clone();
+        self.console = format!("Building package {}...\n", pkg.name);
+        let (project_args, project_note) = project_args(Some(&folder));
+        self.console.push_str(&project_note);
+        self.auto_tab(ctx, bottom::BottomTab::Output);
+        let (tx, rx) = channel();
+        self.build_progress = None;
+        self.build_progress_rx = None;
+        self.building = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = pascoda_project::packages::build(&pkg, &project_args, mode);
+            let _ = tx.send((result, String::new()));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Removes the build products of the program (Build > Clean): the executables, compiled units and
+    /// scratch files. The console says what was removed.
+    fn clean_project(&mut self) {
+        let Some(program) = self.build_source_or_active() else {
+            self.console.push_str("Nothing to clean: open a program first\n");
+            return;
+        };
+        match pascoda_project::clean_build(&program) {
+            Ok(removed) if removed.is_empty() => self.console = "Nothing to clean\n".into(),
+            Ok(removed) => {
+                let names: Vec<String> = removed
+                    .iter()
+                    .map(|p| p.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()))
+                    .collect();
+                self.console = format!("Cleaned {}\n", names.join(", "));
+            }
+            Err(e) => self.console = format!("Could not clean: {e}\n"),
+        }
+    }
+
+    /// The program the build works on: the last build's, else the active tab's.
+    fn build_source_or_active(&self) -> Option<PathBuf> {
+        if !self.build_source.as_os_str().is_empty() {
+            return Some(self.build_source.clone());
+        }
+        self.docs.get(self.active).map(|d| program_for(&d.path))
+    }
+
+    /// Runs the program until the caret's line (Run to Cursor, F4). Needs a stopped program.
+    fn run_to_cursor(&mut self, ctx: &egui::Context) {
+        if self.session.is_none() {
+            self.console.push_str("Run to Cursor needs a debug session (Build > Debug)\n");
+            return;
+        }
+        let (Some(index), Some(doc)) = (self.cursor_index(ctx), self.docs.get(self.active)) else {
+            return;
+        };
+        let (line, _) = line_col(&doc.text, index);
+        let cmd = debugger::Cmd::RunTo(doc.path.clone(), line + 1);
+        if self.paused.is_some() {
+            self.resume_with(cmd);
+        } else {
+            self.send(cmd);
+        }
+    }
+
     fn resume_with(&mut self, cmd: debugger::Cmd) {
         self.paused = None;
+        self.watch_eval = None;
         self.send(cmd);
     }
 
@@ -1590,6 +2289,9 @@ impl App {
             offset += l.chars().count();
         }
         let id = doc.editor_id;
+        // One character is the range the editor scrolls to, so the line is in view.
+        let end = (offset + 1).min(doc.text.chars().count());
+        self.reveal = Some(offset..end);
         let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
         state
             .cursor
@@ -1622,13 +2324,18 @@ fn export_key(program: &Path) -> PathBuf {
 /// The compiler arguments of the Lazarus or Delphi project file in `folder`, and a console note
 /// when that file cannot be read.
 fn project_args(folder: Option<&Path>) -> (Vec<std::ffi::OsString>, String) {
-    let Some(file) = folder.and_then(pascoda_project::foreign::find) else {
+    let Some(folder) = folder else {
         return (Vec::new(), String::new());
     };
-    match pascoda_project::foreign::read(&file) {
-        Ok(project) => (project.compiler_args(), String::new()),
-        Err(e) => (Vec::new(), format!("project file not used: {e}\n")),
+    let note = match pascoda_project::foreign::find(folder).map(|f| pascoda_project::foreign::read(&f)) {
+        Some(Err(e)) => format!("project file not used: {e}\n"),
+        _ => String::new(),
+    };
+    let mut note = note;
+    for missing in pascoda_project::packages::resolve(folder).missing {
+        note.push_str(&format!("A required package, {missing}, was not found: its units are not on the search path\n"));
     }
+    (pascoda_project::compiler_args(folder), note)
 }
 
 /// The main program of the Lazarus or Delphi project file in `dir`, if it exists.
@@ -1641,10 +2348,13 @@ fn project_main(dir: &Path) -> Option<PathBuf> {
 }
 
 fn program_for(path: &Path) -> PathBuf {
-    let Some(dir) = path
-        .parent()
-        .filter(|_| designer::is_unit_file(path))
-    else {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
+    // A program file builds itself.
+    if ext == "lpr" || ext == "dpr" {
+        return path.to_path_buf();
+    }
+    // Any other selected file (a unit, a package, a form file, a text file) builds the folder's program.
+    let Some(dir) = path.parent() else {
         return path.to_path_buf();
     };
     // A Lazarus or Delphi project in the folder names its main program.
@@ -1674,7 +2384,7 @@ fn is_gui_program(source: &Path) -> bool {
 /// Wraps the built program in a `.app` and starts it; GUI apps run on their own, so this
 /// does not wait for them to quit.
 fn launch_app(source: &Path) -> String {
-    let exe = pascoda_project::foreign::executable_of(source);
+    let exe = pascoda_project::executable_for(source);
     let dir = exe.parent().unwrap_or(Path::new("."));
     let stem = exe
         .file_name()
@@ -1690,15 +2400,12 @@ fn launch_app(source: &Path) -> String {
     }
 }
 
-fn run(exe: &Path) -> String {
-    let dir = exe
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    // Absolute, because the child starts in `dir` and a relative path would resolve twice.
+/// Runs the executable with its arguments, in `dir`, and returns what it printed. Both paths are
+/// made absolute first: the child starts in `dir`, and a relative path would resolve twice.
+fn run(exe: &Path, args: &[String], dir: &Path) -> String {
     let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    let exe = dir.join(exe.file_name().unwrap_or_default());
-    match Command::new(&exe).current_dir(dir).output() {
+    let exe = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
+    match Command::new(&exe).args(args).current_dir(dir).output() {
         Ok(o) => format!(
             "{}{}",
             String::from_utf8_lossy(&o.stdout),
@@ -1712,12 +2419,35 @@ fn run(exe: &Path) -> String {
 struct NativeMenu {
     _menu: muda::Menu,
     new_gui: muda::MenuId,
+    new_console: muda::MenuId,
+    new_library: muda::MenuId,
+    new_package: muda::MenuId,
+    new_form: muda::MenuId,
+    new_data_module: muda::MenuId,
+    import_packages: muda::MenuId,
+    new_file: muda::MenuId,
+    new_folder: muda::MenuId,
+    rename_item: muda::MenuId,
+    preferences: muda::MenuId,
+    run_to: muda::MenuId,
+    rebuild: muda::MenuId,
+    clean: muda::MenuId,
+    build_package: muda::MenuId,
+    /// File > Open Recent and its items: the menu's list (the entries it shows, by index), the
+    /// items' ids and the items themselves (kept alive while they are in the menu).
+    open_recent: muda::Submenu,
+    recent_entries: Vec<recent::Entry>,
+    recent_ids: Vec<(muda::MenuId, usize)>,
+    recent_items: Vec<muda::MenuItem>,
+    recent_clear: muda::MenuId,
+    project_options: muda::MenuId,
     toggle_view: muda::MenuId,
     jump_bar: muda::CheckMenuItem,
     assistant: muda::CheckMenuItem,
     open: muda::MenuId,
     save: muda::MenuId,
     run: muda::MenuId,
+    run_tests: muda::MenuId,
     debug: muda::MenuId,
     export: muda::MenuId,
     quit: muda::MenuId,
@@ -1731,6 +2461,8 @@ struct NativeMenu {
 enum Confirm {
     /// Closing the tab of this file.
     Tab(PathBuf),
+    /// Opening another project folder: the tabs of the old one are closed.
+    Project(PathBuf),
     /// Quitting Pascoda.
     Quit,
 }
@@ -1744,9 +2476,28 @@ struct Exporting {
 #[derive(Clone, Copy)]
 enum MenuAction {
     NewGui,
+    NewForm,
+    NewDataModule,
+    ImportPackages,
+    NewFile,
+    NewFolder,
+    RenameItem,
     ToggleView,
     ToggleJumpBar,
     ToggleAssistant,
+    Preferences,
+    RunTests,
+    RunToCursor,
+    ProjectOptions,
+    Rebuild,
+    Clean,
+    NewConsole,
+    NewLibrary,
+    NewPackage,
+    BuildPackage,
+    /// An item of File > Open Recent (its index in the menu's list).
+    OpenRecent(usize),
+    ClearRecent,
     Open,
     Save,
     Run,
@@ -1810,6 +2561,18 @@ impl NativeMenu {
         use muda::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
         let cmd = |code| Some(Accelerator::new(Modifiers::META, code));
         let new_gui = MenuItem::new("New GUI Application...", true, cmd(Code::KeyN));
+        let new_console = MenuItem::new("New Console Application...", true, None);
+        let new_library = MenuItem::new("New Library...", true, None);
+        let new_package = MenuItem::new("New Package...", true, None);
+        let new_file = MenuItem::new("New File", true, None);
+        let new_folder = MenuItem::new("New Folder", true, None);
+        let rename_item = MenuItem::new("Rename", true, None);
+        let new_form = MenuItem::new(
+            "New Form",
+            true,
+            Some(Accelerator::new(Modifiers::META | Modifiers::SHIFT, Code::KeyN)),
+        );
+        let new_data_module = MenuItem::new("New Data Module", true, None);
         let toggle_view = MenuItem::new(
             "Switch Between Code and Form",
             true,
@@ -1829,8 +2592,10 @@ impl NativeMenu {
             )),
         );
         let open = MenuItem::new("Open...", true, cmd(Code::KeyO));
+        let import_packages = MenuItem::new("Import Component Package...", true, None);
         let save = MenuItem::new("Save", true, cmd(Code::KeyS));
         let run = MenuItem::new("Build & Run", true, cmd(Code::KeyR));
+        let run_tests = MenuItem::new("Run Unit Tests", true, cmd(Code::KeyU));
         let debug = MenuItem::new(
             "Debug",
             true,
@@ -1875,11 +2640,14 @@ impl NativeMenu {
         let menu = Menu::new();
         // Not the system's Quit: that ends the process without asking about unsaved changes.
         let quit = MenuItem::new("Quit Pascoda", true, cmd(Code::KeyQ));
+        let preferences = MenuItem::new("Preferences...", true, cmd(Code::Comma));
         let app = Submenu::with_items(
             "Pascoda",
             true,
             &[
                 &PredefinedMenuItem::about(Some("About Pascoda"), Some(about::metadata())),
+                &PredefinedMenuItem::separator(),
+                &preferences,
                 &PredefinedMenuItem::separator(),
                 &PredefinedMenuItem::hide(None),
                 &PredefinedMenuItem::hide_others(None),
@@ -1888,7 +2656,31 @@ impl NativeMenu {
             ],
         )
         .ok()?;
-        let file = Submenu::with_items("File", true, &[&new_gui, &open, &save]).ok()?;
+        let open_recent = Submenu::new("Open Recent", true);
+        let recent_clear = MenuItem::new("Clear Menu", true, None);
+        let file = Submenu::with_items(
+            "File",
+            true,
+            &[
+                &new_gui,
+                &new_console,
+                &new_library,
+                &new_package,
+                &new_form,
+                &new_data_module,
+                &PredefinedMenuItem::separator(),
+                &new_file,
+                &new_folder,
+                &rename_item,
+                &PredefinedMenuItem::separator(),
+                &open_recent,
+                &open,
+                &save,
+                &PredefinedMenuItem::separator(),
+                &import_packages,
+            ],
+        )
+        .ok()?;
         let export = MenuItem::new(
             "Export Application...",
             true,
@@ -1897,10 +2689,28 @@ impl NativeMenu {
                 Code::KeyE,
             )),
         );
+        let run_to = MenuItem::new("Run to Cursor", true, Some(Accelerator::new(Modifiers::empty(), Code::F4)));
+        let project_options = MenuItem::new("Project Options...", true, None);
+        let rebuild = MenuItem::new("Rebuild", true, None);
+        let clean = MenuItem::new("Clean", true, None);
+        let build_package = MenuItem::new("Build Package", true, None);
         let build = Submenu::with_items(
             "Build",
             true,
-            &[&run, &debug, &PredefinedMenuItem::separator(), &export],
+            &[
+                &run,
+                &run_tests,
+                &debug,
+                &run_to,
+                &PredefinedMenuItem::separator(),
+                &project_options,
+                &PredefinedMenuItem::separator(),
+                &rebuild,
+                &clean,
+                &build_package,
+                &PredefinedMenuItem::separator(),
+                &export,
+            ],
         )
         .ok()?;
         let current = theme::Appearance::load();
@@ -1931,12 +2741,33 @@ impl NativeMenu {
         Some(Self {
             _menu: menu,
             new_gui: new_gui.id().clone(),
+            new_console: new_console.id().clone(),
+            new_library: new_library.id().clone(),
+            new_package: new_package.id().clone(),
+            new_form: new_form.id().clone(),
+            new_data_module: new_data_module.id().clone(),
+            import_packages: import_packages.id().clone(),
+            new_file: new_file.id().clone(),
+            new_folder: new_folder.id().clone(),
+            rename_item: rename_item.id().clone(),
+            preferences: preferences.id().clone(),
+            run_to: run_to.id().clone(),
+            rebuild: rebuild.id().clone(),
+            clean: clean.id().clone(),
+            build_package: build_package.id().clone(),
+            open_recent,
+            recent_entries: Vec::new(),
+            recent_ids: Vec::new(),
+            recent_items: Vec::new(),
+            recent_clear: recent_clear.id().clone(),
+            project_options: project_options.id().clone(),
             toggle_view: toggle_view.id().clone(),
             jump_bar,
             assistant,
             open: open.id().clone(),
             save: save.id().clone(),
             run: run.id().clone(),
+            run_tests: run_tests.id().clone(),
             debug: debug.id().clone(),
             export: export.id().clone(),
             quit: quit.id().clone(),
@@ -1953,17 +2784,76 @@ impl NativeMenu {
         }
     }
 
+    /// Rebuilds File > Open Recent for `entries`: the projects, a separator, the files, and Clear
+    /// Menu. Nothing recent shows a disabled note.
+    fn set_recent(&mut self, entries: Vec<recent::Entry>) {
+        while self.open_recent.remove_at(0).is_some() {}
+        self.recent_ids.clear();
+        self.recent_items.clear();
+        if entries.is_empty() {
+            let none = muda::MenuItem::new("No Recent Items", false, None);
+            let _ = self.open_recent.append(&none);
+            self.recent_items.push(none);
+            return;
+        }
+        let title = |e: &recent::Entry| {
+            let name = e.path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            if e.project {
+                format!("{name} (project)")
+            } else {
+                let folder = e.path.parent().and_then(|p| p.file_name()).map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                format!("{name} — {folder}")
+            }
+        };
+        let mut previous_project = None;
+        for (i, e) in entries.iter().enumerate() {
+            if previous_project == Some(true) && !e.project {
+                let sep = muda::PredefinedMenuItem::separator();
+                let _ = self.open_recent.append(&sep);
+            }
+            previous_project = Some(e.project);
+            let item = muda::MenuItem::new(title(e), true, None);
+            let _ = self.open_recent.append(&item);
+            self.recent_ids.push((item.id().clone(), i));
+            self.recent_items.push(item);
+        }
+        let sep = muda::PredefinedMenuItem::separator();
+        let _ = self.open_recent.append(&sep);
+        let clear = muda::MenuItem::new("Clear Menu", true, None);
+        let _ = self.open_recent.append(&clear);
+        self.recent_clear = clear.id().clone();
+        self.recent_items.push(clear);
+        self.recent_entries = entries;
+    }
+
     fn poll(&self) -> Vec<MenuAction> {
         self.events
             .try_iter()
             .filter_map(|id| {
                 [
                     (&self.new_gui, MenuAction::NewGui),
+                    (&self.new_console, MenuAction::NewConsole),
+                    (&self.new_library, MenuAction::NewLibrary),
+                    (&self.new_package, MenuAction::NewPackage),
+                    (&self.new_form, MenuAction::NewForm),
+                    (&self.new_data_module, MenuAction::NewDataModule),
+                    (&self.import_packages, MenuAction::ImportPackages),
+                    (&self.new_file, MenuAction::NewFile),
+                    (&self.new_folder, MenuAction::NewFolder),
+                    (&self.rename_item, MenuAction::RenameItem),
+                    (&self.preferences, MenuAction::Preferences),
                     (&self.toggle_view, MenuAction::ToggleView),
                     (&self.open, MenuAction::Open),
                     (&self.save, MenuAction::Save),
                     (&self.run, MenuAction::Run),
+                    (&self.run_tests, MenuAction::RunTests),
                     (&self.debug, MenuAction::Debug),
+                    (&self.run_to, MenuAction::RunToCursor),
+                    (&self.project_options, MenuAction::ProjectOptions),
+                    (&self.rebuild, MenuAction::Rebuild),
+                    (&self.clean, MenuAction::Clean),
+                    (&self.build_package, MenuAction::BuildPackage),
+                    (&self.recent_clear, MenuAction::ClearRecent),
                     (&self.export, MenuAction::Export),
                     (&self.quit, MenuAction::Quit),
                 ]
@@ -1971,6 +2861,12 @@ impl NativeMenu {
                 .find(|(i, _)| **i == id)
                 .map(|(_, a)| a)
                 .or_else(|| (*self.jump_bar.id() == id).then_some(MenuAction::ToggleJumpBar))
+                .or_else(|| {
+                    self.recent_ids
+                        .iter()
+                        .find(|(item, _)| *item == id)
+                        .map(|(_, i)| MenuAction::OpenRecent(*i))
+                })
                 .or_else(|| (*self.assistant.id() == id).then_some(MenuAction::ToggleAssistant))
                 .or_else(|| {
                     self.edit
@@ -2046,13 +2942,17 @@ fn completion_popup(ctx: &egui::Context, pos: egui::Pos2, c: &Completion) -> Opt
 }
 
 fn editor_font() -> egui::FontId {
-    egui::FontId::monospace(EDITOR_FONT_SIZE)
+    let family = theme::editor_family(prefs::font_index());
+    egui::FontId::new(prefs::font_size(), family)
 }
 
 impl eframe::App for App {
     fn on_exit(&mut self) {
         // Hang up the shell (and its jobs) instead of leaving them behind.
         self.bottom.terminal = None;
+        if let Some(file) = &self.session_file {
+            self.snapshot().save(file);
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -2191,24 +3091,27 @@ mod tests {
         let dir = scratch_project("lfm-tab");
         let mut app = App::bare(Some(dir.join("unit1.lfm")));
         assert!(app.has_form(), "the .lfm of a unit is half of a form pair");
-        assert!(!app.active_is_unit_with_form() && !app.form_showing());
+        assert!(!app.form_showing());
 
         app.show_form(); // what clicking "Form" does
         assert!(app.form_showing(), "the designer is showing");
         assert_eq!(
             app.docs[app.active].path,
-            dir.join("unit1.pas"),
-            "it switched to the unit's tab"
+            dir.join("unit1.lfm"),
+            "the form shows on the .lfm tab, which stays active"
         );
         assert_eq!(app.designers.len(), 1);
 
-        // Going back to the .lfm text shows code, not the designer.
-        let lfm = app
+        // The unit is open for its text, but is not the tab shown.
+        let unit = app
             .docs
             .iter()
-            .position(|d| d.path == dir.join("unit1.lfm"))
+            .position(|d| d.path == dir.join("unit1.pas"))
             .unwrap();
-        app.active = lfm;
+        assert_ne!(unit, app.active);
+
+        // Going back to the .lfm text shows code, not the designer.
+        app.form_view = false;
         assert!(!app.form_showing());
     }
 
@@ -2576,33 +3479,236 @@ mod tests {
             pascoda_fpc::build(src, pascoda_fpc::Mode::default()).expect("fpc should start");
         assert!(built.success, "{}", built.raw_output);
         // The app runs the executable the build writes, which is what `executable_of` names.
-        let exe = pascoda_project::foreign::executable_of(src);
-        assert!(run(&exe).contains("Hello from Pascora"));
+        let exe = pascoda_project::executable_for(src);
+        let folder = src.parent().unwrap();
+        let out = run(&exe, &[], &pascoda_project::run_folder(folder, &exe));
+        assert!(out.contains("Hello from Pascora"), "{out}");
+    }
+
+    /// Run passes each argument as written (spaces kept) and starts in the run folder.
+    #[test]
+    fn run_passes_the_arguments_and_the_folder() {
+        let dir = std::env::temp_dir().join(format!("pascoda-run-args-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("show");
+        std::fs::write(&script, "#!/bin/sh\nprintf '%s|' \"$@\"; pwd\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = run(&script, &["a b".to_string(), "c".to_string()], &dir);
+        let here = dir.canonicalize().unwrap();
+        assert!(out.contains(&format!("a b|c|{}", here.display())), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
 #[cfg(test)]
-mod project_main_tests {
+mod lpk_open_tests {
     use super::*;
 
-    /// A unit in a folder with two programs: the project file decides which one builds.
+    /// A package in the tree opens as a tab, and is listed by the tree.
     #[test]
-    fn the_project_file_names_the_main_program() {
-        let dir = std::env::temp_dir().join(format!("pascoda-main-{}", std::process::id()));
+    fn a_package_opens_from_the_tree() {
+        let base = std::env::temp_dir().join(format!("pascoda-lpk-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let lpk = pascoda_project::create_project(&base, "Shapes", pascoda_project::Template::Package).unwrap();
+        let mut app = App::bare(Some(lpk.with_extension("pas")));
+        let listed: Vec<String> = shell::listing(&app.root)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(listed.contains(&"Shapes.lpk".to_string()), "the tree lists it: {listed:?}");
+        app.select_in_tree(lpk.clone());
+        assert!(app.docs.iter().any(|d| d.path == lpk.canonicalize().unwrap()), "it opens as a tab");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod tree_select_tests {
+    use super::*;
+
+    /// Selecting a form file in the tree shows its form; selecting a unit shows its code, even when
+    /// the form was showing before.
+    #[test]
+    fn selecting_a_form_file_shows_the_form_and_a_unit_shows_its_code() {
+        let base = std::env::temp_dir().join(format!("pascoda-tree-select-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        pascoda_project::create_gui_app(&base, "SelectApp").unwrap();
+        let folder = base.join("SelectApp");
+        let mut app = App::bare(Some(folder.join("unit1.pas")));
+        let root = app.root.clone();
+
+        app.select_in_tree(root.join("unit1.lfm"));
+        assert!(app.form_view, "a .lfm shows its form");
+        assert!(app.designers.iter().any(|f| f.pas_path == root.join("unit1.pas")), "the designer is open");
+
+        app.select_in_tree(root.join("unit1.pas"));
+        assert!(!app.form_view, "a .pas shows its code, not the form");
+        assert_eq!(app.docs[app.active].path, root.join("unit1.pas").canonicalize().unwrap());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Clicking Form on a `.lfm` tab shows the form on that tab; the unit is not made the active tab,
+    /// even when it was not open yet.
+    #[test]
+    fn form_on_an_lfm_tab_stays_on_the_lfm() {
+        let base = std::env::temp_dir().join(format!("pascoda-lfm-form-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        pascoda_project::create_gui_app(&base, "LfmFormApp").unwrap();
+        let folder = base.join("LfmFormApp");
+        let mut app = App::bare(Some(folder.join("unit1.lfm")));
+        let lfm = folder.join("unit1.lfm").canonicalize().unwrap();
+        assert_eq!(app.docs[app.active].path, lfm);
+
+        app.show_form();
+        assert!(app.form_view && app.form_showing());
+        assert_eq!(app.docs[app.active].path, lfm, "the .lfm tab stays the one shown");
+        assert!(app.docs.iter().any(|d| d.path.ends_with("unit1.pas")), "the unit is open for its text");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A form opened from its `.lfm` file: Code shows that file's text, not the unit's code.
+    #[test]
+    fn code_after_a_form_opened_from_its_lfm_shows_the_lfm() {
+        let base = std::env::temp_dir().join(format!("pascoda-lfm-code-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        pascoda_project::create_gui_app(&base, "LfmCodeApp").unwrap();
+        let folder = base.join("LfmCodeApp");
+        let mut app = App::bare(Some(folder.join("unit1.pas")));
+        let root = app.root.clone();
+
+        app.select_in_tree(root.join("unit1.lfm"));
+        app.show_code();
+        assert!(!app.form_view);
+        assert_eq!(app.docs[app.active].path, root.join("unit1.lfm").canonicalize().unwrap(),
+            "Code shows the .lfm text");
+
+        // A unit selected after that is code of the unit again.
+        app.select_in_tree(root.join("unit1.pas"));
+        app.show_code();
+        assert_eq!(app.docs[app.active].path, root.join("unit1.pas").canonicalize().unwrap());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    /// The session of the open tabs is saved at exit and restored at launch: the project, the tabs in
+    /// order, the active tab. Tabs whose files are gone are not reopened.
+    #[test]
+    fn the_tabs_and_the_project_come_back_after_a_restart() {
+        let base = std::env::temp_dir().join(format!("pascoda-session-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("a.pas"), "unit a;\n").unwrap();
+        std::fs::write(base.join("b.pas"), "unit b;\n").unwrap();
+        let file = base.join("session");
+
+        let mut before = App::bare(Some(base.join("a.pas")));
+        before.open_path(base.join("b.pas"));
+        before.open_path(base.join("gone.pas"));
+        before.docs.retain(|d| d.path.file_name() != Some(std::ffi::OsStr::new("gone.pas")));
+        before.active = 1;
+        before.session_file = Some(file.clone());
+        eframe::App::on_exit(&mut before);
+        let saved = session::Session::load(&file).expect("saved at exit");
+        assert_eq!(saved.tabs.len(), 2);
+        assert_eq!(saved.active.as_deref(), Some(base.join("b.pas").canonicalize().unwrap().as_path()));
+
+        let mut after = App::bare(None);
+        after.restore(saved, false);
+        let names: Vec<_> = after.docs.iter().map(|d| d.path.file_name().unwrap().to_owned()).collect();
+        assert_eq!(names, ["a.pas", "b.pas"], "the tabs in their order");
+        assert_eq!(after.docs[after.active].path.file_name().unwrap(), "b.pas", "the active tab");
+        assert_eq!(after.root, base.canonicalize().unwrap(), "the project folder");
+
+        // A file given on the command line stays the active tab, and the project is its folder.
+        let mut given = App::bare(Some(base.join("a.pas")));
+        given.restore(session::Session::load(&file).unwrap(), true);
+        assert_eq!(given.docs[given.active].path.file_name().unwrap(), "a.pas");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod project_switch_tests {
+    use super::*;
+
+    /// A project folder with the GUI fixture's files, in the scratch area.
+    fn project(name: &str) -> PathBuf {
+        let dir = target_tmp().join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("unit1.pas"), "unit unit1;\n").unwrap();
-        std::fs::write(dir.join("hello.lpr"), "program hello;\nbegin end.\n").unwrap();
-        std::fs::write(dir.join("other.lpr"), "program other;\nbegin end.\n").unwrap();
-        let unit = dir.join("unit1.pas");
-        assert_eq!(program_for(&unit), unit, "two programs and no project: nothing is chosen");
+        for f in ["hello.lpr", "unit1.pas", "unit1.lfm"] {
+            std::fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/gui").join(f),
+                dir.join(f),
+            )
+            .unwrap();
+        }
+        dir.canonicalize().unwrap()
+    }
 
-        std::fs::write(
-            dir.join("app.lpi"),
-            "<CONFIG><ProjectOptions><Units><Unit0><Filename Value=\"other.lpr\"/></Unit0></Units></ProjectOptions></CONFIG>",
-        )
-        .unwrap();
-        assert_eq!(program_for(&unit), dir.join("other.lpr"));
-        let _ = std::fs::remove_dir_all(&dir);
+    /// Opening another project closes the tabs of the old one and opens the file in the new one.
+    #[test]
+    fn opening_another_project_closes_the_old_tabs() {
+        let a = project("switch-clean-a");
+        let b = project("switch-clean-b");
+        let mut app = App::bare(Some(a.join("unit1.pas")));
+        app.open_path(a.join("hello.lpr"));
+        assert_eq!(app.docs.len(), 2);
+
+        let file = b.join("unit1.pas");
+        app.switch_project(b.clone(), move |app| app.open_path(file));
+        assert_eq!(app.root, b);
+        assert_eq!(app.docs.len(), 1, "only the new project's tab is open");
+        assert!(app.docs[0].path.starts_with(&b));
+        assert!(app.confirm.is_none());
+    }
+
+    /// A tab in the same folder stays open, so opening a file of the project keeps its tabs.
+    #[test]
+    fn a_file_of_the_same_project_keeps_the_tabs() {
+        let a = project("switch-same-a");
+        let mut app = App::bare(Some(a.join("unit1.pas")));
+        app.switch_project(a.clone(), move |app| app.open_path(a.join("hello.lpr")));
+        assert_eq!(app.docs.len(), 2);
+    }
+
+    /// Unsaved changes in the old project's tabs: the switch waits for the answer, and Save writes
+    /// them before their tabs close.
+    #[test]
+    fn unsaved_tabs_of_the_old_project_are_asked_about_then_saved() {
+        let a = project("switch-dirty-a");
+        let b = project("switch-dirty-b");
+        let mut app = App::bare(Some(a.join("unit1.pas")));
+        app.docs[0].text.push_str("\n// edited\n");
+        let file = b.join("unit1.pas");
+        app.switch_project(b.clone(), move |app| app.open_path(file));
+        assert!(matches!(&app.confirm, Some(Confirm::Project(d)) if *d == b));
+        assert_eq!(app.root, a, "the project does not change until the question is answered");
+        assert_eq!(app.docs.len(), 1);
+
+        // The answer "Save": what show_confirm does with it.
+        app.confirm = None;
+        let (_, then) = app.project_switch.take().unwrap();
+        app.close_tabs_outside(&b, true);
+        app.enter_project(b.clone());
+        then(&mut app);
+        assert_eq!(app.root, b);
+        assert_eq!(app.docs.len(), 1);
+        assert!(app.docs[0].path.starts_with(&b));
+        let saved = std::fs::read_to_string(a.join("unit1.pas")).unwrap();
+        assert!(saved.ends_with("// edited\n"), "the edit was saved to the old project");
     }
 }

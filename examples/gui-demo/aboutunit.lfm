@@ -22,7 +22,7 @@ object AboutForm: TAboutForm
   object TitleLabel: TLabel
     Left = 116
     Height = 30
-    Top = 28
+    Top = 24
     Width = 56
     Caption = 'Notes'
     Font.Height = -21

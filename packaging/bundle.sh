@@ -27,6 +27,22 @@ if [ -n "${NOTARY_PROFILE:-}" ] && [ -z "${CODESIGN_IDENTITY:-}" ]; then
     echo "bundle.sh: NOTARY_PROFILE needs CODESIGN_IDENTITY" >&2; exit 1
 fi
 
+# What the app needs on a Mac without this checkout (the same list as pascoda_fpc::vendor::Part).
+# Checked in vendor/ before the long build, and again in the bundle after fpcsrc.exclude trimmed it.
+need=(
+    lazarus/lcl/interfaces/cocoa
+    fpcsrc/rtl
+    fpcsrc/packages/fcl-db/src
+    fpcsrc/packages/fcl-fpcunit/src
+    pasls/dist/aarch64-darwin/pasls
+)
+check_vendor() { # <folder that holds the entries of $need> <what it is>
+    for n in "${need[@]}"; do
+        [ -e "$1/$n" ] || { echo "bundle.sh: $n is missing from $2 (set up vendor/ first, see README)" >&2; exit 1; }
+    done
+}
+check_vendor "$root/vendor" "vendor/"
+
 (cd "$root" && cargo build --release -p pascoda-app)
 # The build directory is set in .cargo/config.toml, so ask cargo where it is.
 target="$(cd "$root" && cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
@@ -48,9 +64,18 @@ rsync -a --exclude '.git' "$lz/lcl" "$res/lazarus/"
 for c in lazutils codetools freetype; do rsync -a --exclude '.git' "$lz/components/$c" "$res/lazarus/components/"; done
 git -C "$lz" rev-parse --short HEAD > "$res/lazarus/.pascoda-commit" 2>/dev/null || echo bundled > "$res/lazarus/.pascoda-commit"
 mkdir -p "$res/fpcsrc"
-rsync -a --exclude '.git' --exclude-from="$root/packaging/fpcsrc.exclude" "$root/vendor/fpcsrc/" "$res/fpcsrc/"
+# The licence texts stay, though fpcsrc.exclude drops *.txt (the first matching rule wins).
+rsync -a --include='COPYING*' --exclude '.git' --exclude-from="$root/packaging/fpcsrc.exclude" "$root/vendor/fpcsrc/" "$res/fpcsrc/"
 cp "$root/vendor/pasls/dist/aarch64-darwin/pasls" "$res/pasls/dist/aarch64-darwin/"
 cp "$root/vendor/pasls/COPYING" "$res/pasls/COPYING"
+# The revisions of what was copied, next to the Lazarus one above.
+git -C "$root/vendor/fpcsrc" describe --tags --always > "$res/fpcsrc/.pascoda-commit" 2>/dev/null || echo bundled > "$res/fpcsrc/.pascoda-commit"
+git -C "$root/vendor/pasls" rev-parse --short HEAD > "$res/pasls/.pascoda-commit" 2>/dev/null || echo bundled > "$res/pasls/.pascoda-commit"
+check_vendor "$res" "the bundle"
+
+# Components that ship with Pascoda (the VLC package; File > Import Component Package... offers it).
+mkdir -p "$app/Contents/Resources/components"
+rsync -a --exclude '.git' "$root/components/" "$app/Contents/Resources/components/"
 
 # NSPrincipalClass is deliberately absent: eframe/winit create their own NSApplication.
 # CFBundleIdentifier is a PLACEHOLDER; replace it with the identifier of the real developer account.
@@ -70,6 +95,8 @@ cat > "$app/Contents/Info.plist" <<PLIST
 <key>LSMinimumSystemVersion</key><string>$min_macos</string>
 <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
 <key>NSHighResolutionCapable</key><true/>
+<key>NSDisabledDictationMenuItem</key><true/>
+<key>NSDisabledCharacterPaletteMenuItem</key><true/>
 <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
 <key>NSHumanReadableCopyright</key><string>$copyright</string>
 </dict>

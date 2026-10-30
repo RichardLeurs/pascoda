@@ -132,12 +132,16 @@ pub enum Icon {
     Files,
     Stack,
     Filter,
+    Outline,
+    Search,
+    Breakpoint,
     Close,
     Sparkle,
     Gear,
     Send,
     Trash,
     NewFile,
+    NewForm,
     NewFolder,
 }
 
@@ -245,6 +249,21 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
                 );
             }
         }
+        Icon::Breakpoint => {
+            // A filled dot, the breakpoint's mark in the gutter.
+            painter.circle_filled(p(0.0, 0.0), r * 0.6, s.color);
+        }
+        Icon::Search => {
+            // A magnifying glass: a ring and its handle.
+            painter.circle_stroke(p(-0.15, -0.15), r * 0.5, s);
+            line(p(0.2, 0.2), p(0.7, 0.7));
+        }
+        Icon::Outline => {
+            // Three lines, the last two indented: a list of nested declarations.
+            line(p(-0.6, -0.5), p(0.6, -0.5));
+            line(p(-0.2, 0.0), p(0.6, 0.0));
+            line(p(-0.2, 0.5), p(0.6, 0.5));
+        }
         Icon::Filter => {
             painter.circle_stroke(p(-0.15, -0.15), r * 0.5, s);
             line(p(0.2, 0.2), p(0.8, 0.8));
@@ -298,6 +317,14 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             line(p(0.35, 0.9), p(0.35, 0.0));
             line(p(0.85, 0.5), p(0.85, 0.9));
             line(p(0.6, 0.7), p(1.0, 0.7));
+        }
+        Icon::NewForm => {
+            // A window with its title bar, and a plus in its body.
+            let window = Rect::from_min_max(p(-0.9, -0.8), p(0.6, 0.8));
+            painter.rect_stroke(window, 1.5, s, egui::StrokeKind::Inside);
+            line(p(-0.9, -0.4), p(0.6, -0.4));
+            line(p(0.85, 0.3), p(0.85, 0.9));
+            line(p(0.6, 0.6), p(1.1, 0.6));
         }
         Icon::NewFolder => {
             let body = Rect::from_min_max(p(-0.9, -0.45), p(0.4, 0.8));

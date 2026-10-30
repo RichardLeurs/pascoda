@@ -15,6 +15,13 @@ pub(super) enum Act {
     SaveKey,
     /// The model field of the OpenAI provider changed.
     SaveModel,
+    /// The server address of the OpenAI Compatible card was saved.
+    SaveCompat,
+    /// The key of the OpenAI Compatible server was saved to, or removed from, the Keychain.
+    SaveCompatKey,
+    RemoveCompatKey,
+    /// The model field of the OpenAI Compatible provider changed.
+    SaveCompatModel,
     /// The Claude model field changed or a suggestion was picked.
     SaveClaudeModel,
     /// The Codex model field changed.
@@ -159,8 +166,13 @@ impl App {
                 Act::ToggleSettings => {
                     self.assistant.show_settings = !self.assistant.show_settings;
                     self.assistant.openai_edit = self.assistant.openai.clone();
+                    self.assistant.compat_edit = self.assistant.compat.clone();
                 }
                 Act::SaveModel => self.assistant.persist_openai(),
+                Act::SaveCompat => self.assistant.commit_compat(),
+                Act::SaveCompatKey => self.assistant.save_compat_key(),
+                Act::RemoveCompatKey => self.assistant.remove_compat_key(),
+                Act::SaveCompatModel => self.assistant.persist_compat(),
                 Act::SaveClaudeModel => self.assistant.persist_claude_model(),
                 Act::SaveCodexModel => self.assistant.persist_codex_model(),
                 Act::SetProvider(p) => self.assistant.set_provider(p),
@@ -202,6 +214,9 @@ fn panel(ui: &mut Ui, pal: &Palette, a: &mut Assistant, view: &View, acts: &mut 
             match a.provider {
                 Provider::Api => key_card(ui, pal, a, acts),
                 Provider::OpenAi => openai_card(ui, pal, a, acts),
+                Provider::OMlx | Provider::Ollama | Provider::OpenWebUi | Provider::OpenAiCompatible => {
+                    compat_card(ui, pal, a, acts)
+                }
                 Provider::ClaudeCode | Provider::Codex => cli_card(ui, pal, a, acts),
             }
         }
@@ -296,20 +311,8 @@ const PRIVACY_CODEX: &str = "What leaves this Mac: the messages you type, the pr
 const PRIVACY: &str = "What leaves this Mac: the messages you type, the project overview (file names, and the units each file uses), the file, selection, other tabs and build errors you attach with the chips above the input, and any file the assistant reads or edits in this project folder. They go to Anthropic (api.anthropic.com) with your key. Nothing else is uploaded, and the assistant never changes a file without your approval (unless you switch on \"Allow edits this session\") or runs a build without it. \"What was sent\" under each message shows the exact text.";
 
 /// Where the OpenAI provider's text goes, for the privacy note.
-pub(super) fn privacy_openai(s: &OpenAiSettings) -> String {
-    let dest = if s.needs_key() {
-        "OpenAI (api.openai.com) with your key".to_string()
-    } else if pascoda_ai::openai::is_local(&s.base_url) {
-        format!(
-            "the server you configured at {}, which runs on this Mac, so nothing leaves it",
-            s.base_url
-        )
-    } else {
-        format!(
-            "the server you configured at {} (not OpenAI), with your key if you saved one",
-            s.base_url
-        )
-    };
+pub(super) fn privacy_openai() -> String {
+    let dest = "OpenAI (api.openai.com) with your key";
     format!(
         "What leaves this Mac: the messages you type, the project overview (file names, and the units each file uses), the file, selection, other tabs and build errors you attach with the chips above the input, and any file the assistant reads or edits in this project folder. They go to {dest}. Nothing else is uploaded, and the assistant never changes a file without your approval (unless you switch on \"Allow edits this session\") or runs a build without it. \"What was sent\" under each message shows the exact text."
     )
@@ -571,56 +574,33 @@ fn key_card(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<Act>) 
     });
 }
 
-/// The OpenAI provider's fields: endpoint, model and key, with Save and Remove key.
-fn openai_fields(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<Act>) {
-    let label = |ui: &mut Ui, t: &str| {
-        ui.label(RichText::new(t).size(13.0).color(pal.text_secondary));
+/// The OpenAI key once it is stored: its status and Remove key, as the Claude page shows it.
+fn openai_stored(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<Act>) {
+    let (text, removable) = match a.openai_key_state {
+        KeyState::Keychain => ("API key: stored in the macOS Keychain.", true),
+        KeyState::Env => ("API key: from OPENAI_API_KEY in the environment.", false),
+        _ => ("No API key.", false),
     };
-    label(ui, "Base URL");
-    let url = ui.add(
-        egui::TextEdit::singleline(&mut a.openai_edit.base_url)
-            .hint_text(pascoda_ai::openai::DEFAULT_OPENAI_BASE_URL)
-            .desired_width(f32::INFINITY),
-    );
-    url.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, "OpenAI base URL"));
-    ui.add_space(4.0);
-    label(ui, "Model");
-    let model = ui.add(
-        egui::TextEdit::singleline(&mut a.openai_edit.model)
-            .hint_text("model name, as your provider lists it")
-            .desired_width(f32::INFINITY),
-    );
-    model.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::Role::TextInput, true, "OpenAI model name")
-    });
-    ui.horizontal_wrapped(|ui| {
-        for m in pascoda_ai::openai::SUGGESTED_MODELS {
-            if ui
-                .selectable_label(a.openai_edit.model == m, RichText::new(m).size(13.0))
-                .clicked()
-            {
-                a.openai_edit.model = m.into();
-            }
+    ui.label(RichText::new(text).size(13.0).color(pal.text));
+    if let Some(m) = &a.key_message {
+        ui.label(RichText::new(m).size(13.0).color(pal.error));
+    }
+    if removable {
+        ui.add_space(4.0);
+        if text_button(ui, pal, "Remove key", false, true).clicked() {
+            acts.push(Act::RemoveKey);
         }
-    });
-    ui.add_space(4.0);
-    let needs = pascoda_ai::openai::needs_key(&a.openai_edit.base_url);
-    label(
-        ui,
-        if needs {
-            "API key"
-        } else {
-            "API key (optional here)"
-        },
-    );
+    }
+}
+
+/// The OpenAI provider's fields: the key, with Save and Remove key. The endpoint is fixed and the
+/// model is picked under the message box, as with the Claude Console API.
+fn openai_fields(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<Act>) {
+    ui.label(RichText::new("API key").size(13.0).color(pal.text_secondary));
     let key = ui.add(
         egui::TextEdit::singleline(&mut a.key_input)
             .password(true)
-            .hint_text(if needs {
-                "sk-..."
-            } else {
-                "not needed for most local servers"
-            })
+            .hint_text("sk-...")
             .desired_width(f32::INFINITY),
     );
     key.widget_info(|| {
@@ -632,8 +612,7 @@ fn openai_fields(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<A
     let (status, stored) = match a.openai_key_state {
         KeyState::Keychain => ("API key: stored in the macOS Keychain.", true),
         KeyState::Env => ("API key: from OPENAI_API_KEY in the environment.", true),
-        _ if needs => ("No API key yet.", false),
-        _ => ("No API key (not needed for this server).", false),
+        _ => ("No API key yet.", false),
     };
     // The normal text colour (white in dark mode) once a key is stored, not green.
     ui.label(RichText::new(status).size(13.0).color(if stored {
@@ -647,7 +626,7 @@ fn openai_fields(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<A
     }
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        let can = !a.key_input.trim().is_empty() || !needs;
+        let can = !a.key_input.trim().is_empty();
         if text_button(ui, pal, "Save", true, can).clicked() && can || enter && can {
             acts.push(Act::SaveKey);
         }
@@ -659,7 +638,7 @@ fn openai_fields(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<A
     });
     ui.add_space(4.0);
     ui.label(
-        RichText::new("The key is kept in the macOS Keychain (service \"Pascoda\", account \"openai\"); OPENAI_API_KEY in the environment also works. The base URL and model are saved in a plain settings file, never the key. For a local server use e.g. http://localhost:11434/v1 (Ollama) or http://localhost:1234/v1 (LM Studio).")
+        RichText::new("The key is kept in the macOS Keychain (service \"Pascoda\", account \"openai\"); OPENAI_API_KEY in the environment also works. The key is never written to a file.")
             .size(13.0)
             .color(pal.text_secondary),
     );
@@ -685,7 +664,7 @@ fn openai_card(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<Act
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new(
-                        "Pascoda uses your own OpenAI API key (platform.openai.com), or any server that speaks the same API: change the base URL.",
+                        "Pascoda uses your own OpenAI API key (platform.openai.com). Pick the model under the message box. To use another server, use OpenAI Compatible.",
                     )
                     .size(13.0)
                     .color(pal.text_secondary),
@@ -702,7 +681,138 @@ fn openai_card(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<Act
                         ui.label(RichText::new("Privacy").size(13.0).color(pal.text));
                         ui.add_space(2.0);
                         ui.label(
-                            RichText::new(privacy_openai(&a.openai_edit))
+                            RichText::new(privacy_openai())
+                                .size(13.0)
+                                .color(pal.text_secondary),
+                        );
+                    });
+            });
+        });
+    });
+}
+
+/// Where an OpenAI Compatible server's text goes, for the privacy note. `keyed`: a key saved for it is
+/// sent with each request.
+pub(super) fn privacy_compat(s: &OpenAiSettings, keyed: bool) -> String {
+    let key = if keyed {
+        "Your saved key goes with each request."
+    } else {
+        "No key is sent."
+    };
+    if s.base_url.trim().is_empty() {
+        "No server is set yet. Give the address of a server above.".to_string()
+    } else if pascoda_ai::openai::is_local(&s.base_url) {
+        format!("the server at {}, which runs on this Mac, so nothing leaves it. {key}", s.base_url)
+    } else {
+        format!("the server at {}, which is not on this Mac: your messages go there. {key}", s.base_url)
+    }
+}
+
+/// The optional key of an OpenAI Compatible server: stored in the Keychain under this server's own
+/// account. Once stored only its status and Remove key show, as on the Claude page.
+fn compat_key_section(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<Act>) {
+    ui.label(RichText::new("API key (optional)").size(13.0).color(pal.text_secondary));
+    if a.compat_key_state == KeyState::Keychain {
+        ui.label(
+            RichText::new("API key: stored in the macOS Keychain for this server.")
+                .size(13.0)
+                .color(pal.text),
+        );
+        ui.add_space(4.0);
+        if text_button(ui, pal, "Remove key", false, true).clicked() {
+            acts.push(Act::RemoveCompatKey);
+        }
+    } else {
+        let field = ui.add(
+            egui::TextEdit::singleline(&mut a.key_input)
+                .password(true)
+                .hint_text("leave empty if the server needs none")
+                .desired_width(f32::INFINITY),
+        );
+        field.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::Role::PasswordInput, true, "Server API key")
+        });
+        let enter = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+        if let Some(m) = &a.key_message {
+            ui.add_space(4.0);
+            ui.label(RichText::new(m).size(13.0).color(pal.error));
+        }
+        ui.add_space(6.0);
+        let can = !a.key_input.trim().is_empty();
+        if text_button(ui, pal, "Save to Keychain", true, can).clicked() && can || enter && can {
+            acts.push(Act::SaveCompatKey);
+        }
+    }
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new("Ollama and oMLX need no key by default; Open WebUI asks for one. Each server's key is kept in the macOS Keychain under that server's name, never in a file.")
+            .size(13.0)
+            .color(pal.text_secondary),
+    );
+}
+
+/// The OpenAI Compatible provider's only setting: the address of the server, with Save.
+fn compat_fields(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<Act>) {
+    ui.label(RichText::new("Server address").size(13.0).color(pal.text_secondary));
+    let url = ui.add(
+        egui::TextEdit::singleline(&mut a.compat_edit.base_url)
+            .hint_text("http://127.0.0.1:11434/v1")
+            .desired_width(f32::INFINITY),
+    );
+    url.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, "Server address"));
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if ui.button("Save").clicked() {
+            acts.push(Act::SaveCompat);
+        }
+        ui.label(
+            RichText::new("e.g. Ollama http://127.0.0.1:11434/v1 or LM Studio http://127.0.0.1:1234/v1")
+                .size(12.0)
+                .color(pal.text_tertiary),
+        );
+    });
+}
+
+/// The OpenAI Compatible provider's card while no server is set.
+fn compat_card(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<Act>) {
+    Frame::new().fill(pal.editor).show(ui, |ui| {
+        ui.set_min_size(ui.available_size());
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            Frame::new().inner_margin(Margin::same(16)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.vertical_centered(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
+                    paint_icon(ui.painter(), r, Icon::Sparkle, pal.accent);
+                });
+                ui.add_space(6.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("Connect to a server").size(17.0).color(pal.text));
+                });
+                ui.add_space(8.0);
+                provider_choice(ui, pal, a, acts);
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "Pascoda talks to any server that speaks the OpenAI Chat Completions API, on this Mac or on your network. Give its address.",
+                    )
+                    .size(13.0)
+                    .color(pal.text_secondary),
+                );
+                ui.add_space(10.0);
+                compat_fields(ui, pal, a, acts);
+                ui.add_space(8.0);
+                compat_key_section(ui, pal, a, acts);
+                ui.add_space(12.0);
+                Frame::new()
+                    .fill(pal.sidebar)
+                    .corner_radius(8)
+                    .inner_margin(Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new("Privacy").size(13.0).color(pal.text));
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(privacy_compat(&a.compat_edit, a.compat_key_state == KeyState::Keychain))
                                 .size(13.0)
                                 .color(pal.text_secondary),
                         );
@@ -780,10 +890,27 @@ fn settings(ui: &mut Ui, pal: &Palette, a: &mut Assistant, acts: &mut Vec<Act>) 
                                 );
                             }
                             Provider::OpenAi => {
-                                openai_fields(ui, pal, a, acts);
+                                // As Claude's page: a stored key is shown as stored, with Remove
+                                // key only; the key field and Save come back when there is none.
+                                if matches!(a.openai_key_state, KeyState::Keychain | KeyState::Env) {
+                                    openai_stored(ui, pal, a, acts);
+                                } else {
+                                    openai_fields(ui, pal, a, acts);
+                                }
                                 ui.add_space(6.0);
                                 ui.label(
-                                    RichText::new(privacy_openai(&a.openai))
+                                    RichText::new(privacy_openai())
+                                        .size(13.0)
+                                        .color(pal.text_secondary),
+                                );
+                            }
+                            Provider::OMlx | Provider::Ollama | Provider::OpenWebUi | Provider::OpenAiCompatible => {
+                                compat_fields(ui, pal, a, acts);
+                                ui.add_space(6.0);
+                                compat_key_section(ui, pal, a, acts);
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new(privacy_compat(&a.compat, a.compat_key_state == KeyState::Keychain))
                                         .size(13.0)
                                         .color(pal.text_secondary),
                                 );
@@ -900,7 +1027,7 @@ fn input_area(ui: &mut Ui, pal: &Palette, a: &mut Assistant, view: &View, acts: 
                             .frame(Frame::NONE)
                             .hint_text(if a.provider == Provider::Codex {
                                 "Ask Codex...  Enter sends, Shift+Enter adds a line"
-                            } else if a.provider == Provider::OpenAi {
+                            } else if a.provider == Provider::OpenAi || a.provider.is_compatible() {
                                 "Ask the assistant...  Enter sends, Shift+Enter adds a line"
                             } else {
                                 "Ask Claude...  Enter sends, Shift+Enter adds a line"
@@ -926,6 +1053,13 @@ fn input_area(ui: &mut Ui, pal: &Palette, a: &mut Assistant, view: &View, acts: 
                             "default model",
                         ) {
                             acts.push(Act::SaveCodexModel);
+                        }
+                        return;
+                    }
+                    if a.provider.is_compatible() {
+                        // The server's model names are not listed: the name is typed.
+                        if model_field(ui, &mut a.compat.model, &[], "compat-model-list", "model name") {
+                            acts.push(Act::SaveCompatModel);
                         }
                         return;
                     }
@@ -1067,7 +1201,7 @@ fn switch(ui: &mut Ui, pal: &Palette, label: &str, on: bool) -> bool {
     resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Switch, enabled, on, label));
     let track = egui::Rect::from_min_size(rect.left_top() + vec2(0.0, 2.0), vec2(28.0, 16.0));
     ui.painter()
-        .rect_filled(track, 8.0, if on { pal.warning } else { pal.separator });
+        .rect_filled(track, 8.0, if on { pal.ok } else { pal.separator });
     let knob_x = if on {
         track.right() - 8.0
     } else {

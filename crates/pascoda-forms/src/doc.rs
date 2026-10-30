@@ -237,6 +237,51 @@ impl FormDoc {
         self.apply(edit)
     }
 
+    /// Renames a symbol the way a code rename does: the component named `old` (the form itself
+    /// included), and every property of any component whose value names it (`PopupMenu = Old`,
+    /// `AnchorSideLeft.Control = Old`, `Action = Old`). Event handlers are left as they are, and
+    /// the rest of the source is kept. Returns how many names and references changed.
+    pub fn rename_symbol(&mut self, old: &str, new: &str) -> Result<usize, EditError> {
+        if old.eq_ignore_ascii_case(new) {
+            return Ok(0);
+        }
+        fn named(c: &Component, old: &str, path: &mut Vec<usize>) -> Option<Vec<usize>> {
+            if c.name.eq_ignore_ascii_case(old) {
+                return Some(path.clone());
+            }
+            c.children.iter().enumerate().find_map(|(i, ch)| {
+                path.push(i);
+                let found = named(ch, old, path);
+                path.pop();
+                found
+            })
+        }
+        fn referring(c: &Component, old: &str, path: &mut Vec<usize>) -> Option<(Vec<usize>, String)> {
+            if let Some(p) = c.props.iter().find(|p| {
+                !p.name.starts_with("On") && p.value.as_ident().is_some_and(|v| v.eq_ignore_ascii_case(old))
+            }) {
+                return Some((path.clone(), p.name.clone()));
+            }
+            c.children.iter().enumerate().find_map(|(i, ch)| {
+                path.push(i);
+                let found = referring(ch, old, path);
+                path.pop();
+                found
+            })
+        }
+        let mut count = 0;
+        // Each edit re-parses the source, so the search starts again every time.
+        while let Some(path) = named(&self.root, old, &mut Vec::new()) {
+            self.rename_component(&path, new)?;
+            count += 1;
+        }
+        while let Some((path, prop)) = referring(&self.root, old, &mut Vec::new()) {
+            self.set_prop(&path, &prop, PropValue::Ident(new.to_string()))?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     fn line_start(&self, pos: usize) -> usize {
         self.source[..pos].rfind('\n').map_or(0, |i| i + 1)
     }
@@ -362,6 +407,22 @@ mod tests {
         assert_eq!(d.source(), FORM);
         assert_eq!(d.remove_component(&[]), Err(EditError::CannotRemoveRoot));
         assert_eq!(d.remove_component(&[7]), Err(EditError::NoSuchComponent));
+    }
+
+    #[test]
+    fn a_symbol_rename_follows_references_but_not_handlers() {
+        let src = "object Form1: TForm1\n  object Button1: TButton\n    OnClick = Button1Click\n  end\n  object Label1: TLabel\n    AnchorSideLeft.Control = Button1\n    PopupMenu = Button1\n  end\nend\n";
+        let mut doc = FormDoc::parse(src).unwrap();
+        assert_eq!(doc.rename_symbol("Button1", "OkButton"), Ok(3), "the name and two references");
+        let out = doc.source();
+        assert!(out.contains("object OkButton: TButton"));
+        assert!(out.contains("OnClick = Button1Click"), "handlers keep their names");
+        assert!(out.contains("AnchorSideLeft.Control = OkButton"));
+        assert!(out.contains("PopupMenu = OkButton"));
+        assert_eq!(doc.rename_symbol("OkButton", "OkButton"), Ok(0));
+        // The form itself is a name too.
+        assert_eq!(doc.rename_symbol("Form1", "Main"), Ok(1));
+        assert!(doc.source().starts_with("object Main: TForm1"));
     }
 
     #[test]

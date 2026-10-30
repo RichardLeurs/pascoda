@@ -584,6 +584,36 @@ pub fn declared_classes(unit: &str) -> Vec<(String, String)> {
     out
 }
 
+/// The components a unit offers to the IDE: each `RegisterComponents('Page', [TA, TB])` call, as
+/// `(page, classes)`. Calls inside comments and strings are not read. Classes are the names as
+/// written (a unit prefix such as `Unit.TA` is kept as written).
+pub fn registered_components(unit: &str) -> Vec<(String, Vec<String>)> {
+    let scan = Scan::new(unit);
+    let mut out = Vec::new();
+    for i in 0..scan.toks.len() {
+        if !scan.is_word(i, "RegisterComponents") || !scan.is_sym(i + 1, b'(') {
+            continue;
+        }
+        if scan.toks.get(i + 2).is_none_or(|t| t.kind != Kind::Str) {
+            continue;
+        }
+        let page = scan.text(i + 2).trim_matches('\'').replace("''", "'");
+        if !scan.is_sym(i + 3, b',') || !scan.is_sym(i + 4, b'[') {
+            continue;
+        }
+        let mut classes = Vec::new();
+        let mut j = i + 5;
+        while j < scan.toks.len() && !scan.is_sym(j, b']') {
+            if scan.toks[j].kind == Kind::Word {
+                classes.push(scan.text(j).to_string());
+            }
+            j += 1;
+        }
+        out.push((page, classes));
+    }
+    out
+}
+
 /// Makes sure each class is registered with `RegisterClass`, which a form that names it in a
 /// `.lfm` needs before it loads. The calls go into the `initialization` section (created before
 /// `finalization` or the final `end.` when the unit has none). Classes already registered are
@@ -1032,5 +1062,36 @@ mod register_tests {
         let got = apply_edits(&unit, &plan_register(&unit, &["TMyLabel", "TForm1"]).unwrap().edits);
         let at = got.find("initialization").unwrap();
         assert!(got[at..].starts_with("initialization\n  RegisterClass(TMyLabel);\n  RegisterClass(TForm1);\n  Randomize;"), "{got}");
+    }
+
+    #[test]
+    fn registered_components_are_read_by_page() {
+        let unit = "unit reglazvlc;\ninterface\nprocedure Register;\nimplementation\nuses lazvlc, Classes;\n\nprocedure Register;\nbegin\n  RegisterComponents('Multimedia',[TLCLVLCPlayer,TVLCMediaListPlayer]);\nend;\nend.\n";
+        assert_eq!(
+            registered_components(unit),
+            [("Multimedia".to_string(), vec!["TLCLVLCPlayer".to_string(), "TVLCMediaListPlayer".to_string()])]
+        );
+    }
+
+    #[test]
+    fn several_calls_comments_and_strings_are_handled() {
+        let unit = "unit u;\nprocedure Register;\nbegin\n  { RegisterComponents('Hidden', [TNo]) }\n  (* RegisterComponents('Also', [TNo2]) *)\n  RegisterComponents('Video Players',\n    [TOne,\n     TTwo]);\n  WriteLn('RegisterComponents(''Text'', [TNo3])');\n  RegisterComponents('It''s', [TThree]);\nend;\nend.\n";
+        assert_eq!(
+            registered_components(unit),
+            [
+                ("Video Players".to_string(), vec!["TOne".to_string(), "TTwo".to_string()]),
+                ("It's".to_string(), vec!["TThree".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_vendored_lazvlc_register_unit_names_its_components() {
+        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/lazarus/components/vlc/reglazvlc.pas");
+        let Ok(text) = std::fs::read_to_string(file) else { return };
+        assert_eq!(
+            registered_components(&text),
+            [("Multimedia".to_string(), vec!["TLCLVLCPlayer".to_string(), "TVLCMediaListPlayer".to_string()])]
+        );
     }
 }

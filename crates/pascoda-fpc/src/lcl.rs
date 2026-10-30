@@ -440,6 +440,14 @@ fn fpc_version() -> String {
 /// Folders that may hold `vendor/`, best first. See `Lcl::find`.
 pub fn search_dirs(start: &Path) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = start.ancestors().map(Path::to_path_buf).collect();
+    dirs.extend(fixed_dirs());
+    dirs
+}
+
+/// The folders that may hold `vendor/` whatever file is open: `$PASCODA_HOME`, the app bundle, the
+/// user's `Application Support/Pascoda`, and (debug builds) the source tree.
+pub fn fixed_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
     dirs.extend(std::env::var_os("PASCODA_HOME").map(PathBuf::from));
     // Contents/MacOS/<exe> -> Contents/Resources
     if let Ok(exe) = std::env::current_exe()
@@ -447,6 +455,8 @@ pub fn search_dirs(start: &Path) -> Vec<PathBuf> {
     {
         dirs.push(contents.join("Resources"));
     }
+    // Where the tools are installed when the bundle does not have them (see `vendor::install_command`).
+    dirs.extend(crate::vendor::user_root());
     if cfg!(debug_assertions) {
         dirs.extend(
             Path::new(env!("CARGO_MANIFEST_DIR"))

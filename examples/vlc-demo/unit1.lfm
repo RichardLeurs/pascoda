@@ -1,0 +1,72 @@
+object Form1: TForm1
+  Left = 300
+  Height = 420
+  Top = 200
+  Width = 560
+  Caption = 'VLC Demo'
+  ClientHeight = 420
+  ClientWidth = 560
+  object VideoPanel: TPanel
+    Left = 0
+    Height = 340
+    Top = 0
+    Width = 560
+    Align = alTop
+    Caption = ''
+    Color = clBlack
+    ParentColor = False
+    TabOrder = 0
+  end
+  object OpenButton: TButton
+    Left = 12
+    Height = 30
+    Top = 352
+    Width = 90
+    Caption = 'Open...'
+    OnClick = OpenButtonClick
+    TabOrder = 1
+  end
+  object PlayButton: TButton
+    Left = 114
+    Height = 30
+    Top = 352
+    Width = 90
+    Caption = 'Play'
+    OnClick = PlayButtonClick
+    TabOrder = 2
+  end
+  object PauseButton: TButton
+    Left = 216
+    Height = 30
+    Top = 352
+    Width = 90
+    Caption = 'Pause'
+    OnClick = PauseButtonClick
+    TabOrder = 3
+  end
+  object StopButton: TButton
+    Left = 318
+    Height = 30
+    Top = 352
+    Width = 90
+    Caption = 'Stop'
+    OnClick = StopButtonClick
+    TabOrder = 4
+  end
+  object StatusLabel: TLabel
+    Left = 12
+    Height = 17
+    Top = 392
+    Width = 536
+    Caption = 'Open a file to start'
+    ParentColor = False
+  end
+  object OpenDialog1: TOpenDialog
+    Left = 440
+    Top = 352
+  end
+  object Player: TPascodaVlcPlayer
+    Left = 440
+    Top = 300
+  end
+end

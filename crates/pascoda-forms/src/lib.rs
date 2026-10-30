@@ -2,6 +2,7 @@
 //! losing anything we do not understand.
 
 pub mod doc;
+pub mod inherit;
 pub mod lfm;
 pub mod model;
 pub mod sync;

@@ -1,7 +1,7 @@
 //! Runs the language server on its own thread and talks to the UI over channels.
 
 use eframe::egui;
-use pascoda_lsp::{Client, CompletionItem, Config, Location};
+use pascoda_lsp::{Client, CompletionItem, Config, FileEdit, Location, Symbol};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
@@ -24,6 +24,35 @@ pub enum Req {
         line: u32,
         col: u32,
     },
+    References {
+        path: PathBuf,
+        text: String,
+        line: u32,
+        col: u32,
+    },
+    /// The signature of the call at the caret: `at` is the caret's char index and `key` the text's,
+    /// both echoed back so a late answer can be recognised.
+    Signature {
+        path: PathBuf,
+        text: String,
+        line: u32,
+        col: u32,
+        at: usize,
+        key: u64,
+    },
+    /// The declarations of a file. `key` identifies the text asked about, echoed back.
+    Symbols {
+        path: PathBuf,
+        text: String,
+        key: u64,
+    },
+    Rename {
+        path: PathBuf,
+        text: String,
+        line: u32,
+        col: u32,
+        new_name: String,
+    },
 }
 
 pub enum Resp {
@@ -32,6 +61,19 @@ pub enum Resp {
     Definition(Option<Location>),
     /// The position the answer is for (0-based line, column), so late answers can be ignored.
     Hover(u32, u32, Option<String>),
+    References(Vec<Location>),
+    Signature {
+        at: usize,
+        key: u64,
+        sig: Option<pascoda_lsp::Signature>,
+    },
+    Symbols {
+        path: PathBuf,
+        key: u64,
+        symbols: Vec<Symbol>,
+    },
+    /// The replacements of a rename, per file.
+    Rename(Vec<FileEdit>),
     Error(String),
 }
 
@@ -85,6 +127,40 @@ pub fn spawn(root: &Path, ctx: egui::Context) -> Option<Handle> {
                     .sync(&path, &text)
                     .and_then(|_| client.hover(&path, line, col))
                     .map(|h| Resp::Hover(line, col, h.filter(|t| !t.is_empty()))),
+                Req::References {
+                    path,
+                    text,
+                    line,
+                    col,
+                } => client
+                    .sync(&path, &text)
+                    .and_then(|_| client.references(&path, line, col))
+                    .map(Resp::References),
+                Req::Signature {
+                    path,
+                    text,
+                    line,
+                    col,
+                    at,
+                    key,
+                } => client
+                    .sync(&path, &text)
+                    .and_then(|_| client.signature_help(&path, line, col))
+                    .map(|sig| Resp::Signature { at, key, sig }),
+                Req::Symbols { path, text, key } => client
+                    .sync(&path, &text)
+                    .and_then(|_| client.document_symbols(&path))
+                    .map(|symbols| Resp::Symbols { path, key, symbols }),
+                Req::Rename {
+                    path,
+                    text,
+                    line,
+                    col,
+                    new_name,
+                } => client
+                    .sync(&path, &text)
+                    .and_then(|_| client.rename(&path, line, col, &new_name))
+                    .map(Resp::Rename),
             };
             reply(result.unwrap_or_else(Resp::Error));
         }

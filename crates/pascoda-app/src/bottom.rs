@@ -10,14 +10,16 @@ pub(crate) enum BottomTab {
     Problems,
     Output,
     Debug,
+    Tests,
     Terminal,
 }
 
 impl BottomTab {
-    pub const ALL: [BottomTab; 4] = [
+    pub const ALL: [BottomTab; 5] = [
         BottomTab::Problems,
         BottomTab::Output,
         BottomTab::Debug,
+        BottomTab::Tests,
         BottomTab::Terminal,
     ];
 
@@ -45,6 +47,8 @@ pub(crate) struct BottomPane {
     pub view: crate::terminal_view::ViewState,
     /// The terminal was drawn in the previous frame (so a newly shown one asks for focus).
     pub view_shown: bool,
+    /// Text for the shell's prompt, typed (without Enter) once the terminal is up.
+    pub pending_input: Option<String>,
 }
 
 impl BottomPane {
@@ -115,6 +119,6 @@ mod tests {
     #[test]
     fn tab_order_is_stable() {
         let names: Vec<_> = BottomTab::ALL.iter().map(|t| t.index()).collect();
-        assert_eq!(names, [0, 1, 2, 3]);
+        assert_eq!(names, [0, 1, 2, 3, 4]);
     }
 }

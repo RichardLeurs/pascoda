@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CONFIG>
+  <Package Version="4">
+    <Name Value="PascodaVlc"/>
+    <Author Value="Pascoda"/>
+    <Description Value="VLC video and audio players for Pascoda. Needs VLC.app (videolan.org) on the Mac that runs the program."/>
+    <Files Count="2">
+      <Item1>
+        <Filename Value="PascodaVlc.pas"/>
+        <Type Value="Unit"/>
+        <UnitName Value="PascodaVlc"/>
+      </Item1>
+      <Item2>
+        <Filename Value="RegPascodaVlc.pas"/>
+        <HasRegisterProc Value="True"/>
+        <Type Value="RegisterUnit"/>
+        <UnitName Value="RegPascodaVlc"/>
+      </Item2>
+    </Files>
+    <RequiredPkgs Count="2">
+      <Item1>
+        <PackageName Value="LCL"/>
+      </Item1>
+      <Item2>
+        <PackageName Value="libvlc"/>
+      </Item2>
+    </RequiredPkgs>
+    <CompilerOptions>
+      <SearchPaths>
+        <IncludeFiles Value="."/>
+        <OtherUnitFiles Value="."/>
+      </SearchPaths>
+    </CompilerOptions>
+  </Package>
+</CONFIG>

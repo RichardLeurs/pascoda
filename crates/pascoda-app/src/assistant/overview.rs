@@ -599,14 +599,14 @@ impl Project {
 pub(crate) mod tests {
     use super::*;
 
-    /// A scratch copy of the sources of `examples/notes`, plus things that must be ignored.
+    /// A scratch copy of the sources of `examples/gui-demo`, plus things that must be ignored.
     pub(crate) fn notes_copy(name: &str) -> PathBuf {
         let dir = crate::target_tmp().join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("lib")).unwrap();
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::create_dir_all(dir.join("Notes.app/Contents")).unwrap();
-        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/notes");
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/gui-demo");
         for e in std::fs::read_dir(src).unwrap().flatten() {
             let p = e.path();
             if matches!(

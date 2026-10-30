@@ -619,17 +619,37 @@ fn sse(blocks: &[Value], stop: &str) -> String {
 
 /// Serves one scripted reply per request; returns the address and the request bodies.
 pub(crate) fn mock(script: Vec<String>) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let (url, bodies, _) = mock_auth(script);
+    (url, bodies)
+}
+
+/// Like [`mock`], and also the `authorization` header of each request (empty when it has none).
+pub(crate) fn mock_auth(
+    script: Vec<String>,
+) -> (String, Arc<Mutex<Vec<Value>>>, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let seen = bodies.clone();
+    let auths = Arc::new(Mutex::new(Vec::new()));
+    let seen_auths = auths.clone();
     std::thread::spawn(move || {
         let mut script = script.into_iter();
         for conn in listener.incoming() {
             let Ok(mut conn) = conn else { break };
-            let Some(body) = read_body(&mut conn) else {
+            let mut head = String::new();
+            let Some(body) = read_body(&mut conn, &mut head) else {
                 continue;
             };
+            // The name is matched in any case; the value keeps its case (a key is case sensitive).
+            let auth = head
+                .lines()
+                .find_map(|l| {
+                    (l.to_ascii_lowercase().starts_with("authorization:"))
+                        .then(|| l["authorization:".len()..].trim().to_string())
+                })
+                .unwrap_or_default();
+            seen_auths.lock().unwrap().push(auth);
             seen.lock()
                 .unwrap()
                 .push(serde_json::from_str(&body).unwrap_or(Value::Null));
@@ -644,10 +664,11 @@ pub(crate) fn mock(script: Vec<String>) -> (String, Arc<Mutex<Vec<Value>>>) {
             });
         }
     });
-    (url, bodies)
+    (url, bodies, auths)
 }
 
-fn read_body(conn: &mut TcpStream) -> Option<String> {
+/// Reads one request: its body, and its header block (lower case) in `head_out`.
+fn read_body(conn: &mut TcpStream, head_out: &mut String) -> Option<String> {
     let mut data = Vec::new();
     let mut buf = [0u8; 4096];
     loop {
@@ -657,7 +678,8 @@ fn read_body(conn: &mut TcpStream) -> Option<String> {
         }
         data.extend_from_slice(&buf[..n]);
         if let Some(p) = data.windows(4).position(|w| w == b"\r\n\r\n") {
-            let head = String::from_utf8_lossy(&data[..p]).to_ascii_lowercase();
+            *head_out = String::from_utf8_lossy(&data[..p]).into_owned();
+            let head = head_out.to_ascii_lowercase();
             let len = head
                 .lines()
                 .find_map(|l| {
@@ -1478,7 +1500,7 @@ fn the_provider_is_remembered_in_a_plain_text_file() {
     a.set_provider(Provider::ClaudeCode);
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "claude-code");
     assert_eq!(Provider::load(&file), Provider::ClaudeCode);
-    assert!(matches!(a.items.last(), Some(Item::Note(n)) if n.contains("Claude Code CLI")));
+    assert!(a.items.is_empty(), "switching agents empties the chat");
     a.set_provider(Provider::Api);
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "api");
     std::fs::write(&file, "garbage").unwrap();
@@ -1583,7 +1605,7 @@ fn oa_turn(approve: bool, name: &str) -> (App, Vec<Value>) {
     app.docs[0].text.push_str("// unsaved marker\n");
     app.assistant.provider = Provider::OpenAi;
     app.assistant.use_openai_key("oa-test-key-not-real");
-    app.assistant.openai.base_url = format!("{url}/v1");
+    app.assistant.openai_base_url = Some(format!("{url}/v1"));
     app.assistant.openai.model = "test-model".into();
     let ctx = egui::Context::default();
     app.assistant.input = "Please change the greeting".into();
@@ -1685,7 +1707,7 @@ fn stop_ends_an_openai_turn_waiting_for_approval() {
     let mut app = App::bare(Some(dir.join("unit1.pas")));
     app.assistant.provider = Provider::OpenAi;
     app.assistant.use_openai_key("k");
-    app.assistant.openai.base_url = format!("{url}/v1");
+    app.assistant.openai_base_url = Some(format!("{url}/v1"));
     app.assistant.openai.model = "m".into();
     let ctx = egui::Context::default();
     app.assistant.input = "go".into();
@@ -1705,7 +1727,7 @@ fn an_empty_model_is_explained_and_nothing_is_sent() {
     let mut app = App::bare(Some(dir.join("unit1.pas")));
     app.assistant.provider = Provider::OpenAi;
     app.assistant.use_openai_key("k");
-    app.assistant.openai.base_url = format!("{url}/v1");
+    app.assistant.openai_base_url = Some(format!("{url}/v1"));
     let ctx = egui::Context::default();
     app.assistant.input = "hello".into();
     assert!(!app.assistant_send(&ctx));
@@ -1725,7 +1747,7 @@ fn status_server(code: u16, body: &str) -> String {
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(mut conn) = conn else { break };
-            if read_body(&mut conn).is_none() {
+            if read_body(&mut conn, &mut String::new()).is_none() {
                 continue;
             }
             let _ = write!(
@@ -1748,11 +1770,9 @@ fn a_401_from_the_server_clears_the_key_and_brings_back_the_card() {
     let mut app = App::bare(Some(dir.join("unit1.pas")));
     app.assistant.provider = Provider::OpenAi;
     app.assistant.use_openai_key("sk-wrong");
-    app.assistant.openai.base_url = "https://api.openai.com/v1".into();
     app.assistant.openai.model = "m".into();
-    // The default URL would go to the real OpenAI; point at the local server but keep the
-    // "needs a key" rule by using the settings check on a copy.
-    app.assistant.openai.base_url = url.replace("127.0.0.1", "localhost");
+    // The official address is fixed; the test points the provider at the local server.
+    app.assistant.openai_base_url = Some(url.replace("127.0.0.1", "localhost"));
     let ctx = egui::Context::default();
     app.assistant.input = "hi".into();
     assert!(app.assistant_send(&ctx));
@@ -1762,8 +1782,8 @@ fn a_401_from_the_server_clears_the_key_and_brings_back_the_card() {
     assert_eq!(a.openai_key_state, KeyState::Missing);
     assert!(a.key_message.as_deref().unwrap_or("").contains("rejected"));
     assert!(!a.key_message.as_deref().unwrap().contains("sk-wrong"));
-    // A local server needs no key, so the panel stays usable and opens the settings to type one.
-    assert!(a.ready() && a.show_settings);
+    // The official endpoint needs a key: the key card comes back.
+    assert!(!a.ready() && a.show_settings);
 }
 
 #[test]
@@ -1777,7 +1797,7 @@ fn a_401_from_openai_itself_shows_the_key_card() {
     );
     assert!(!a.ready(), "api.openai.com needs a key");
     assert_eq!(a.openai_key_state, KeyState::Missing);
-    assert!(a.key_message.is_some() && !a.show_settings);
+    assert!(a.key_message.is_some() && a.show_settings, "the key card comes back");
     // The Anthropic key is not touched by an OpenAI failure
     let mut b = openai_assistant("401b");
     b.use_key("anthropic");
@@ -1787,16 +1807,14 @@ fn a_401_from_openai_itself_shows_the_key_card() {
 }
 
 #[test]
-fn openai_readiness_follows_the_endpoint() {
+fn openai_readiness_needs_the_key() {
     let mut a = openai_assistant("ready");
     assert!(!a.ready(), "OpenAI itself needs a key");
     a.use_key("anthropic-key");
     assert!(!a.ready(), "an Anthropic key does not help");
-    a.openai.base_url = "http://localhost:11434/v1".into();
-    assert!(a.ready(), "a local server may run without a key");
-    a.openai.base_url = "https://api.openai.com/v1".into();
     a.use_openai_key("sk");
     assert!(a.ready());
+    assert_eq!(a.openai.base_url, "https://api.openai.com/v1", "the endpoint is the official one");
 }
 
 #[test]
@@ -1813,7 +1831,8 @@ fn the_openai_settings_are_saved_without_the_key() {
     };
     a.key_input = "sk-TOPSECRET".into();
     a.save_key();
-    assert_eq!(a.openai.base_url, "http://localhost:11434/v1");
+    // The endpoint is fixed: a typed address is ignored, only the model is kept.
+    assert_eq!(a.openai.base_url, "https://api.openai.com/v1");
     assert_eq!(a.openai.model, "llama3.1");
     assert_eq!(a.openai_key_state, KeyState::Keychain);
     assert!(a.key_input.is_empty());
@@ -1827,7 +1846,7 @@ fn the_openai_settings_are_saved_without_the_key() {
     assert!(a.openai_keystore.load().unwrap().is_some());
     a.remove_key();
     assert!(a.openai_keystore.load().unwrap().is_none());
-    // An empty base URL falls back to OpenAI; typing the model in the chat updates the file
+    // Typing the model in the chat updates the file; the endpoint stays the official one
     a.openai_edit.base_url = "  ".into();
     a.commit_openai();
     assert_eq!(a.openai.base_url, "https://api.openai.com/v1");
@@ -1883,24 +1902,14 @@ fn the_provider_file_knows_openai_and_the_switch_resets_the_card() {
     assert_eq!(Provider::load(&file), Provider::OpenAi);
     assert!(a.key_message.is_none() && a.key_input.is_empty());
     assert_eq!(Provider::OpenAi.label(), "OpenAI API");
-    assert_eq!(Provider::ALL.len(), 4);
+    assert_eq!(Provider::ALL.len(), 8);
 }
 
 #[test]
 fn the_privacy_text_names_where_the_text_goes() {
-    let p = |u: &str| {
-        ui::privacy_openai(&OpenAiSettings {
-            base_url: u.into(),
-            model: String::new(),
-        })
-    };
-    assert!(p("https://api.openai.com/v1").contains("OpenAI (api.openai.com)"));
-    assert!(p("http://localhost:11434/v1").contains("nothing leaves it"));
-    let other = p("https://llm.example.org/v1");
-    assert!(other.contains("llm.example.org") && other.contains("not OpenAI"));
-    for t in [p("https://api.openai.com/v1"), other] {
-        assert!(!t.contains("Anthropic") && !t.contains("Claude"));
-    }
+    let t = ui::privacy_openai();
+    assert!(t.contains("OpenAI (api.openai.com)"));
+    assert!(!t.contains("Anthropic") && !t.contains("Claude"));
 }
 
 // ---- "Allow edits this session" ---------------------------------------------------------------
@@ -2163,7 +2172,7 @@ fn auto_mode_with_openai_applies_without_a_click() {
     let mut app = App::bare(Some(dir.join("unit1.pas")));
     app.assistant.provider = Provider::OpenAi;
     app.assistant.use_openai_key("oa-test-key-not-real");
-    app.assistant.openai.base_url = format!("{url}/v1");
+    app.assistant.openai_base_url = Some(format!("{url}/v1"));
     app.assistant.openai.model = "test-model".into();
     app.assistant.set_auto_edits(true);
     let ctx = egui::Context::default();
@@ -2447,6 +2456,10 @@ fn the_chooser_groups_claude_and_openai_agents_and_remembers_codex() {
             ("Claude", "Claude Code CLI"),
             ("OpenAI", "OpenAI API"),
             ("OpenAI", "Codex CLI"),
+            ("Other servers", "oMLX"),
+            ("Other servers", "Ollama"),
+            ("Other servers", "Open WebUI"),
+            ("Other servers", "OpenAI Compatible"),
         ]
     );
     // each vendor's providers sit together
@@ -2598,4 +2611,172 @@ fn codex_not_logged_in_shows_the_login_steps() {
         })
         .unwrap();
     assert!(msg.contains("codex login"), "{msg}");
+}
+
+fn compat_assistant(_tag: &str) -> Assistant {
+    Assistant {
+        provider: Provider::OpenAiCompatible,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn the_compatible_server_is_ready_once_it_has_an_address() {
+    let mut a = compat_assistant("ready");
+    assert!(!a.ready(), "no server named yet");
+    a.compat_edit.base_url = "  http://127.0.0.1:11434/v1 ".into();
+    a.commit_compat();
+    assert!(a.ready(), "an address is enough: no key is asked for");
+    assert_eq!(a.compat.base_url, "http://127.0.0.1:11434/v1", "trimmed");
+    assert!(a.settled(), "nothing is looked up for this provider");
+    a.compat_edit.base_url = "   ".into();
+    a.commit_compat();
+    assert!(!a.ready(), "a blank address is no server");
+}
+
+#[test]
+fn the_compatible_server_is_saved_without_a_key_or_default_address() {
+    let dir = scratch("assist-compat-settings");
+    let file = dir.join("openai-compatible-settings");
+    assert!(
+        read_compat_file(&file).is_empty(),
+        "a missing file names no server (the OpenAI default would be wrong here)"
+    );
+    let mut a = compat_assistant("settings");
+    a.compat_file = Some(file.clone());
+    a.compat_edit = OpenAiSettings {
+        base_url: "http://localhost:1234/v1".into(),
+        model: String::new(),
+    };
+    a.commit_compat();
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(!text.to_lowercase().contains("key"), "no key in the file: {text}");
+    assert_eq!(
+        read_compat_file(&file)["openai-compatible"].base_url,
+        "http://localhost:1234/v1"
+    );
+}
+
+#[test]
+fn a_file_of_one_server_before_the_presets_is_the_generic_server() {
+    let dir = scratch("assist-compat-old-file");
+    let file = dir.join("openai-compatible-settings");
+    std::fs::write(&file, r#"{"base_url":"http://10.0.0.5:9000/v1","model":"m"}"#).unwrap();
+    let saved = read_compat_file(&file);
+    assert_eq!(saved["openai-compatible"].base_url, "http://10.0.0.5:9000/v1");
+    assert_eq!(saved["openai-compatible"].model, "m");
+}
+
+#[test]
+fn each_compatible_server_keeps_its_own_address_model_and_key() {
+    let _keychain = lock(&KEYCHAIN);
+    let dir = scratch("assist-compat-servers");
+    let file = dir.join("openai-compatible-settings");
+    let mut a = Assistant {
+        provider: Provider::OpenAi,
+        compat_file: Some(file.clone()),
+        compat_service: format!("PascodaTest-compat-{}", std::process::id()),
+        ..Default::default()
+    };
+    // Ollama comes with its usual address and needs no key.
+    a.set_provider(Provider::Ollama);
+    assert_eq!(a.compat.base_url, "http://127.0.0.1:11434/v1");
+    assert!(a.ready() && a.compat_key_state == KeyState::Missing);
+    a.compat.model = "qwen3:4b".into();
+    a.persist_compat();
+
+    // Open WebUI: its own address, and a key kept under its own account.
+    a.set_provider(Provider::OpenWebUi);
+    assert_eq!(a.compat.base_url, "http://127.0.0.1:8080/api/v1");
+    a.key_input = "sk-webui".into();
+    a.save_compat_key();
+    assert_eq!(a.compat_key_state, KeyState::Keychain);
+    assert!(a.key_input.is_empty(), "the key field is cleared once saved");
+    a.compat.model = "gemma".into();
+    a.persist_compat();
+
+    // oMLX does not see Open WebUI's key.
+    a.set_provider(Provider::OMlx);
+    assert_eq!(a.compat.base_url, "http://127.0.0.1:8000/v1");
+    assert_eq!(a.compat_key_state, KeyState::Missing);
+
+    // Back to Ollama: its model is still there, and Open WebUI's key is still stored for it.
+    a.set_provider(Provider::Ollama);
+    assert_eq!(a.compat.model, "qwen3:4b");
+    a.set_provider(Provider::OpenWebUi);
+    assert_eq!(a.compat.model, "gemma");
+    assert_eq!(a.compat_key_state, KeyState::Keychain);
+    a.remove_compat_key();
+    assert_eq!(a.compat_key_state, KeyState::Missing);
+    assert!(a.compat_keystore().load().unwrap().is_none());
+
+    // Every server's address and model are in the file, with no key.
+    let saved = read_compat_file(&file);
+    assert_eq!(saved["ollama"].model, "qwen3:4b");
+    assert_eq!(saved["open-webui"].base_url, "http://127.0.0.1:8080/api/v1");
+    assert!(!std::fs::read_to_string(&file).unwrap().contains("sk-webui"));
+}
+
+#[test]
+fn a_turn_goes_to_the_compatible_server_with_its_model() {
+    let dir = scratch("assist-compat-turn");
+    let (url, bodies) = mock(vec![oa_text("Hello from the server.")]);
+    let mut app = App::bare(Some(dir.join("unit1.pas")));
+    app.assistant.provider = Provider::OpenAiCompatible;
+    app.assistant.compat_edit = OpenAiSettings {
+        base_url: format!("{url}/v1"),
+        model: String::new(),
+    };
+    app.assistant.commit_compat();
+    app.assistant.compat.model = "local-model".into();
+    let ctx = egui::Context::default();
+    app.assistant.input = "hi".into();
+    assert!(app.assistant_send(&ctx));
+    wait(&mut app, &ctx, "the end of the turn", |a| !a.assistant.streaming());
+    let seen = bodies.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0]["model"], "local-model");
+    assert!(
+        app.assistant
+            .items
+            .iter()
+            .any(|i| matches!(i, Item::Assistant(t) if t.contains("Hello from the server."))),
+        "the server's answer is shown"
+    );
+}
+
+#[test]
+fn switching_the_agent_empties_the_chat() {
+    let mut a = openai_assistant("switch-empties");
+    a.items.push(Item::Assistant("an old answer".into()));
+    a.usage.input_tokens = 99;
+    a.set_provider(Provider::Codex);
+    assert!(a.items.is_empty(), "the chat of the previous agent is gone");
+    assert_eq!(a.usage.input_tokens, 0);
+    assert_eq!(a.provider, Provider::Codex);
+}
+
+/// Open WebUI wants `Authorization: Bearer <key>` on every request: the key saved for it is sent.
+#[test]
+fn open_webui_gets_the_saved_key_as_a_bearer_token() {
+    let _keychain = lock(&KEYCHAIN);
+    let dir = scratch("assist-compat-webui-key");
+    let (url, bodies, auths) = mock_auth(vec![oa_text("hello")]);
+    let mut app = App::bare(Some(dir.join("unit1.pas")));
+    app.assistant.compat_service = format!("PascodaTest-webui-{}", std::process::id());
+    app.assistant.set_provider(Provider::OpenWebUi);
+    app.assistant.compat = OpenAiSettings {
+        base_url: format!("{url}/api/v1"),
+        model: "gemma".into(),
+    };
+    app.assistant.key_input = "sk-webui-test".into();
+    app.assistant.save_compat_key();
+    assert_eq!(app.assistant.compat_key_state, KeyState::Keychain);
+    let ctx = egui::Context::default();
+    app.assistant.input = "hi".into();
+    assert!(app.assistant_send(&ctx));
+    wait(&mut app, &ctx, "the end of the turn", |a| !a.assistant.streaming());
+    assert_eq!(bodies.lock().unwrap().len(), 1);
+    assert_eq!(auths.lock().unwrap()[0], "Bearer sk-webui-test");
+    let _ = app.assistant.compat_keystore().delete();
 }

@@ -50,6 +50,10 @@ enum Drag {
 
 #[derive(Default)]
 pub struct UiState {
+    /// The SQLdb connection editor is open for this connector.
+    pub connection: Option<super::ConnectionEdit>,
+    /// Why the connection could not be applied (shown in the editor).
+    pub connection_error: String,
     /// The palette class that the next click on the form places.
     pub tool: Option<&'static str>,
     /// The palette page shown (index into the pages of `PALETTE`).
@@ -109,6 +113,7 @@ pub fn show(
     unit: &mut String,
 ) -> Outcome {
     let mut out = Outcome::default();
+    connection_dialog(d, state, ui.ctx());
     let pal = Palette::of(ui.ctx());
     let max_w = inspector_max(ui.available_width());
     egui::Panel::right("designer-inspector")
@@ -130,8 +135,12 @@ pub fn show(
     Frame::new().fill(pal.chrome).show(ui, |ui| {
         ui.set_width(ui.available_width());
         // Pages as real tabs: the chosen one is joined to the icon row below it.
+        // Built-in pages first, then the pages of imported packages (see `imports`).
+        let imported = super::imported_entries();
+        // A data module offers only the pages that have non-visual components.
+        let datamodule = d.is_datamodule();
         let mut pages: Vec<&str> = Vec::new();
-        for en in PALETTE {
+        for en in PALETTE.iter().chain(&imported).filter(|en| !datamodule || en.nonvisual) {
             if !pages.contains(&en.page) {
                 pages.push(en.page);
             }
@@ -154,7 +163,13 @@ pub fn show(
             })
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
+                // The row scrolls sideways rather than growing: a row wider than the free area
+                // (many pages, e.g. imported packages, or a long sync error) would widen this Ui,
+                // and the canvas laid out after it would then reach under the inspector (the form
+                // centred too far right, and the native controls covering the inspector).
+                egui::ScrollArea::horizontal()
+                    .id_salt("designer-pages")
+                    .show(ui, |ui| ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     if let (Some(i), _) =
                         crate::style::page_tabs(ui, &pal, &pages, page_index, pal.chrome)
@@ -166,18 +181,22 @@ pub fn show(
                     } else if let Some(e) = &state.native_error {
                         ui.colored_label(pal.error, e);
                     }
-                });
+                    if let Some(a) = &d.ancestor {
+                        ui.colored_label(pal.text_tertiary, a.note());
+                    }
+                }));
             });
         Frame::new()
             .inner_margin(Margin::symmetric(10, 6))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 let classes: Vec<&'static str> = if page == "Project" {
-                    custom.clone()
+                    custom.iter().copied().filter(|c| !datamodule || is_nonvisual(c)).collect()
                 } else {
                     PALETTE
                         .iter()
-                        .filter(|en| en.page == page)
+                        .chain(&imported)
+                        .filter(|en| en.page == page && (!datamodule || en.nonvisual))
                         .map(|en| en.class)
                         .collect()
                 };
@@ -221,6 +240,92 @@ pub fn show(
 /// The component tray under the form: non-visual components (timers, dialogs, menus) as chips.
 /// Click selects, double-click creates the default handler; with a non-visual palette tool, a
 /// click anywhere on the strip places the component.
+/// A data module's surface: there is no window to draw. The non-visual components are in the tray
+/// below; clicking the empty surface clears the selection.
+fn datamodule_surface(d: &mut Designer, native: &mut Option<Native>, ui: &mut egui::Ui) {
+    if let Some(n) = native {
+        // The native controls of a form would cover the surface.
+        n.hide();
+    }
+    let pal = Palette::of(ui.ctx());
+    let rect = ui.available_rect_before_wrap();
+    let resp = ui.allocate_rect(rect, Sense::click());
+    ui.painter().rect_filled(rect, 0.0, pal.editor);
+    let name = d.doc.root().name.clone();
+    ui.painter().text(
+        rect.center() - vec2(0.0, 14.0),
+        egui::Align2::CENTER_CENTER,
+        format!("{name} (data module)"),
+        egui::FontId::proportional(14.0),
+        pal.text,
+    );
+    ui.painter().text(
+        rect.center() + vec2(0.0, 12.0),
+        egui::Align2::CENTER_CENTER,
+        "Non-visual components: they are listed in the tray below.",
+        egui::FontId::proportional(12.0),
+        pal.text_tertiary,
+    );
+    if resp.clicked() {
+        d.select_paths(Vec::new());
+    }
+}
+
+/// The SQLdb connection editor: the driver, host, database, user and password of a connector.
+/// OK writes them to the connector (one undo step); Cancel discards them.
+fn connection_dialog(d: &mut Designer, state: &mut UiState, ctx: &egui::Context) {
+    let Some(mut edit) = state.connection.take() else { return };
+    let (mut ok, mut cancel) = (false, false);
+    let error = state.connection_error.clone();
+    crate::style::dialog(ctx, "connection-editor", Some("SQLdb Connection"), 420.0, |ui| {
+        ui.spacing_mut().item_spacing.y = 8.0;
+        egui::Grid::new("connection-fields").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+            ui.label("Driver");
+            egui::ComboBox::from_id_salt("connection-driver")
+                .selected_text(edit.connector.clone())
+                .show_ui(ui, |ui| {
+                    for (name, _) in super::CONNECTORS {
+                        ui.selectable_value(&mut edit.connector, name.to_string(), *name);
+                    }
+                });
+            ui.end_row();
+            ui.label("Host name");
+            ui.add(egui::TextEdit::singleline(&mut edit.host).desired_width(260.0));
+            ui.end_row();
+            ui.label("Database");
+            ui.add(egui::TextEdit::singleline(&mut edit.database).desired_width(260.0).hint_text("a file path for SQLite"));
+            ui.end_row();
+            ui.label("User name");
+            ui.add(egui::TextEdit::singleline(&mut edit.user).desired_width(260.0));
+            ui.end_row();
+            ui.label("Password");
+            ui.add(egui::TextEdit::singleline(&mut edit.password).password(true).desired_width(260.0));
+            ui.end_row();
+        });
+        if !error.is_empty() {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        ui.horizontal(|ui| {
+            ok = ui.button("OK").clicked();
+            cancel = ui.button("Cancel").clicked();
+        });
+    });
+    if cancel {
+        state.connection_error.clear();
+        return;
+    }
+    if ok {
+        match d.apply_connection(&edit) {
+            Ok(()) => state.connection_error.clear(),
+            Err(e) => state.connection_error = e.to_string(),
+        }
+        if state.connection_error.is_empty() {
+            return;
+        }
+    }
+    state.connection = Some(edit);
+}
+
 fn tray(
     d: &mut Designer,
     state: &mut UiState,
@@ -421,8 +526,14 @@ fn canvas(
     unit: &mut String,
     out: &mut Outcome,
 ) {
+    if d.is_datamodule() {
+        datamodule_surface(d, native, ui);
+        return;
+    }
     let ctx = ui.ctx().clone();
-    let avail = ui.available_rect_before_wrap();
+    // Never more than `show` left beside the inspector (it set the clip to that area): content
+    // that grew the Ui past it must not move the canvas, or the native views, under the inspector.
+    let avail = ui.available_rect_before_wrap().intersect(ui.clip_rect());
     let (w, h) = geometry::form_size(d.doc.root());
     // The visible canvas, minus scroll bars where the form does not fit.
     let (area, hbar, vbar) = viewport::split(avail, (w, h));
@@ -1413,6 +1524,13 @@ fn inspector(
     ui.separator();
 
     let path = d.selected.clone();
+    // A SQLdb connector opens the connection editor.
+    if let Some(edit) = d.connection_of(&path)
+        && ui.button("Edit Connection\u{2026}").clicked()
+    {
+        state.connection = Some(edit);
+        state.connection_error.clear();
+    }
     // Menus and action lists (and the items in them) open the item editor.
     if let Some(owner) = d.item_owner(&path).filter(|_| !is_form)
         && let Some(oc) = d.doc.component(&owner)

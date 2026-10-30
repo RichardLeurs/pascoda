@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CONFIG>
+  <Package Version="4">
+    <Name Value="PascodaData"/>
+    <Author Value="Pascoda"/>
+    <Description Value="Database components for Pascoda (SQLdb and SQLite connections, queries and data sources) from the FPC database sources in vendor/fpcsrc."/>
+    <Files Count="1">
+      <Item1>
+        <Filename Value="RegPascodaData.pas"/>
+        <HasRegisterProc Value="True"/>
+        <Type Value="RegisterUnit"/>
+        <UnitName Value="RegPascodaData"/>
+      </Item1>
+    </Files>
+    <RequiredPkgs Count="2">
+      <Item1>
+        <PackageName Value="LCL"/>
+      </Item1>
+      <Item2>
+        <PackageName Value="fcl-db"/>
+      </Item2>
+    </RequiredPkgs>
+    <CompilerOptions>
+      <SearchPaths>
+        <IncludeFiles Value="."/>
+        <OtherUnitFiles Value="."/>
+      </SearchPaths>
+    </CompilerOptions>
+  </Package>
+</CONFIG>

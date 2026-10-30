@@ -35,6 +35,21 @@ pub struct Variable {
     pub reference: i64,
 }
 
+/// A breakpoint: its 1-based line, and optionally the condition it stops on and the hit condition.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Breakpoint {
+    pub line: u32,
+    pub condition: Option<String>,
+    pub hit_condition: Option<String>,
+}
+
+impl Breakpoint {
+    /// A plain breakpoint at `line`.
+    pub fn at(line: u32) -> Self {
+        Self { line, ..Self::default() }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     Over,
@@ -205,11 +220,13 @@ impl Session {
 
     /// Starts `program` under the debugger, with line breakpoints set before it runs.
     /// `breakpoints` pairs a source file with 1-based lines.
+    /// Starts `program` in `cwd` with the program arguments `args`, stopping at the breakpoints.
     pub fn launch(
         &mut self,
         program: &Path,
         cwd: &Path,
-        breakpoints: &[(PathBuf, Vec<u32>)],
+        args: &[String],
+        breakpoints: &[(PathBuf, Vec<Breakpoint>)],
     ) -> Result<(), String> {
         let staged = stage_outside_protected_folders(program);
         let program = staged.as_path();
@@ -220,7 +237,7 @@ impl Session {
         let launch = self
             .send(
                 "launch",
-                json!({"program": program, "cwd": cwd, "stopOnEntry": false}),
+                json!({"program": program, "cwd": cwd, "args": args, "stopOnEntry": false}),
             )
             .map_err(|e| e.to_string())?;
         self.wait_event("initialized", Duration::from_secs(20))
@@ -232,12 +249,30 @@ impl Session {
         self.wait(launch, Duration::from_secs(20)).map(|_| ())
     }
 
-    pub fn set_breakpoints(&mut self, file: &Path, lines: &[u32]) -> Result<(), String> {
-        self.request(
-            "setBreakpoints",
-            json!({"source": {"path": file}, "breakpoints": lines.iter().map(|l| json!({"line": l})).collect::<Vec<_>>()}),
-        )
-        .map(|_| ())
+    /// Sets the breakpoints of `file` (the list replaces the file's earlier ones). A condition stops
+    /// only when it holds; a hit condition (such as `== 2` or `>= 3`) stops on matching hits.
+    pub fn set_breakpoints(&mut self, file: &Path, breakpoints: &[Breakpoint]) -> Result<(), String> {
+        let list: Vec<Value> = breakpoints
+            .iter()
+            .map(|b| {
+                let mut o = json!({"line": b.line});
+                if let Some(c) = &b.condition {
+                    o["condition"] = json!(c);
+                }
+                if let Some(h) = &b.hit_condition {
+                    o["hitCondition"] = json!(h);
+                }
+                o
+            })
+            .collect();
+        self.request("setBreakpoints", json!({"source": {"path": file}, "breakpoints": list}))
+            .map(|_| ())
+    }
+
+    /// Stops at the start of the named routines (their symbol names), replacing the earlier ones.
+    pub fn set_function_breakpoints(&mut self, names: &[&str]) -> Result<(), String> {
+        let list: Vec<Value> = names.iter().map(|n| json!({"name": n})).collect();
+        self.request("setFunctionBreakpoints", json!({"breakpoints": list})).map(|_| ())
     }
 
     pub fn resume(&mut self, thread: i64) -> Result<(), String> {

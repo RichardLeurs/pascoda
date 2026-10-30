@@ -12,19 +12,148 @@ pub enum Cmd {
     Resume,
     Step(Step),
     Stop,
-    Breakpoints(PathBuf, Vec<u32>),
+    Breakpoints(PathBuf, Vec<pascoda_dap::Breakpoint>),
     /// The variable paths the UI shows open; they are fetched again at every stop.
     Expanded(HashSet<String>),
     /// Children of the variable at `path` (`reference` as in [`Var::reference`]) are wanted.
     Fetch(String, i64),
+    /// The watch expressions (Pascal text); their values are sent at every stop, and at once when
+    /// the program is stopped.
+    Watches(Vec<String>),
+    /// Evaluates one expression in the stopped program's frame, once.
+    Evaluate(String),
+    /// Assigns `value` to the variable `target` (both lldb expressions) while the program is stopped.
+    /// The variables are read again afterwards.
+    SetValue(String, String),
+    /// Stops (or stops no longer) where a Pascal exception is raised.
+    ExceptionStops(bool),
+    /// Runs until the program reaches `line` (1-based) of `file`, then stops there (a breakpoint
+    /// that is only there for this run; the user's breakpoints stay as they were).
+    RunTo(PathBuf, u32),
 }
 
 pub enum Event {
     Stopped(Paused),
     /// The children of the variable at the path, answering [`Cmd::Fetch`].
     Children(String, Vec<Var>),
+    /// The values of the watch expressions, as the `Watches` scope of the variables, answering
+    /// [`Cmd::Watches`] while the program is stopped.
+    Watched(Vec<Var>),
+    /// The result of [`Cmd::SetValue`]: done, or the error lldb gave.
+    Assigned(Result<(), String>),
+    /// The variables after an assignment, replacing the ones shown.
+    Refreshed(Vec<(String, Vec<Var>)>),
+    /// The result of [`Cmd::Evaluate`]: the expression, and its value or the error lldb gave.
+    Evaluated(String, Result<Var, String>),
     Output(String),
     Ended(String),
+}
+
+/// The scope the watch values are listed under in the variables.
+pub const WATCH_SCOPE: &str = "Watches";
+
+/// Turns a Pascal expression into the C-style one lldb evaluates (lldb has no Pascal parser). Names
+/// become upper case, as the debug information spells them; `=`, `<>`, `and`, `or`, `not`, `div`
+/// and `mod` become their C operators; `true` and `false` become 1 and 0. String literals are kept.
+pub fn lldb_expression(pascal: &str) -> String {
+    let chars: Vec<char> = pascal.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    let mut prev = ' ';
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' {
+            // A string literal; a doubled quote inside it is one quote.
+            out.push('\'');
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\'' {
+                    if chars.get(i + 1) == Some(&'\'') {
+                        out.push_str("\\'");
+                        i += 2;
+                        continue;
+                    }
+                    out.push('\'');
+                    i += 1;
+                    break;
+                }
+                out.push(chars[i]);
+                i += 1;
+            }
+            prev = '\'';
+            continue;
+        }
+        if c.is_alphabetic() || c == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            match word.to_ascii_lowercase().as_str() {
+                "and" => out.push_str("&&"),
+                "or" => out.push_str("||"),
+                "not" => out.push('!'),
+                "div" => out.push('/'),
+                "mod" => out.push('%'),
+                "true" => out.push('1'),
+                "false" => out.push('0'),
+                _ => out.push_str(&word.to_uppercase()),
+            }
+            prev = 'a';
+            continue;
+        }
+        let next = chars.get(i + 1).copied();
+        match c {
+            '<' if next == Some('>') => {
+                out.push_str("!=");
+                i += 2;
+                prev = '=';
+                continue;
+            }
+            // `=` alone is equality; `<=`, `>=` and `:=` keep their `=`.
+            '=' if !matches!(prev, '<' | '>' | ':' | '!' | '=') => out.push_str("=="),
+            _ => out.push(c),
+        }
+        prev = c;
+        i += 1;
+    }
+    out
+}
+
+/// The error an evaluation gave, without lldb's notes and the echoed expression: `use of undeclared
+/// identifier 'NOSUCH'` for an unknown name.
+pub fn clean_error(raw: &str) -> String {
+    let message = raw
+        .lines()
+        .find_map(|l| l.find("error: ").map(|i| &l[i + "error: ".len()..]))
+        .map(|m| match m.split_once(": ") {
+            Some((place, rest)) if place.starts_with("<user expression") => rest,
+            _ => m,
+        })
+        .unwrap_or_else(|| raw.lines().next().unwrap_or_default().trim_start_matches("evaluate: "));
+    message.trim().to_string()
+}
+
+/// The watch values for `exprs` in `frame`: each evaluated, with its children when they are open.
+/// A value that cannot be evaluated shows the error in place of the value.
+fn watch_vars(dbg: &mut Session, frame: i64, exprs: &[String], expanded: &HashSet<String>) -> Vec<Var> {
+    exprs
+        .iter()
+        .map(|expr| match dbg.evaluate(frame, &lldb_expression(expr)) {
+            Ok(mut v) => {
+                v.name = expr.clone();
+                build(dbg, frame, v, WATCH_SCOPE, expanded)
+            }
+            Err(e) => Var {
+                name: expr.clone(),
+                type_name: String::new(),
+                value: clean_error(&e),
+                kind: Kind::Other,
+                reference: 0,
+                children: None,
+            },
+        })
+        .collect()
 }
 
 /// What a value is, for the badge in the Variables pane.
@@ -63,6 +192,35 @@ pub struct Paused {
     pub vars: Vec<(String, Vec<Var>)>,
 }
 
+/// The condition and hit condition of a breakpoint as the user wrote them: a Pascal condition, and a
+/// hit condition (`== 2`, `>= 3`). Both empty for a plain breakpoint.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Stop {
+    pub condition: String,
+    pub hits: String,
+}
+
+/// The breakpoints of a file for the debugger: each line of `lines` that is not `disabled`, with its
+/// condition translated for lldb (`lldb_expression`) and its hit condition as written.
+pub fn breakpoint_specs(
+    lines: &std::collections::BTreeSet<u32>,
+    stops: &std::collections::BTreeMap<u32, Stop>,
+    disabled: &std::collections::BTreeSet<u32>,
+) -> Vec<pascoda_dap::Breakpoint> {
+    lines
+        .iter()
+        .filter(|line| !disabled.contains(line))
+        .map(|&line| {
+            let stop = stops.get(&line).cloned().unwrap_or_default();
+            pascoda_dap::Breakpoint {
+                line,
+                condition: Some(stop.condition.trim().to_string()).filter(|c| !c.is_empty()).map(|c| lldb_expression(&c)),
+                hit_condition: Some(stop.hits.trim().to_string()).filter(|h| !h.is_empty()),
+            }
+        })
+        .collect()
+}
+
 /// Separates scope and variable names in a path such as `Globals/POINT/X`.
 pub const PATH_SEP: char = '/';
 
@@ -74,6 +232,14 @@ impl Paused {
     /// whose "file" is a `binary`symbol` string.
     pub fn source_frames(&self) -> impl Iterator<Item = &Frame> {
         self.frames.iter().filter(|f| is_source(f))
+    }
+
+    /// Replaces the variables listed under `scope`, adding the scope first when it is not there.
+    pub fn set_scope(&mut self, scope: &str, vars: Vec<Var>) {
+        match self.vars.iter().position(|(s, _)| s == scope) {
+            Some(i) => self.vars[i].1 = vars,
+            None => self.vars.insert(0, (scope.to_string(), vars)),
+        }
     }
 
     pub fn location(&self) -> Option<(&Path, u32)> {
@@ -113,13 +279,14 @@ pub struct Handle {
 pub fn spawn(
     exe: PathBuf,
     cwd: PathBuf,
-    breakpoints: Vec<(PathBuf, Vec<u32>)>,
+    args: Vec<String>,
+    breakpoints: Vec<(PathBuf, Vec<pascoda_dap::Breakpoint>)>,
     ctx: egui::Context,
 ) -> Handle {
     let (cmds, cmd_rx) = channel();
     let (event_tx, events) = channel();
     std::thread::spawn(move || {
-        let reason = match drive(&exe, &cwd, &breakpoints, &cmd_rx, &event_tx, &ctx) {
+        let reason = match drive(&exe, &cwd, &args, &breakpoints, &cmd_rx, &event_tx, &ctx) {
             Ok(()) => "program finished".to_string(),
             Err(e) => format!("debugger error: {e}"),
         };
@@ -132,14 +299,15 @@ pub fn spawn(
 fn drive(
     exe: &Path,
     cwd: &Path,
-    breakpoints: &[(PathBuf, Vec<u32>)],
+    args: &[String],
+    breakpoints: &[(PathBuf, Vec<pascoda_dap::Breakpoint>)],
     cmds: &Receiver<Cmd>,
     out: &Sender<Event>,
     ctx: &egui::Context,
 ) -> Result<(), String> {
     let adapter = find_lldb_dap().ok_or("lldb-dap not found (install Xcode)")?;
     let mut dbg = Session::start(&adapter).map_err(|e| e.to_string())?;
-    dbg.launch(exe, cwd, breakpoints)?;
+    dbg.launch(exe, cwd, args, breakpoints)?;
     let mut thread = 0;
     // Variable references are valid only while stopped, in the frame we listed.
     let mut stopped_in: Option<i64> = None;
@@ -148,6 +316,13 @@ fn drive(
         let _ = out.send(e);
         ctx.request_repaint();
     };
+
+    // The watch expressions, set by the UI.
+    let mut watches: Vec<String> = Vec::new();
+    // The user's breakpoints per file (what the UI set), and the run-to target while it runs.
+    let mut user_bps: std::collections::HashMap<PathBuf, Vec<pascoda_dap::Breakpoint>> =
+        breakpoints.iter().cloned().collect();
+    let mut run_to: Option<(PathBuf, u32)> = None;
 
     loop {
         while let Ok(cmd) = cmds.try_recv() {
@@ -164,7 +339,27 @@ fn drive(
                     stopped_in = None;
                     dbg.step(thread, kind)?
                 }
-                Cmd::Breakpoints(file, lines) => dbg.set_breakpoints(&file, &lines)?,
+                Cmd::Breakpoints(file, lines) => {
+                    let mut all = lines.clone();
+                    if let Some((target_file, target)) = &run_to
+                        && *target_file == file
+                    {
+                        all.push(pascoda_dap::Breakpoint::at(*target));
+                    }
+                    user_bps.insert(file.clone(), lines);
+                    dbg.set_breakpoints(&file, &all)?
+                }
+                Cmd::RunTo(file, line) => match stopped_in {
+                    Some(_) => {
+                        let mut lines = user_bps.get(&file).cloned().unwrap_or_default();
+                        lines.push(pascoda_dap::Breakpoint::at(line));
+                        dbg.set_breakpoints(&file, &lines)?;
+                        run_to = Some((file, line));
+                        stopped_in = None;
+                        dbg.resume(thread)?;
+                    }
+                    None => send(Event::Output("Run to Cursor needs the program stopped\n".into())),
+                },
                 Cmd::Expanded(paths) => expanded = paths,
                 Cmd::Fetch(path, reference) => {
                     if let Some(frame) = stopped_in {
@@ -172,6 +367,41 @@ fn drive(
                             .unwrap_or_default();
                         send(Event::Children(path, kids));
                     }
+                }
+                Cmd::Watches(list) => {
+                    watches = list;
+                    if let Some(frame) = stopped_in {
+                        let values = watch_vars(&mut dbg, frame, &watches, &expanded);
+                        send(Event::Watched(values));
+                    }
+                }
+                Cmd::ExceptionStops(on) => {
+                    // Free Pascal raises every exception through this routine.
+                    let names: &[&str] = if on { &["FPC_RAISEEXCEPTION"] } else { &[] };
+                    dbg.set_function_breakpoints(names)?;
+                }
+                Cmd::SetValue(target, value) => match stopped_in {
+                    Some(frame) => match dbg.evaluate(frame, &format!("{target} = {value}")) {
+                        Ok(_) => {
+                            send(Event::Assigned(Ok(())));
+                            let vars = read_vars(&mut dbg, frame, true, &expanded, &watches).unwrap_or_default();
+                            send(Event::Refreshed(vars));
+                        }
+                        Err(e) => send(Event::Assigned(Err(clean_error(&e)))),
+                    },
+                    None => send(Event::Assigned(Err("the program is running".into()))),
+                },
+                Cmd::Evaluate(expr) => {
+                    let result = match stopped_in {
+                        Some(frame) => dbg
+                            .evaluate(frame, &lldb_expression(&expr))
+                            .map(|mut v| {
+                                v.name = expr.clone();
+                                show(&mut dbg, frame, v)
+                            }),
+                        None => Err("the program is running".to_string()),
+                    };
+                    send(Event::Evaluated(expr, result.map_err(|e| clean_error(&e))));
                 }
             }
         }
@@ -183,28 +413,15 @@ fn drive(
         match event.name.as_str() {
             "stopped" => {
                 thread = event.body["threadId"].as_i64().unwrap_or(thread);
+                // The run-to breakpoint is taken out again before anything else happens.
+                if let Some((file, _)) = run_to.take() {
+                    let lines = user_bps.get(&file).cloned().unwrap_or_default();
+                    dbg.set_breakpoints(&file, &lines)?;
+                }
                 let frames = dbg.stack(thread)?;
                 let top = frames.iter().find(|f| is_source(f)).or(frames.first());
                 let frame = top.map_or(0, |f| f.id);
-                let vars = match top {
-                    Some(f) => dbg.variables(f.id)?,
-                    None => Vec::new(),
-                };
-                let vars = vars
-                    .into_iter()
-                    .filter(|(scope, _)| scope != "Registers")
-                    .map(|(scope, vars)| {
-                        let mut vars: Vec<Var> = vars
-                            .into_iter()
-                            .map(|v| build(&mut dbg, frame, v, &scope, &expanded))
-                            .collect();
-                        if scope == "Globals" {
-                            // lldb lists globals in no particular order.
-                            vars.sort_by_key(|v| v.name.to_lowercase());
-                        }
-                        (scope, vars)
-                    })
-                    .collect();
+                let vars = read_vars(&mut dbg, frame, top.is_some(), &expanded, &watches)?;
                 stopped_in = Some(frame);
                 send(Event::Stopped(Paused { frames, vars }));
             }
@@ -220,6 +437,38 @@ fn drive(
             _ => {}
         }
     }
+}
+
+/// The variables of `frame` by scope (none when there is no source frame), with the watches first
+/// under their own scope. Open rows are filled in; globals are sorted by name.
+fn read_vars(
+    dbg: &mut Session,
+    frame: i64,
+    has_frame: bool,
+    expanded: &HashSet<String>,
+    watches: &[String],
+) -> Result<Vec<(String, Vec<Var>)>, String> {
+    let raw = if has_frame { dbg.variables(frame)? } else { Vec::new() };
+    let mut vars: Vec<(String, Vec<Var>)> = raw
+        .into_iter()
+        .filter(|(scope, _)| scope != "Registers")
+        .map(|(scope, vars)| {
+            let mut vars: Vec<Var> = vars
+                .into_iter()
+                .map(|v| build(dbg, frame, v, &scope, expanded))
+                .collect();
+            if scope == "Globals" {
+                // lldb lists globals in no particular order.
+                vars.sort_by_key(|v| v.name.to_lowercase());
+            }
+            (scope, vars)
+        })
+        .collect();
+    if !watches.is_empty() {
+        let values = watch_vars(dbg, frame, watches, expanded);
+        vars.insert(0, (WATCH_SCOPE.to_string(), values));
+    }
+    Ok(vars)
 }
 
 /// Formats `v` (listed under the variable path `parent`) and, if its own path is open, fetches
@@ -692,7 +941,12 @@ mod tests {
             match handle.events.recv_timeout(WAIT).expect("debugger event") {
                 Event::Stopped(p) => return p,
                 Event::Ended(why) => panic!("ended early: {why}"),
-                Event::Output(_) | Event::Children(..) => {}
+                Event::Output(_)
+                | Event::Children(..)
+                | Event::Watched(_)
+                | Event::Evaluated(..)
+                | Event::Assigned(_)
+                | Event::Refreshed(_) => {}
             }
         }
     }
@@ -718,7 +972,8 @@ mod tests {
         let handle = spawn(
             src.with_extension(""),
             src.parent().unwrap().to_path_buf(),
-            vec![(src.clone(), vec![10])],
+            vec![],
+            vec![(src.clone(), vec![pascoda_dap::Breakpoint::at(10)])],
             egui::Context::default(),
         );
         let paused = next_stop(&handle);
@@ -734,8 +989,332 @@ mod tests {
         }
     }
 
+    /// Run to cursor stops at a line inside a loop once, and the line is not a breakpoint afterwards:
+    /// the program runs to its end.
+    #[test]
+    fn run_to_stops_at_the_line_once_and_leaves_the_breakpoints_alone() {
+        let _fpc = crate::FPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let src = Path::new("../../tests/fixtures/debug.pas").canonicalize().unwrap();
+        let built = pascoda_fpc::build(&src, pascoda_fpc::Mode::default()).unwrap();
+        assert!(built.success, "{}", built.raw_output);
+
+        let handle = spawn(
+            src.with_extension(""),
+            src.parent().unwrap().to_path_buf(),
+            vec![],
+            vec![(src.clone(), vec![pascoda_dap::Breakpoint::at(6)])],
+            egui::Context::default(),
+        );
+        let paused = next_stop(&handle);
+        assert_eq!(paused.location(), Some((src.as_path(), 6)));
+
+        // Line 9 is in the loop: it would stop three times if it stayed a breakpoint.
+        handle.cmds.send(Cmd::RunTo(src.clone(), 9)).unwrap();
+        let paused = next_stop(&handle);
+        assert_eq!(paused.location(), Some((src.as_path(), 9)));
+        assert_eq!(find(&paused, "TOTAL").value, "0", "the first time through the loop");
+
+        handle.cmds.send(Cmd::Resume).unwrap();
+        loop {
+            match handle.events.recv_timeout(WAIT).expect("debugger event") {
+                Event::Ended(_) => break,
+                Event::Stopped(p) => panic!("stopped again at {:?}: the run-to line stayed", p.location()),
+                _ => {}
+            }
+        }
+    }
+
+    /// The program gets the run arguments and the run folder, under the debugger as under Run.
+    #[test]
+    fn the_debugged_program_gets_its_arguments_and_folder() {
+        let _fpc = crate::FPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("pascoda-debug-args-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let src = dir.join("argsdemo.pas");
+        std::fs::write(
+            &src,
+            "program argsdemo;\nuses SysUtils;\nbegin\n  WriteLn(ParamStr(1), '|', GetCurrentDir);\nend.\n",
+        )
+        .unwrap();
+        let built = pascoda_fpc::build(&src, pascoda_fpc::Mode::default()).unwrap();
+        assert!(built.success, "{}", built.raw_output);
+        let handle = spawn(
+            src.with_extension(""),
+            dir.join("data"),
+            vec!["hello there".into()],
+            vec![],
+            egui::Context::default(),
+        );
+        let mut output = String::new();
+        loop {
+            match handle.events.recv_timeout(WAIT).expect("debugger event") {
+                Event::Output(text) => output.push_str(&text),
+                Event::Ended(_) => break,
+                _ => {}
+            }
+        }
+        let data = dir.join("data").canonicalize().unwrap();
+        assert!(output.contains(&format!("hello there|{}", data.display())), "{output}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A condition stops the program only when it holds, and a hit count stops it from that hit on: line
+    /// 9 runs three times, and each case stops on the passes it should.
+    #[test]
+    fn a_condition_and_a_hit_condition_decide_when_a_breakpoint_stops() {
+        let _fpc = crate::FPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let src = Path::new("../../tests/fixtures/debug.pas").canonicalize().unwrap();
+        let built = pascoda_fpc::build(&src, pascoda_fpc::Mode::default()).unwrap();
+        assert!(built.success, "{}", built.raw_output);
+        let stops_for = |bp: pascoda_dap::Breakpoint| {
+            let handle = spawn(
+                src.with_extension(""),
+                src.parent().unwrap().to_path_buf(),
+                vec![],
+                vec![(src.clone(), vec![bp])],
+                egui::Context::default(),
+            );
+            let mut stops = Vec::new();
+            loop {
+                match handle.events.recv_timeout(WAIT).expect("debugger event") {
+                    Event::Stopped(p) => {
+                        stops.push(find(&p, "I").value.clone());
+                        handle.cmds.send(Cmd::Resume).unwrap();
+                    }
+                    Event::Ended(_) => break stops,
+                    _ => {}
+                }
+            }
+        };
+        let by_condition = stops_for(pascoda_dap::Breakpoint {
+            line: 9,
+            condition: Some(lldb_expression("i = 2")),
+            hit_condition: None,
+        });
+        assert_eq!(by_condition, ["2"], "only the pass where i = 2");
+        // lldb-dap reads a plain number as "from that hit on": 3 is the third pass, 2 the second and third.
+        let from_third = stops_for(pascoda_dap::Breakpoint {
+            line: 9,
+            condition: None,
+            hit_condition: Some("3".into()),
+        });
+        assert_eq!(from_third, ["3"], "from the third hit on");
+        let from_second = stops_for(pascoda_dap::Breakpoint {
+            line: 9,
+            condition: None,
+            hit_condition: Some("2".into()),
+        });
+        assert_eq!(from_second, ["2", "3"], "from the second hit on");
+    }
+
+    /// A value changed while the program is stopped is the new value: the variables show it, and the
+    /// program carries on with it (line 10 prints the total).
+    #[test]
+    fn a_value_can_be_changed_while_stopped() {
+        let _fpc = crate::FPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let src = Path::new("../../tests/fixtures/debug.pas").canonicalize().unwrap();
+        let built = pascoda_fpc::build(&src, pascoda_fpc::Mode::default()).unwrap();
+        assert!(built.success, "{}", built.raw_output);
+        let handle = spawn(
+            src.with_extension(""),
+            src.parent().unwrap().to_path_buf(),
+            vec![],
+            vec![(src.clone(), vec![pascoda_dap::Breakpoint::at(10)])],
+            egui::Context::default(),
+        );
+        assert_eq!(find(&next_stop(&handle), "TOTAL").value, "6");
+
+        handle.cmds.send(Cmd::SetValue("TOTAL".into(), "9".into())).unwrap();
+        let mut refreshed = None;
+        let mut assigned = None;
+        while refreshed.is_none() || assigned.is_none() {
+            match handle.events.recv_timeout(WAIT).expect("debugger event") {
+                Event::Assigned(r) => assigned = Some(r),
+                Event::Refreshed(vars) => refreshed = Some(vars),
+                Event::Ended(why) => panic!("ended: {why}"),
+                _ => {}
+            }
+        }
+        assert_eq!(assigned.unwrap(), Ok(()));
+        let shown = refreshed
+            .unwrap()
+            .into_iter()
+            .flat_map(|(_, vars)| vars)
+            .find(|v| v.name == "TOTAL")
+            .expect("TOTAL is listed");
+        assert_eq!(shown.value, "9", "the variables show the new value");
+
+        handle.cmds.send(Cmd::Resume).unwrap();
+        let mut output = String::new();
+        loop {
+            match handle.events.recv_timeout(WAIT).expect("debugger event") {
+                Event::Output(text) => output.push_str(&text),
+                Event::Ended(_) => break,
+                _ => {}
+            }
+        }
+        assert!(output.contains("Pascora 9"), "the program prints the new total: {output}");
+    }
+
+    /// A name that is not a variable is refused, with lldb's reason, and the program keeps running.
+    #[test]
+    fn a_change_to_an_unknown_name_is_refused() {
+        let _fpc = crate::FPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let src = Path::new("../../tests/fixtures/debug.pas").canonicalize().unwrap();
+        let built = pascoda_fpc::build(&src, pascoda_fpc::Mode::default()).unwrap();
+        assert!(built.success, "{}", built.raw_output);
+        let handle = spawn(
+            src.with_extension(""),
+            src.parent().unwrap().to_path_buf(),
+            vec![],
+            vec![(src.clone(), vec![pascoda_dap::Breakpoint::at(10)])],
+            egui::Context::default(),
+        );
+        next_stop(&handle);
+        handle.cmds.send(Cmd::SetValue("NOSUCH".into(), "1".into())).unwrap();
+        let result = loop {
+            match handle.events.recv_timeout(WAIT).expect("debugger event") {
+                Event::Assigned(r) => break r,
+                Event::Ended(why) => panic!("ended: {why}"),
+                _ => {}
+            }
+        };
+        assert_eq!(result, Err("use of undeclared identifier 'NOSUCH'".to_string()));
+        handle.cmds.send(Cmd::Stop).unwrap();
+    }
+
+    /// With exception stops on, the program stops on the line that raises a Pascal exception, and
+    /// carries on when it is resumed. Without them it runs past the raise.
+    #[test]
+    fn exception_stops_land_on_the_raising_line() {
+        let _fpc = crate::FPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("pascoda-exc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Canonical, as the debugger reports paths (`/private/var` for the temp folder on macOS).
+        let dir = dir.canonicalize().unwrap();
+        let src = dir.join("boom.pas");
+        std::fs::write(
+            &src,
+            "program boom;\nuses SysUtils;\nprocedure Fail;\nbegin\n  raise Exception.Create('bad thing');\nend;\nbegin\n  try\n    Fail;\n  except\n    on E: Exception do WriteLn('caught ', E.Message);\n  end;\n  WriteLn('done');\nend.\n",
+        )
+        .unwrap();
+        let built = pascoda_fpc::build(&src, pascoda_fpc::Mode::ObjFpc).unwrap();
+        assert!(built.success, "{}", built.raw_output);
+        let handle = spawn(
+            src.with_extension(""),
+            dir.clone(),
+            vec![],
+            vec![],
+            egui::Context::default(),
+        );
+        handle.cmds.send(Cmd::ExceptionStops(true)).unwrap();
+        let paused = next_stop(&handle);
+        assert_eq!(paused.location(), Some((src.as_path(), 5)), "the raise");
+        handle.cmds.send(Cmd::Resume).unwrap();
+        let mut output = String::new();
+        loop {
+            match handle.events.recv_timeout(WAIT).expect("debugger event") {
+                Event::Output(text) => output.push_str(&text),
+                Event::Stopped(_) => panic!("stopped again after the raise"),
+                Event::Ended(_) => break,
+                _ => {}
+            }
+        }
+        assert!(output.contains("caught bad thing"), "{output}");
+
+        // Without exception stops the same program runs past the raise without stopping.
+        let plain = spawn(src.with_extension(""), dir.clone(), vec![], vec![], egui::Context::default());
+        let mut output = String::new();
+        loop {
+            match plain.events.recv_timeout(WAIT).expect("debugger event") {
+                Event::Output(text) => output.push_str(&text),
+                Event::Stopped(_) => panic!("stopped without exception stops on"),
+                Event::Ended(_) => break,
+                _ => {}
+            }
+        }
+        assert!(output.contains("caught bad thing"), "{output}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Watches are listed under their own scope at each stop, can change while stopped, and a
+    /// one-off evaluation gives a value or lldb's error.
+    #[test]
+    fn watches_are_listed_at_each_stop_and_evaluated_on_demand() {
+        let _fpc = crate::FPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let src = Path::new("../../tests/fixtures/debug.pas").canonicalize().unwrap();
+        let built = pascoda_fpc::build(&src, pascoda_fpc::Mode::default()).unwrap();
+        assert!(built.success, "{}", built.raw_output);
+
+        let handle = spawn(
+            src.with_extension(""),
+            src.parent().unwrap().to_path_buf(),
+            vec![],
+            vec![(src.clone(), vec![pascoda_dap::Breakpoint::at(10)])],
+            egui::Context::default(),
+        );
+        handle
+            .cmds
+            .send(Cmd::Watches(vec!["total".into(), "name".into()]))
+            .unwrap();
+        let paused = next_stop(&handle);
+        let (scope, watched) = &paused.vars[0];
+        assert_eq!(scope, WATCH_SCOPE);
+        assert_eq!(watched.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(), ["total", "name"]);
+        assert_eq!(watched[0].value, "6");
+        assert_eq!(watched[1].value, "'Pascora'");
+
+        // A watch that cannot be evaluated shows lldb's message as its value.
+        handle.cmds.send(Cmd::Watches(vec!["total".into(), "nosuch".into()])).unwrap();
+        let values = loop {
+            match handle.events.recv_timeout(WAIT).expect("debugger event") {
+                Event::Watched(v) => break v,
+                Event::Ended(why) => panic!("ended: {why}"),
+                _ => {}
+            }
+        };
+        assert_eq!(values[0].value, "6");
+        assert_eq!(values[1].value, "use of undeclared identifier 'NOSUCH'", "{:?}", values[1]);
+
+        // One-off evaluation, Pascal spelling and case.
+        handle.cmds.send(Cmd::Evaluate("total * 2".into())).unwrap();
+        let result = loop {
+            match handle.events.recv_timeout(WAIT).expect("debugger event") {
+                Event::Evaluated(expr, r) => break (expr, r),
+                Event::Ended(why) => panic!("ended: {why}"),
+                _ => {}
+            }
+        };
+        assert_eq!(result.0, "total * 2");
+        assert_eq!(result.1.expect("evaluates").value, "12");
+
+        handle.cmds.send(Cmd::Stop).unwrap();
+    }
+
     /// Every kind of value in `debug_types.pas` as the pane gets it, and opening the structured
     /// ones: on demand, and kept open across a step.
+    #[test]
+    fn cleans_lldb_errors_for_the_pane() {
+        let raw = "evaluate: Expression evaluation in ISO Pascal not supported. Falling back to default language. Ran expression as 'Objective C++'.\nerror: <user expression 0>:1:1: use of undeclared identifier 'NOSUCH'\n    1 | NOSUCH\n      | ^~~~~~\n";
+        assert_eq!(clean_error(raw), "use of undeclared identifier 'NOSUCH'");
+        assert_eq!(clean_error("evaluate: no frame"), "no frame");
+    }
+
+    #[test]
+    fn translates_pascal_expressions_for_lldb() {
+        assert_eq!(lldb_expression("total + i"), "TOTAL + I");
+        assert_eq!(lldb_expression("total = 3"), "TOTAL == 3");
+        assert_eq!(lldb_expression("a <> b and not c"), "A != B && ! C");
+        assert_eq!(lldb_expression("x >= 2"), "X >= 2");
+        assert_eq!(lldb_expression("x <= 2 or y := 1"), "X <= 2 || Y := 1");
+        assert_eq!(lldb_expression("x mod 2 div 3"), "X % 2 / 3");
+        assert_eq!(lldb_expression("name = 'a = b'"), "NAME == 'a = b'", "string literals are kept");
+        assert_eq!(lldb_expression("c = 'it''s'"), "C == 'it\\'s'");
+        assert_eq!(lldb_expression("flag = true"), "FLAG == 1");
+    }
+
     #[test]
     fn formats_every_kind_of_value() {
         let _fpc = crate::FPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -754,7 +1333,8 @@ mod tests {
         let handle = spawn(
             copy.with_extension(""),
             work.clone(),
-            vec![(copy.clone(), vec![line])],
+            vec![],
+            vec![(copy.clone(), vec![pascoda_dap::Breakpoint::at(line)])],
             egui::Context::default(),
         );
         let mut paused = next_stop(&handle);

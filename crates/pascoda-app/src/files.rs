@@ -3,13 +3,38 @@
 
 use std::path::{Path, PathBuf};
 
-/// The Pascal files a new file can be (the tree lists them, and a new file must be one of these,
-/// or it would be created and then never shown).
-pub const FILE_EXTENSIONS: &[&str] = &["pas", "pp", "lpr", "dpr", "inc", "lfm"];
+/// The text files the new-file menu creates besides the Pascal kinds: notes, settings and scripts.
+/// `.lpi` and `.dproj` are not here, since Lazarus and Delphi write those. `FILE_EXTENSIONS` must
+/// hold all of them (a test checks it).
+#[cfg(test)]
+pub const OTHER_TEXT_EXTENSIONS: &[&str] =
+    &["txt", "md", "markdown", "cfg", "ini", "toml", "json", "xml", "yml", "yaml", "sh"];
 
-/// The files the tree lists: the new-file kinds, plus Delphi forms and project files, which are
-/// read but not created here.
-pub const TREE_EXTENSIONS: &[&str] = &["pas", "pp", "lpr", "dpr", "inc", "lfm", "dfm", "lpi", "dproj"];
+/// The kinds a new file can be (the tree lists them, and a new file must be one of these, or it
+/// would be created and then never shown).
+pub const FILE_EXTENSIONS: &[&str] = &["pas", "pp", "lpr", "dpr", "inc", "lfm", "txt", "md", "markdown", "cfg", "ini", "toml", "json", "xml", "yml", "yaml", "sh"];
+
+/// What a new file of this kind starts with: a skeleton for a Pascal unit or program (an empty
+/// source file stops the language server from starting, see `pasls`), a shebang for a shell script,
+/// and the minimum a JSON or XML document needs. Everything else starts empty.
+fn starter_text(ext: &str, stem: &str) -> String {
+    let name = if pascoda_project::is_valid_name(stem) { stem } else { "Unit1" };
+    match ext {
+        "pas" | "pp" => format!("unit {name};\n\ninterface\n\nimplementation\n\nend.\n"),
+        "lpr" | "dpr" => format!("program {name};\n\nbegin\nend.\n"),
+        "sh" => "#!/bin/sh\n".into(),
+        "json" => "{}\n".into(),
+        "xml" => "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n".into(),
+        _ => String::new(),
+    }
+}
+
+/// The files the tree lists: the new-file kinds, plus Delphi forms, project files and other text
+/// files, which are read but not created here.
+pub const TREE_EXTENSIONS: &[&str] = &[
+    "pas", "pp", "lpr", "dpr", "inc", "lfm", "dfm", "lpi", "lpk", "dproj", "txt", "md", "markdown", "cfg",
+    "ini", "toml", "json", "xml", "yml", "yaml", "sh",
+];
 
 /// Folders the tree hides (and so cannot create either).
 pub const HIDDEN_DIRS: &[&str] = &["target", "vendor", "lib"];
@@ -30,8 +55,9 @@ pub fn check_name(name: &str) -> Result<&str, String> {
     Ok(name)
 }
 
-/// Creates an empty file `name` in `dir`. A name without an extension gets `.pas`; an extension
-/// the tree does not list is refused. An existing file is never overwritten.
+/// Creates the file `name` in `dir`, with the starting text of its kind (empty for most). A name
+/// without an extension gets `.pas`; an extension the tree does not create is refused. An existing
+/// file is never overwritten.
 pub fn new_file(dir: &Path, name: &str) -> Result<PathBuf, String> {
     let name = check_name(name)?;
     let name = if Path::new(name).extension().is_none() {
@@ -58,7 +84,10 @@ pub fn new_file(dir: &Path, name: &str) -> Result<PathBuf, String> {
     if path.exists() {
         return Err(format!("“{name}” already exists"));
     }
-    std::fs::File::create_new(&path).map_err(|e| e.to_string())?;
+    use std::io::Write;
+    let mut file = std::fs::File::create_new(&path).map_err(|e| e.to_string())?;
+    let stem = Path::new(&name).file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+    file.write_all(starter_text(&ext, stem).as_bytes()).map_err(|e| e.to_string())?;
     Ok(path)
 }
 
@@ -108,12 +137,45 @@ pub fn delete(path: &Path, root: &Path) -> Result<(), String> {
 pub fn delete_with(
     path: &Path,
     root: &Path,
-    remove: impl FnOnce(&Path) -> Result<(), String>,
+    mut remove: impl FnMut(&Path) -> Result<(), String>,
 ) -> Result<(), String> {
     if path == root || !path.starts_with(root) {
         return Err("Only items inside the project can be deleted".into());
     }
-    remove(path)
+    let with = companions(path);
+    remove(path)?;
+    for other in &with {
+        remove(other)?;
+    }
+    Ok(())
+}
+
+/// The files that go with `path` when it is deleted: a unit's form (`.lfm` or `.dfm`), and a
+/// form's unit (`.pas`, else `.pp`). Only those that exist.
+pub fn companions(path: &Path) -> Vec<PathBuf> {
+    if !path.is_file() {
+        return Vec::new();
+    }
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
+    let candidates: Vec<PathBuf> = match ext.as_str() {
+        "pas" | "pp" => ["lfm", "dfm"].iter().map(|e| path.with_extension(e)).collect(),
+        "lfm" | "dfm" => ["pas", "pp"].iter().map(|e| path.with_extension(e)).collect(),
+        _ => Vec::new(),
+    };
+    let is_form = ext == "lfm" || ext == "dfm";
+    let mut found: Vec<PathBuf> = candidates.into_iter().filter(|c| c.is_file()).collect();
+    if is_form {
+        // Only the first unit a form has (`.pas` before `.pp`).
+        found.truncate(1);
+    }
+    found
+}
+
+/// Everything a deletion of `path` removes: the item itself and its companions.
+pub fn removed_with(path: &Path) -> Vec<PathBuf> {
+    let mut all = vec![path.to_path_buf()];
+    all.extend(companions(path));
+    all
 }
 
 /// Removes a file or a whole folder from disk, for the tests.
@@ -147,13 +209,39 @@ pub fn rename(path: &Path, new_name: &str, root: &Path) -> Result<Vec<(PathBuf, 
             .unwrap_or_default()
             .to_ascii_lowercase();
         if !TREE_EXTENSIONS.contains(&ext.as_str()) {
-            return Err("The project lists only Pascal, form and project files".into());
+            return Err("The project lists only Pascal, form, project and text files".into());
         }
     } else if name.ends_with(".app") || HIDDEN_DIRS.contains(&name.to_ascii_lowercase().as_str()) {
         return Err(format!("The tree hides folders named “{name}”"));
     }
     let parent = path.parent().ok_or("The item has no folder")?;
-    let target = parent.join(&name);
+    relocate(path, parent, &name)
+}
+
+/// Moves a file or a folder into another folder of the project, keeping its name. A unit moves
+/// with its form. Returns the moves made; moving into the folder it is already in changes nothing.
+/// The project folder, a folder into itself, folders outside the project and a taken name are refused.
+pub fn move_into(path: &Path, dir: &Path, root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    if path == root || !path.starts_with(root) {
+        return Err("Only items inside the project can be moved".into());
+    }
+    if !dir.starts_with(root) || !dir.is_dir() {
+        return Err("Items can only be moved into a folder of the project".into());
+    }
+    if dir.starts_with(path) {
+        return Err("A folder cannot be moved into itself".into());
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or("The item has no name")?;
+    relocate(path, dir, &name)
+}
+
+/// Puts `path` at `dir/name`, with the form of a unit (`.lfm` or `.dfm` of the same name) beside it.
+/// Moves nothing when the target is the path itself.
+fn relocate(path: &Path, dir: &Path, name: &str) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    let target = dir.join(name);
     if target == path {
         return Ok(Vec::new());
     }
@@ -226,13 +314,45 @@ mod tests {
     }
 
     #[test]
+    fn new_pascal_files_start_with_a_skeleton_so_the_language_server_starts() {
+        let d = scratch("skeleton");
+        assert_eq!(
+            std::fs::read_to_string(new_file(&d, "order.pas").unwrap()).unwrap(),
+            "unit order;\n\ninterface\n\nimplementation\n\nend.\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(new_file(&d, "shop.lpr").unwrap()).unwrap(),
+            "program shop;\n\nbegin\nend.\n"
+        );
+        assert_eq!(std::fs::read_to_string(new_file(&d, "my-file.pp").unwrap()).unwrap(), "unit Unit1;\n\ninterface\n\nimplementation\n\nend.\n", "an invalid name gets a valid one");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_new_file_kinds_are_listed_by_the_tree_and_start_with_their_text() {
+        for ext in OTHER_TEXT_EXTENSIONS {
+            assert!(FILE_EXTENSIONS.contains(ext), "{ext} can be created");
+            assert!(TREE_EXTENSIONS.contains(ext), "{ext} is listed");
+        }
+        for ext in FILE_EXTENSIONS {
+            assert!(TREE_EXTENSIONS.contains(ext), "a created {ext} is listed");
+        }
+        let d = scratch("starters");
+        assert_eq!(std::fs::read_to_string(new_file(&d, "run.sh").unwrap()).unwrap(), "#!/bin/sh\n");
+        assert_eq!(std::fs::read_to_string(new_file(&d, "app.json").unwrap()).unwrap(), "{}\n");
+        assert!(std::fs::read_to_string(new_file(&d, "readme.md").unwrap()).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn new_file_adds_pas_and_refuses_unlisted_or_existing() {
         let d = scratch("file");
         let p = new_file(&d, "unit2").unwrap();
         assert_eq!(p.file_name().unwrap(), "unit2.pas");
         assert!(p.is_file());
         assert!(new_file(&d, "unit2.pas").is_err(), "never overwrite");
-        assert!(new_file(&d, "notes.txt").is_err(), "the tree would hide it");
+        assert!(new_file(&d, "notes.exe").is_err(), "the tree would hide it");
+        assert!(new_file(&d, "lazarus.lpi").is_err(), "project files are written by the IDE that owns them");
         assert!(new_file(&d, "Form1.LFM").is_ok(), "extensions are case-insensitive");
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -287,7 +407,7 @@ mod tests {
         assert!(!f.exists() && root.join("unit3.pas").is_file());
         new_file(&root, "taken").unwrap();
         assert!(rename(&root.join("unit3.pas"), "taken.pas", &root).is_err());
-        assert!(rename(&root.join("unit3.pas"), "notes.txt", &root).is_err(), "the tree would hide it");
+        assert!(rename(&root.join("unit3.pas"), "notes.exe", &root).is_err(), "the tree would hide it");
         assert!(rename(&root.join("unit3.pas"), "unit3.pas", &root).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -301,6 +421,69 @@ mod tests {
         assert_eq!(moves.len(), 2);
         assert!(root.join("app.pas").is_file() && root.join("app.dfm").is_file());
         assert!(!root.join("main.dfm").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn other_text_files_are_listed_and_can_be_renamed_to() {
+        let root = scratch("other-text");
+        std::fs::write(root.join("notes.txt"), "hello\n").unwrap();
+        std::fs::write(root.join("readme.md"), "# hi\n").unwrap();
+        std::fs::write(root.join("junk.o"), "x").unwrap();
+        let names: Vec<String> = crate::shell::listing(&root)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"notes.txt".to_string()) && names.contains(&"readme.md".to_string()));
+        assert!(!names.contains(&"junk.o".to_string()), "compiled files stay hidden");
+        rename(&root.join("notes.txt"), "todo.md", &root).unwrap();
+        assert!(root.join("todo.md").is_file());
+        assert!(rename(&root.join("todo.md"), "bin.o", &root).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_unit_moves_into_a_folder_with_its_form() {
+        let root = scratch("move-unit");
+        let dir = new_folder(&root, "sub").unwrap();
+        let pas = new_file(&root, "main.pas").unwrap();
+        std::fs::write(root.join("main.lfm"), "object Form1: TForm1\nend\n").unwrap();
+        let moves = move_into(&pas, &dir, &root).unwrap();
+        assert_eq!(moves.len(), 2);
+        assert!(dir.join("main.pas").is_file() && dir.join("main.lfm").is_file());
+        assert!(!root.join("main.pas").exists() && !root.join("main.lfm").exists());
+        assert!(move_into(&dir.join("main.pas"), &dir, &root).unwrap().is_empty(), "already there");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_move_refuses_a_taken_name_a_folder_into_itself_and_outside_the_project() {
+        let root = scratch("move-refuse");
+        let outer = new_folder(&root, "outer").unwrap();
+        let inner = new_folder(&outer, "inner").unwrap();
+        new_file(&inner, "a.pas").unwrap();
+        new_file(&root, "a.pas").unwrap();
+        let root_a = root.join("a.pas");
+        assert!(move_into(&root_a, &inner, &root).is_err(), "inner already has a.pas");
+        assert!(move_into(&outer, &inner, &root).is_err(), "into itself");
+        assert!(move_into(&root, &outer, &root).is_err(), "the project folder stays");
+        assert!(move_into(&root_a, &std::env::temp_dir(), &root).is_err(), "outside the project");
+        assert!(root_a.is_file(), "a refused move changes nothing");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn deleting_a_form_file_takes_its_unit_and_deleting_a_unit_takes_its_form() {
+        let root = scratch("delete-pair");
+        let pas = new_file(&root, "unit5.pas").unwrap();
+        std::fs::write(root.join("unit5.lfm"), "object Form5: TForm5\nend\n").unwrap();
+        std::fs::write(root.join("unit6.pas"), "unit unit6;\n").unwrap();
+        std::fs::write(root.join("unit6.lfm"), "object Form6: TForm6\nend\n").unwrap();
+        assert_eq!(removed_with(&root.join("unit5.lfm")).len(), 2, "the form and its unit");
+        delete_with(&root.join("unit5.lfm"), &root, remove_from_disk).unwrap();
+        assert!(!pas.exists() && !root.join("unit5.lfm").exists());
+        delete_with(&root.join("unit6.pas"), &root, remove_from_disk).unwrap();
+        assert!(!root.join("unit6.lfm").exists(), "a unit takes its form");
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -164,6 +164,12 @@ fn custom_option(dir: &Path, token: &str, f: &mut Foreign) {
     }
 }
 
+/// Whether a switch may be passed to fpc from a project file (`.lpi`, `.dproj`, `pascoda.toml`):
+/// optimisation and debug information, and the switches in `passes_through`.
+pub fn is_allowed_switch(token: &str) -> bool {
+    token.starts_with("-O") || token.starts_with("-g") || passes_through(token)
+}
+
 /// Whether a Lazarus `CustomOptions` token goes to fpc unchanged: syntax (`-S`, but not the mode
 /// switches), verbosity (`-v`), code generation (`-C`), linking (`-X`), undefines (`-u`) and
 /// rebuilding (`-B`). Tokens that would fight Pascoda's own choices are left out: `-M` (the mode),

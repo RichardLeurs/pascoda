@@ -141,7 +141,422 @@ fn terminal_with(script: &str, marker: &str) -> crate::terminal::Terminal {
 
 /// The four tabs of the bottom pane, in both themes, with the pane tall enough to read.
 #[test]
+fn renders_the_references_in_the_search_tab() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut app = editing_app();
+    app.debug_height = 260.0;
+    app.nav_tab = shell::NavTab::Search;
+    app.show_navigator = true;
+    let f = fixture();
+    app.project_bar.title = "References to total".into();
+    app.show_references(vec![
+        pascoda_lsp::Location { path: f.clone(), line: 2, col: 4 },
+        pascoda_lsp::Location { path: f.clone(), line: 8, col: 4 },
+        pascoda_lsp::Location { path: f.clone(), line: 8, col: 13 },
+    ]);
+    render(app, false, (1100.0, 640.0), "ui-references");
+}
+
+#[test]
+fn renders_the_document_outline() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut app = editing_app();
+    // A stub server, so the outline is shown as read for the current text (nothing is asked).
+    let (requests, _asked) = std::sync::mpsc::channel();
+    let (_answers, responses) = std::sync::mpsc::channel();
+    app.lsp = Some(lsp::Handle { requests, responses });
+    let path = app.docs[0].path.clone();
+    let key = shell::text_key(&app.docs[0].text);
+    app.outline.shown = Some((path.clone(), key));
+    app.outline.symbols = vec![
+        pascoda_lsp::Symbol { name: "TForm1".into(), kind: 5, line: 4, col: 2, depth: 0 },
+        pascoda_lsp::Symbol { name: "Button1".into(), kind: 8, line: 5, col: 4, depth: 1 },
+        pascoda_lsp::Symbol { name: "Button1Click".into(), kind: 6, line: 6, col: 4, depth: 1 },
+        pascoda_lsp::Symbol { name: "Form1".into(), kind: 13, line: 10, col: 2, depth: 0 },
+    ];
+    app.nav_tab = shell::NavTab::Outline;
+    render(app, false, (1100.0, 640.0), "ui-outline");
+}
+
+#[test]
+fn renders_the_editor_with_a_font_and_background_from_the_preferences() {
+    let _guard = crate::prefs::tests::APPLY.write().unwrap_or_else(|e| e.into_inner());
+    let app = editing_app();
+    let mut p = crate::prefs::Prefs { font: 2, ..crate::prefs::Prefs::default() };
+    p.set_background(false, Some([0xFB, 0xF6, 0xE9]));
+    p.apply();
+    let png = render(app, false, (1100.0, 640.0), "ui-editor-courier-background");
+    crate::prefs::Prefs::default().apply();
+    assert!(png.exists());
+}
+
+#[test]
+fn renders_the_component_packages_dialog_and_done_closes_it() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut app = editing_app();
+    app.import_packages_open = true;
+    let png = render(app, false, (1100.0, 640.0), "ui-import-packages");
+    assert!(png.exists());
+    let mut app = editing_app();
+    app.import_packages_open = true;
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1100.0, 640.0))
+        .with_pixels_per_point(1.0)
+        .with_context_setup(theme::apply)
+        .build_ui_state(|ui, app: &mut App| app.draw(ui, None), app);
+    harness.run_steps(3);
+    harness.get_by_label("Done").click();
+    harness.run_steps(3);
+    assert!(!harness.state().import_packages_open, "Done closes the dialog");
+}
+
+#[test]
+fn renders_a_data_module_surface_with_the_tray_only() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let dir = crate::target_tmp().join("datamodule-render");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("unit2.pas"),
+        "unit Unit2;\n\n{$mode objfpc}{$H+}\n\ninterface\n\nuses\n  Classes, SysUtils;\n\ntype\n  TDataModule2 = class(TDataModule)\n  end;\n\nvar\n  DataModule2: TDataModule2;\n\nimplementation\n\n{$R *.lfm}\n\nend.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("unit2.lfm"),
+        "object DataModule2: TDataModule2\n  OldCreateOrder = False\n  Height = 150\n  HorizontalOffset = 300\n  VerticalOffset = 200\n  Width = 200\nend\n",
+    )
+    .unwrap();
+    let mut app = App::bare(Some(dir.join("unit2.pas")));
+    app.show_form();
+    let png = render(app, false, (1100.0, 640.0), "ui-datamodule");
+    assert!(png.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn renders_the_tests_pane() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut app = editing_app();
+    app.bottom.choose(crate::bottom::BottomTab::Tests, 0.0);
+    app.unit_tests.entries = vec![
+        crate::unit_tests::Entry { id: "TDemoTests.TestPasses".into(), state: crate::unit_tests::State::Passed, failures: Vec::new() },
+        crate::unit_tests::Entry {
+            id: "TDemoTests.TestFails".into(),
+            state: crate::unit_tests::State::Failed,
+            failures: vec![crate::unit_tests::Failure { error: false, class: "EAssertionFailedError".into(), message: "differs expected: <2> but was: <3>".into() }],
+        },
+        crate::unit_tests::Entry {
+            id: "TDemoTests.TestRaises".into(),
+            state: crate::unit_tests::State::Errored,
+            failures: vec![crate::unit_tests::Failure { error: true, class: "Exception".into(), message: "boom".into() }],
+        },
+    ];
+    app.unit_tests.runs = 3;
+    app.unit_tests.failures = 1;
+    app.unit_tests.errors = 1;
+    app.unit_tests.phase = crate::unit_tests::Phase::Finished;
+    app.unit_tests.selected = Some("TDemoTests.TestFails".into());
+    render(app, false, (1100.0, 640.0), "ui-tests-pane");
+}
+
+#[test]
+fn renders_the_editor_with_word_wrap() {
+    let _guard = crate::prefs::tests::APPLY.write().unwrap_or_else(|e| e.into_inner());
+    let mut app = editing_app();
+    app.docs[0].text.push_str(&format!("\n// {}\n", "wrapped words ".repeat(30)));
+    crate::prefs::Prefs { word_wrap: true, ..crate::prefs::Prefs::default() }.apply();
+    let png = render(app, false, (1100.0, 640.0), "ui-editor-wrap");
+    crate::prefs::Prefs::default().apply();
+    assert!(png.exists());
+}
+
+#[test]
+fn renders_the_preferences_window() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut app = editing_app();
+    app.preferences_open = true;
+    render(app, false, (1100.0, 640.0), "ui-preferences");
+}
+
+#[test]
+fn renders_the_preferences_window_dark() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut app = editing_app();
+    app.preferences_open = true;
+    render(app, true, (1100.0, 640.0), "ui-preferences-dark");
+}
+
+#[test]
+fn renders_the_watches_in_a_stopped_program() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut app = debugging_app();
+    app.watch_list = vec!["count * 2".into(), "missing".into()];
+    app.watch_input = "name".into();
+    app.watch_eval = Some((
+        "COUNT".into(),
+        Ok(debugger::Var {
+            name: "COUNT".into(),
+            type_name: "LongInt".into(),
+            value: "42".into(),
+            kind: debugger::Kind::Integer,
+            reference: 0,
+            children: None,
+        }),
+    ));
+    if let Some(p) = app.paused.as_mut() {
+        p.set_scope(
+            debugger::WATCH_SCOPE,
+            vec![
+                debugger::Var {
+                    name: "count * 2".into(),
+                    type_name: "LongInt".into(),
+                    value: "84".into(),
+                    kind: debugger::Kind::Integer,
+                    reference: 0,
+                    children: None,
+                },
+                debugger::Var {
+                    name: "missing".into(),
+                    type_name: String::new(),
+                    value: "use of undeclared identifier 'MISSING'".into(),
+                    kind: debugger::Kind::Other,
+                    reference: 0,
+                    children: None,
+                },
+            ],
+        );
+    }
+    render(app, false, (1100.0, 640.0), "ui-watches");
+}
+
+#[test]
+fn renders_the_project_options_window() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut app = editing_app();
+    app.project_options = project_options::Editor {
+        open: true,
+        mode: pascoda_fpc::Mode::Delphi,
+        defines: "DEBUG\nFAST".into(),
+        units: "lib\nnope".into(),
+        includes: String::new(),
+        switches: "-O2\n-o/tmp/x".into(),
+        output: "bin/notes".into(),
+        default_target: "/Users/me/notes/notes".into(),
+        args: "--in\nreport.txt".into(),
+        workdir: "data".into(),
+        configuration: pascoda_project::Configuration::Release,
+        project_file: Some(project_options::FileView {
+            file_name: "notes.lpi".into(),
+            rows: vec![
+                ("Main program".into(), "notes.lpr".into()),
+                ("Mode".into(), "ObjFPC".into()),
+                ("Unit paths (-Fu)".into(), "frames, ../common".into()),
+                ("Defines (-d)".into(), "FOO".into()),
+                ("Switches".into(), "-O2, -g".into()),
+            ],
+            skipped: vec!["$(LazarusDir)/lcl".into()],
+        }),
+        error: String::new(),
+    };
+    render(app, false, (1100.0, 640.0), "ui-project-options");
+}
+
+#[test]
+fn renders_the_project_options_window_dark() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut app = editing_app();
+    app.project_options = project_options::Editor {
+        open: true,
+        mode: pascoda_fpc::Mode::ObjFpc,
+        defines: "DEBUG".into(),
+        units: "lib".into(),
+        includes: String::new(),
+        switches: "-O2".into(),
+        output: String::new(),
+        default_target: "/Users/me/notes/notes".into(),
+        args: String::new(),
+        workdir: String::new(),
+        configuration: pascoda_project::Configuration::Debug,
+        project_file: None,
+        error: String::new(),
+    };
+    render(app, true, (1100.0, 640.0), "ui-project-options-dark");
+}
+
+#[test]
+fn renders_the_signature_hint_over_a_call() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut app = editing_app();
+    app.docs[0].text = "program p;\nbegin\n  WriteLn(Add(1, 2));\nend.\n".into();
+    let at = app.docs[0].text.find("2)").unwrap();
+    app.signature = Some(shell::SigHint {
+        key: shell::text_key(&app.docs[0].text),
+        at,
+        sig: pascoda_lsp::Signature {
+            label: "Add(a: Integer; b: Integer):Integer".into(),
+            parameters: vec!["a: Integer".into(), "b: Integer".into()],
+            active: Some(1),
+        },
+    });
+    render(app, false, (1100.0, 640.0), "ui-signature-hint");
+}
+
+#[test]
+fn renders_a_go_to_scrolled_to_a_far_line() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut app = editing_app();
+    app.docs[0].text = (1..=120).map(|i| format!("  line {i} := {i};\n")).collect();
+    let offset = app.docs[0].text.find("line 90 ").unwrap();
+    app.reveal = Some(offset..offset + 1);
+    render(app, false, (1100.0, 640.0), "ui-reveal-line-90");
+}
+
+/// A click on the message of a problem (not on its red marker) goes to its line in the editor.
+#[test]
+fn clicking_a_problem_message_goes_to_its_line() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut app = editing_app();
+    app.debug_height = 250.0;
+    app.bottom.tab = bottom::BottomTab::Problems;
+    app.diagnostics = vec![Diagnostic {
+        file: app.docs[0].path.clone(),
+        line: 8,
+        col: 5,
+        severity: Severity::Error,
+        message: "Identifier not found \"Foo\"".into(),
+    }];
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1100.0, 640.0))
+        .with_pixels_per_point(1.0)
+        .build_ui_state(|ui, app: &mut App| app.draw(ui, None), app);
+    theme::apply(&harness.ctx);
+    harness.run_steps(2);
+    harness.get_by_label("Error: Identifier not found \"Foo\"").click();
+    harness.run_steps(6);
+    // The caret is on the problem's line and column (the editor scrolls to it the frame after).
+    assert_eq!(harness.state().cursor_pos, (8, 5), "line 8, column 5");
+}
+
+/// A long search result is cut to one line that fits the row, ending with "...". Short ones are kept.
+#[test]
+fn a_search_result_is_cut_to_one_line_with_dots() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(300.0, 120.0))
+        .with_pixels_per_point(1.0)
+        .build_ui_state(
+            |ui, out: &mut Vec<String>| {
+                let font = egui::TextStyle::Monospace.resolve(ui.style());
+                let long = "   10:5    WriteLn('a very long line of text that will not fit in the sidebar at all');";
+                out.push(shell::fit_one_line(ui, long, &font, 200.0));
+                out.push(shell::fit_one_line(ui, "short", &font, 200.0));
+            },
+            Vec::new(),
+        );
+    harness.run_steps(2);
+    let out = harness.state().clone();
+    assert!(out[0].ends_with("..."), "{:?}", out[0]);
+    assert!(out[0].chars().count() < 80, "cut: {:?}", out[0]);
+    assert_eq!(out[1], "short", "text that fits is kept");
+}
+
+/// The Search tab in the sidebar with a result too long for its row.
+#[test]
+fn renders_the_search_results_on_one_line_each() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut app = editing_app();
+    app.nav_tab = shell::NavTab::Search;
+    app.show_navigator = true;
+    app.project_bar.query = "Write".into();
+    app.project_bar.results = vec![find::FileHits {
+        path: app.docs[0].path.clone(),
+        hits: vec![find::Hit {
+            line: 10,
+            col: 3,
+            text: "  WriteLn('a line of text far longer than the sidebar can show, so it must be cut');\n".into(),
+            range: 0..0,
+        }],
+    }];
+    app.project_bar.searched = true;
+    render(app, false, (1100.0, 640.0), "ui-search-one-line");
+}
+
+#[test]
+fn renders_the_breakpoint_box() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut app = editing_app();
+    let path = app.docs[0].path.clone();
+    app.bp_edit = Some(shell::BpEdit {
+        path,
+        line: 9,
+        condition: "i = 2".into(),
+        hits: "3".into(),
+        error: String::new(),
+    });
+    render(app, false, (1100.0, 640.0), "ui-breakpoint-box");
+}
+
+#[test]
+fn renders_the_breakpoints_tab() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut app = editing_app();
+    app.nav_tab = shell::NavTab::Breakpoints;
+    app.show_navigator = true;
+    let path = app.docs[0].path.clone();
+    app.docs[0].breakpoints.extend([8, 9]);
+    app.docs[0].disabled.insert(9);
+    app.docs[0].stops.insert(9, debugger::Stop { condition: "i = 2".into(), hits: String::new() });
+    render(app, false, (1100.0, 640.0), "ui-breakpoints-tab");
+    let _ = path;
+}
+
+#[test]
+fn renders_the_change_value_box() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut app = editing_app();
+    app.value_edit = Some(shell::ValueEdit {
+        target: "TOTAL".into(),
+        name: "TOTAL".into(),
+        kind: debugger::Kind::Integer,
+        text: "9".into(),
+        error: "A whole number, such as 42".into(),
+    });
+    render(app, false, (1100.0, 640.0), "ui-change-value");
+}
+
+#[test]
+fn renders_the_go_to_line_box() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut app = editing_app();
+    app.go_to.open = true;
+    app.go_to.text = "99".into();
+    app.go_to.error = "Line 99 is not in the file (it has 12 lines)".into();
+    render(app, false, (1100.0, 640.0), "ui-go-to-line");
+}
+
+#[test]
+fn renders_the_find_bar_and_the_project_search() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut app = editing_app();
+    app.find.show(true);
+    app.find.query = "end".into();
+    app.find.with = "stop".into();
+    app.find.current = Some(0);
+    render(app, false, (1100.0, 640.0), "ui-find-bar");
+
+    let mut app = editing_app();
+    app.debug_height = 260.0;
+    app.nav_tab = shell::NavTab::Search;
+    app.show_navigator = true;
+    app.project_bar.query = "Write".into();
+    app.run_project_search();
+    app.project_bar.with = "Print".into();
+    render(app, false, (1100.0, 640.0), "ui-project-search");
+}
+
+#[test]
 fn renders_the_bottom_tabs() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     use bottom::BottomTab::*;
     let diagnostics = || {
         vec![
@@ -200,6 +615,7 @@ fn renders_the_bottom_tabs() {
 
 #[test]
 fn renders_the_ide() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     let a = render(editing_app(), false, (1368.0, 800.0), "ui-light");
     let b = render(debugging_app(), false, (1368.0, 800.0), "ui-light-debug");
     let c = render(debugging_app(), true, (1368.0, 800.0), "ui-dark-debug");
@@ -211,6 +627,7 @@ fn renders_the_ide() {
 /// added in memory only; nothing is saved to the fixture.
 #[test]
 fn renders_the_form_designer() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     let unit = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/gui/unit1.pas");
     let mut app = App::bare(Some(unit));
     app.lsp_ready = true;
@@ -229,6 +646,7 @@ fn renders_the_form_designer() {
 /// the native overlay draws the same), and the inspector's layout and arrange sections.
 #[test]
 fn renders_a_multi_selection() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     let unit = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/gui/unit1.pas");
     let mut app = App::bare(Some(unit));
     app.lsp_ready = true;
@@ -245,6 +663,7 @@ fn renders_a_multi_selection() {
 /// The form's `.lfm` open as text: the toolbar must still offer Code | Form.
 #[test]
 fn renders_the_lfm_tab() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     let lfm = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/gui/unit1.lfm");
     let mut app = App::bare(Some(lfm));
     app.lsp_ready = true;
@@ -256,6 +675,7 @@ fn renders_the_lfm_tab() {
 /// Squiggles, gutter dots and the hover popup, with a build error and a warning in the unit.
 #[test]
 fn renders_diagnostics_and_hover() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     use egui_kittest::kittest::Queryable;
     use hints::{FileMarks, Mark};
     let mut app = editing_app();
@@ -312,6 +732,7 @@ fn renders_diagnostics_and_hover() {
 /// rows without children do nothing.
 #[test]
 fn variable_rows_open_and_close() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     use egui_kittest::kittest::Queryable;
     let mut harness = Harness::builder()
         .with_size(egui::vec2(1368.0, 800.0))
@@ -386,6 +807,7 @@ fn menu_app() -> App {
 
 #[test]
 fn renders_the_menu_editor() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     let a = render(menu_app(), false, (1368.0, 1000.0), "ui-menu-editor");
     let b = render(menu_app(), true, (1368.0, 1000.0), "ui-menu-editor-dark");
     println!("{}\n{}", a.display(), b.display());
@@ -406,6 +828,7 @@ fn renders_the_menu_editor() {
 /// The editor's buttons reach the designer: Add Item, Add Sub-item, Indent, Done.
 #[test]
 fn menu_editor_buttons_edit_the_form() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     use egui_kittest::kittest::Queryable;
     let mut harness = Harness::builder()
         .with_size(egui::vec2(1368.0, 800.0))
@@ -437,6 +860,7 @@ fn menu_editor_buttons_edit_the_form() {
 /// The inspector's anchor-side and border-spacing sections for a label anchored to a button.
 #[test]
 fn renders_anchor_sides_in_the_inspector() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     use designer::geometry::{AnchorSide, Edge, SideRef};
     let unit = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/gui/unit1.pas");
     let mut app = App::bare(Some(unit));
@@ -470,6 +894,7 @@ fn renders_anchor_sides_in_the_inspector() {
 /// The action list opens in the same editor (from the inspector's button) and adds actions.
 #[test]
 fn action_list_editor_adds_actions() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     use egui_kittest::kittest::Queryable;
     let mut app = menu_app();
     app.designer_ui.item_edit = None;
@@ -505,6 +930,7 @@ fn action_list_editor_adds_actions() {
 
 #[test]
 fn renders_build_progress() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     let mut app = editing_app();
     app.building = Some(std::sync::mpsc::channel().1);
     app.build_progress = Some(pascoda_fpc::Progress {
@@ -521,7 +947,8 @@ fn renders_build_progress() {
 /// control selected. A copy of the example is used, so nothing is written to it.
 #[test]
 fn renders_a_large_form_scrolled() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/notes");
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/gui-demo");
     let dir = out_dir().join("notes-scroll");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -608,6 +1035,7 @@ fn assistant_app() -> App {
 
 #[test]
 fn renders_the_assistant_key_card() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     let mut app = editing_app();
     app.assistant.open = true;
     app.assistant.key = assistant::KeyState::Missing;
@@ -617,6 +1045,7 @@ fn renders_the_assistant_key_card() {
 
 #[test]
 fn renders_the_empty_assistant() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     let p = render(
         assistant_app(),
         false,
@@ -667,6 +1096,7 @@ Want me to apply it?";
 
 #[test]
 fn renders_the_assistant_chat() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     let mut app = assistant_app();
     app.assistant.items = chat_items();
     app.assistant
@@ -682,6 +1112,7 @@ fn renders_the_assistant_chat() {
 
 #[test]
 fn renders_a_pending_proposal() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     use assistant::*;
     let mut app = assistant_app();
     let abs = fixture().canonicalize().unwrap();
@@ -737,6 +1168,7 @@ fn renders_a_pending_proposal() {
 /// The panel next to the form designer (native views are not part of the render).
 #[test]
 fn renders_the_assistant_beside_the_form() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     let unit = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/gui/unit1.pas");
     let mut app = App::bare(Some(unit));
     app.lsp_ready = true;
@@ -751,6 +1183,7 @@ fn renders_the_assistant_beside_the_form() {
 /// Typing into the real input field: Enter sends, Shift+Enter adds a line.
 #[test]
 fn enter_sends_and_shift_enter_adds_a_line() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     // The mock answers with one text reply; nothing leaves this machine.
     let (url, _) = assistant::mock_server(vec![assistant::text_reply("Hi there")]);
     let mut app = assistant_app();
@@ -792,6 +1225,7 @@ fn enter_sends_and_shift_enter_adds_a_line() {
 /// Clicking Apply / Reject on a card in the real panel.
 #[test]
 fn card_buttons_apply_and_reject() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     use assistant::*;
     let mut app = assistant_app();
     let abs = app.docs[0].path.clone();
@@ -865,6 +1299,7 @@ fn cli_found(logged_in: Option<bool>) -> assistant::CliState {
 
 #[test]
 fn renders_the_claude_code_status_cards() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     for (cli, name) in [
         (assistant::CliState::Missing, "ui-assistant-cli-missing"),
         (cli_found(Some(false)), "ui-assistant-cli-login"),
@@ -884,6 +1319,7 @@ fn renders_the_claude_code_status_cards() {
 
 #[test]
 fn renders_claude_code_settings_and_chat() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     let mut app = cli_app(cli_found(Some(true)));
     app.assistant.show_settings = true;
     app.assistant.items = chat_items();
@@ -903,6 +1339,7 @@ fn renders_claude_code_settings_and_chat() {
 /// Clicking the provider switch in the real panel.
 #[test]
 fn the_provider_switch_changes_the_card() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     let _keychain = assistant::KEYCHAIN
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -959,6 +1396,7 @@ fn openai_chat_app() -> App {
 
 #[test]
 fn renders_the_openai_key_card() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     let p = render(
         openai_app(),
         false,
@@ -984,6 +1422,7 @@ fn renders_the_openai_key_card() {
 
 #[test]
 fn renders_the_openai_chat_and_settings() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     let mut app = openai_chat_app();
     app.assistant.items = chat_items();
     let p = render(app, false, (1368.0, 1300.0), "ui-assistant-openai-chat");
@@ -1006,7 +1445,8 @@ fn renders_the_openai_chat_and_settings() {
 
 /// Clicking through the OpenAI card: choose the provider, point at a local server, save.
 #[test]
-fn the_openai_card_takes_a_local_endpoint() {
+fn the_openai_card_has_only_the_key() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     let mut app = editing_app();
     app.assistant.open = true;
     app.assistant.key = assistant::KeyState::Missing;
@@ -1020,46 +1460,13 @@ fn the_openai_card_takes_a_local_endpoint() {
     harness.run_steps(2);
     harness.get_by_label("OpenAI API").click();
     harness.run_steps(3);
-    assert_eq!(
-        harness.state().assistant.provider,
-        assistant::Provider::OpenAi
-    );
-    assert!(!harness.state().assistant.ready());
-    // the OpenAI card names no other vendor
-    assert!(harness.query_by_label("OpenAI base URL").is_some());
-    assert!(harness.query_by_label("Check again").is_none());
-    // Point at a local server (no key needed there)
-    let url = harness.get_by_label("OpenAI base URL");
-    url.focus();
-    harness.run_steps(2);
-    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
-    harness.run_steps(1);
-    harness
-        .get_by_label("OpenAI base URL")
-        .type_text("http://localhost:11434/v1");
-    harness.run_steps(2);
-    harness.get_by_label("OpenAI model name").focus();
-    harness.run_steps(2);
-    harness
-        .get_by_label("OpenAI model name")
-        .type_text("llama3.1");
-    harness.run_steps(2);
-    assert_eq!(
-        harness.state().assistant.openai_edit.base_url,
-        "http://localhost:11434/v1"
-    );
-    harness.get_by_label("Save").click();
-    harness.run_steps(3);
-    let a = &harness.state().assistant;
-    assert!(a.ready(), "a local server needs no key");
-    assert_eq!(a.openai.model, "llama3.1");
-    // the settings page stays open (only the gear closes it); after that the chat is up with
-    // the model field and the neutral placeholder
-    assert!(harness.state().assistant.show_settings);
-    harness.state_mut().assistant.show_settings = false;
-    harness.run_steps(2);
-    assert!(harness.query_all_by_label("Model").next().is_some());
-    assert!(harness.query_by_label("Message").is_some());
+    assert_eq!(harness.state().assistant.provider, assistant::Provider::OpenAi);
+    assert!(!harness.state().assistant.ready(), "the key is needed");
+    // The endpoint is fixed and the model is picked under the message box: no other fields here.
+    assert!(harness.query_by_label("OpenAI API key").is_some());
+    assert!(harness.query_by_label("OpenAI base URL").is_none());
+    assert!(harness.query_by_label("OpenAI model name").is_none());
+    assert!(harness.query_by_label("Server address").is_none());
 }
 
 // ---- "Allow edits this session" and "save first" ----------------------------------------------
@@ -1100,6 +1507,7 @@ fn edit_card(
 
 #[test]
 fn renders_auto_mode_with_applied_cards_and_revert() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     use assistant::*;
     let mut app = assistant_app();
     app.assistant.set_auto_edits(true);
@@ -1157,6 +1565,7 @@ fn renders_auto_mode_with_applied_cards_and_revert() {
 
 #[test]
 fn renders_the_save_first_card_for_claude_code() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     use assistant::*;
     let mut app = cli_app(cli_found(Some(true)));
     app.assistant.backend_writes = true;
@@ -1179,6 +1588,7 @@ fn renders_the_save_first_card_for_claude_code() {
 /// fixture itself is never written.
 #[test]
 fn the_edit_switch_and_the_save_first_button_work_with_clicks() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     let dir = crate::target_tmp().join("render-save-first");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -1229,6 +1639,7 @@ fn the_edit_switch_and_the_save_first_button_work_with_clicks() {
 /// terminal, Ctrl+C interrupts, Cmd+K clears, and the editor's text is untouched.
 #[test]
 fn the_terminal_tab_takes_the_keyboard() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     use egui::{Event, Key, Modifiers};
     let mut app = editing_app();
     app.bottom.tab = bottom::BottomTab::Terminal;
@@ -1323,6 +1734,7 @@ fn the_bottom_pane_switches_by_itself_unless_the_user_just_chose() {
 
 #[test]
 fn renders_the_context_chips_and_what_was_sent() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     use assistant::*;
     // A scratch copy of the notes example; the opened unit has an unsaved edit and a second
     // tab is open, so every chip shows.
@@ -1375,6 +1787,7 @@ fn renders_the_context_chips_and_what_was_sent() {
 /// started again in the new folder; one in use stays and offers a `cd` button.
 #[test]
 fn the_terminal_follows_the_project_folder() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     let a = crate::target_tmp().join("term-follow-a");
     let b = crate::target_tmp().join("term-follow-b");
     std::fs::create_dir_all(&a).unwrap();
@@ -1445,6 +1858,7 @@ fn the_terminal_follows_the_project_folder() {
 
 #[test]
 fn the_terminal_wheel_scrolls_the_history() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     use egui::{Event, MouseWheelUnit};
     let mut app = editing_app();
     app.bottom.tab = bottom::BottomTab::Terminal;
@@ -1500,6 +1914,7 @@ fn the_terminal_wheel_scrolls_the_history() {
 
 #[test]
 fn renders_and_drives_the_export_dialog() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     use pascoda_project::ExportSettings;
     for dark in [false, true] {
         let mut app = editing_app();
@@ -1571,6 +1986,7 @@ fn renders_and_drives_the_export_dialog() {
 
 #[test]
 fn a_changed_tab_is_red_and_closing_it_asks() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     for dark in [false, true] {
         let mut app = editing_app();
         app.docs[0].text.push_str("// typed, not saved\n");
@@ -1613,6 +2029,7 @@ fn a_changed_tab_is_red_and_closing_it_asks() {
 /// mouse report, not as arrow keys; a plain shell keeps the IDE's own scrolling.
 #[test]
 fn the_wheel_reaches_a_program_that_asked_for_the_mouse() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     use egui::Event;
     let mut app = editing_app();
     app.bottom.tab = bottom::BottomTab::Terminal;
@@ -1661,6 +2078,7 @@ fn the_wheel_reaches_a_program_that_asked_for_the_mouse() {
 /// The toolbar's activity bar during an export: the same bar as a build, labelled with the step.
 #[test]
 fn the_toolbar_shows_export_progress() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     for dark in [false, true] {
         let mut app = editing_app();
         let (_tx, rx) = std::sync::mpsc::channel();
@@ -1695,6 +2113,7 @@ fn the_toolbar_shows_export_progress() {
 /// The inline name field under the project, and the delete prompt above the file list.
 #[test]
 fn renders_the_project_tree_actions() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     let root = std::env::temp_dir().join(format!("pascoda-tree-render-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("sub")).unwrap();
@@ -1715,6 +2134,7 @@ fn renders_the_project_tree_actions() {
 /// The name field that replaces a row while it is renamed.
 #[test]
 fn renders_the_rename_field() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     let root = std::env::temp_dir().join(format!("pascoda-rename-render-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("sub")).unwrap();
@@ -1726,3 +2146,180 @@ fn renders_the_rename_field() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+
+/// Tab in the editor inserts spaces up to the next tab stop and keeps the focus there.
+#[test]
+fn tab_in_the_editor_inserts_spaces_to_the_next_stop() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    use egui::text::{CCursor, CCursorRange};
+    use egui::{Event, Key, Modifiers};
+    let mut app = editing_app();
+    app.docs[0].text = "ab".into();
+    let id = app.docs[0].editor_id;
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(900.0, 640.0))
+        .with_pixels_per_point(1.0)
+        .build_ui_state(|ui, app: &mut App| app.draw(ui, None), app);
+    theme::apply(&harness.ctx);
+    harness.run_steps(2);
+    harness.ctx.memory_mut(|m| m.request_focus(id));
+    let mut state = egui::TextEdit::load_state(&harness.ctx, id).unwrap_or_default();
+    state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(2))));
+    state.store(&harness.ctx, id);
+    harness.run_steps(2);
+    assert!(harness.ctx.memory(|m| m.has_focus(id)), "the editor has the focus");
+
+    let tab = |h: &Harness<'_, App>| {
+        h.event_modifiers(
+            Event::Key {
+                key: Key::Tab,
+                physical_key: Some(Key::Tab),
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            },
+            Modifiers::NONE,
+        );
+    };
+    tab(&harness);
+    harness.run_steps(3);
+    // Column 2 with 4-wide tab stops: two spaces.
+    assert_eq!(harness.state().docs[0].text, "ab  ");
+    assert!(harness.ctx.memory(|m| m.has_focus(id)), "Tab keeps the focus in the editor");
+}
+
+/// Regression: a palette page row wider than the free area (the db demo's many pages, or a long
+/// "unit not updated" note) widened the designer's Ui, so the canvas reached under the inspector:
+/// the form sat too far right and, in the real window, the native views covered the inspector.
+#[test]
+fn a_wide_palette_row_keeps_the_canvas_beside_the_inspector() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/db-demo");
+    let dir = out_dir().join("db-demo-canvas");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for e in std::fs::read_dir(&src).unwrap().flatten() {
+        if e.path().is_file() {
+            std::fs::copy(e.path(), dir.join(e.file_name())).unwrap();
+        }
+    }
+    let mut app = App::bare(Some(dir.join("unit1.pas")));
+    app.lsp_ready = true;
+    app.show_form();
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(980.0, 800.0))
+        .with_pixels_per_point(1.0)
+        .with_context_setup(theme::apply)
+        .build_ui_state(|ui, app: &mut App| app.draw(ui, None), app);
+    harness.run_steps(3);
+    let before = harness.state().designer_ui.view.expect("the canvas was laid out");
+    // A row far wider than the window; then select a tray component and the grid, as in the bug.
+    harness.state_mut().designers[0].sync_error = Some("x".repeat(400));
+    let names = ["DBGrid1", "SQLConnector1", "StatusLabel"];
+    for name in names {
+        let i = harness.state().designers[0]
+            .doc
+            .root()
+            .children
+            .iter()
+            .position(|c| c.name == name)
+            .unwrap();
+        harness.state_mut().designers[0].select(vec![i]);
+        harness.run_steps(3);
+        let view = harness.state().designer_ui.view.unwrap();
+        assert!(
+            view.area.right() <= before.area.right() + 0.5,
+            "{name}: the canvas {:?} reaches past where it was {:?}",
+            view.area,
+            before.area
+        );
+        assert!(
+            view.client().left() >= view.area.left(),
+            "{name}: the form starts inside the canvas"
+        );
+    }
+    harness
+        .render()
+        .expect("offscreen render")
+        .save(out_dir().join("ui-form-wide-palette-row.png"))
+        .unwrap();
+}
+
+/// Selecting a form file in the tree shows the form and its properties pane.
+#[test]
+fn renders_the_inspector_after_selecting_a_form_file() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/gui");
+    let mut app = App::bare(Some(root.join("unit1.pas")));
+    app.lsp_ready = true;
+    app.select_in_tree(root.join("unit1.lfm"));
+    println!("form_view={} active={:?} designers={}", app.form_view, app.docs.get(app.active).map(|d| d.path.clone()), app.designers.len());
+    let a = render(app, false, (1200.0, 800.0), "ui-tree-form-selected-1200");
+    println!("{}", a.display());
+}
+
+/// The OpenAI Compatible settings page for Ollama: the server's address, the optional key and the
+/// privacy note.
+#[test]
+fn renders_the_ollama_settings() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut app = editing_app();
+    app.assistant.open = true;
+    app.assistant.provider = assistant::Provider::Ollama;
+    app.assistant.compat = pascoda_ai::openai::OpenAiSettings {
+        base_url: "http://127.0.0.1:11434/v1".into(),
+        model: "qwen3:4b".into(),
+    };
+    app.assistant.compat_edit = app.assistant.compat.clone();
+    app.assistant.compat_key_state = assistant::KeyState::Missing; // never read the real Keychain
+    app.assistant.show_settings = true;
+    let a = render(app, false, (1368.0, 900.0), "ui-assistant-ollama-settings");
+    println!("{}", a.display());
+}
+
+/// The "Some tools are missing" window: what is missing, and the button types the install command
+/// at the Terminal's prompt without running it.
+#[test]
+fn the_vendor_window_types_its_command_in_the_terminal_without_running_it() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    use pascoda_fpc::vendor::Part;
+    let mut app = editing_app();
+    app.vendor_dialog = Some(vec![Part::Fpc]);
+    // A shell with a known prompt; started in the project folder, so the pane keeps it.
+    let mut cmd = portable_pty::CommandBuilder::new("/bin/sh");
+    cmd.env("PS1", "$ ");
+    app.bottom.terminal = Some(crate::terminal::Terminal::spawn(cmd, 10, 80, || {}).expect("spawn"));
+    app.bottom.terminal_root = Some(app.root.clone());
+
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1200.0, 800.0))
+        .with_pixels_per_point(1.0)
+        .with_context_setup(theme::apply)
+        .build_ui_state(|ui, app: &mut App| app.draw(ui, None), app);
+    h.run_steps(3);
+    // The window says what is missing and what it is for.
+    assert!(h.query_by_label_contains("Free Pascal compiler").is_some());
+    assert!(h.query_by_label("Install in Terminal").is_some());
+    let png = h.render().expect("render");
+    png.save(out_dir().join("ui-vendor-dialog.png")).unwrap();
+
+    h.get_by_label("Install in Terminal").click();
+    h.run_steps(3);
+    assert!(h.state().vendor_dialog.is_none(), "the window closes");
+    assert_eq!(h.state().bottom.tab, bottom::BottomTab::Terminal);
+    let screen = |h: &Harness<'_, App>| h.state().bottom.terminal.as_ref().unwrap().screen_text();
+    for _ in 0..200 {
+        h.run_steps(1);
+        if screen(&h).contains("brew install fpc") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let text = screen(&h);
+    assert!(text.contains("$ brew install fpc"), "typed at the prompt:\n{text}");
+    // Not run: no second prompt, no output.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    h.run_steps(2);
+    let text = screen(&h);
+    assert_eq!(text.matches("$ ").count(), 1, "the command waits for Enter:\n{text}");
+}

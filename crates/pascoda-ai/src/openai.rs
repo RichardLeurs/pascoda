@@ -74,9 +74,33 @@ impl OpenAiSettings {
         Some(Path::new(&home).join("Library/Application Support/Pascoda/openai-settings"))
     }
 
+    /// `~/Library/Application Support/Pascoda/openai-compatible-settings`: the server of the
+    /// "OpenAI Compatible" provider, kept apart from the OpenAI one.
+    pub fn server_file() -> Option<PathBuf> {
+        let home = std::env::var_os("HOME")?;
+        Some(Path::new(&home).join("Library/Application Support/Pascoda/openai-compatible-settings"))
+    }
+
     /// The saved settings; defaults for a missing or unreadable file.
     pub fn load(file: &Path) -> Self {
-        let mut s = OpenAiSettings::default();
+        Self::read(file, OpenAiSettings::default())
+    }
+
+    /// The saved server of an OpenAI-compatible provider. Unlike [`OpenAiSettings::load`] there is
+    /// no default address: the user has to name a server.
+    pub fn load_server(file: &Path) -> Self {
+        Self::read(file, Self::no_server())
+    }
+
+    /// No server named yet: an empty address and model.
+    pub fn no_server() -> Self {
+        OpenAiSettings {
+            base_url: String::new(),
+            model: String::new(),
+        }
+    }
+
+    fn read(file: &Path, mut s: OpenAiSettings) -> Self {
         let Ok(text) = std::fs::read_to_string(file) else {
             return s;
         };

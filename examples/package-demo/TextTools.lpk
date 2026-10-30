@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CONFIG>
+  <Package Version="5">
+    <Name Value="TextTools"/>
+    <Files Count="1">
+      <Item1>
+        <FileName Value="TextTools.pas"/>
+        <Type Value="Unit"/>
+        <UnitName Value="TextTools"/>
+      </Item1>
+    </Files>
+    <RequiredPkgs Count="0"/>
+    <CompilerOptions>
+      <SearchPaths>
+        <IncludeFiles Value="."/>
+        <OtherUnitFiles Value="."/>
+      </SearchPaths>
+    </CompilerOptions>
+  </Package>
+</CONFIG>

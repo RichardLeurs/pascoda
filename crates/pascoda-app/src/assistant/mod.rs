@@ -19,7 +19,7 @@ use pascoda_ai::{
     Keystore, OpenAi, OpenAiConfig, OpenAiSettings, Proposal, Sandbox, Usage,
 };
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -299,22 +299,57 @@ pub enum Provider {
     ClaudeCode,
     /// The user's own installed `codex` (OpenAI Codex CLI), driven through its app server.
     Codex,
+    /// oMLX on this Mac (its OpenAI-compatible server).
+    OMlx,
+    /// Ollama on this Mac.
+    Ollama,
+    /// Open WebUI (its OpenAI-compatible API, which asks for a key).
+    OpenWebUi,
+    /// Any other server that speaks the OpenAI Chat Completions API (LM Studio, a LAN box).
+    OpenAiCompatible,
 }
 
 impl Provider {
-    /// In the order of the chooser: the Claude providers together, then the OpenAI ones.
-    pub const ALL: [Provider; 4] = [
+    /// In the order of the chooser: the Claude providers together, then the OpenAI ones, then
+    /// the servers that only speak the OpenAI API.
+    pub const ALL: [Provider; 8] = [
         Provider::Api,
         Provider::ClaudeCode,
         Provider::OpenAi,
         Provider::Codex,
+        Provider::OMlx,
+        Provider::Ollama,
+        Provider::OpenWebUi,
+        Provider::OpenAiCompatible,
     ];
+
+    /// Whether this is a server that speaks the OpenAI API (the "Other servers" group). Such a server
+    /// has its own address, model and optional key.
+    pub fn is_compatible(self) -> bool {
+        matches!(
+            self,
+            Provider::OMlx | Provider::Ollama | Provider::OpenWebUi | Provider::OpenAiCompatible
+        )
+    }
+
+    /// The address a server of this kind usually has on this Mac; empty for a server of your own.
+    pub fn preset_url(self) -> &'static str {
+        match self {
+            Provider::OMlx => "http://127.0.0.1:8000/v1",
+            Provider::Ollama => "http://127.0.0.1:11434/v1",
+            Provider::OpenWebUi => "http://127.0.0.1:8080/api/v1",
+            _ => "",
+        }
+    }
 
     /// Which company's agents these are; the chooser groups by it.
     pub fn vendor(self) -> &'static str {
         match self {
             Provider::Api | Provider::ClaudeCode => "Claude",
             Provider::OpenAi | Provider::Codex => "OpenAI",
+            Provider::OMlx | Provider::Ollama | Provider::OpenWebUi | Provider::OpenAiCompatible => {
+                "Other servers"
+            }
         }
     }
 
@@ -324,6 +359,10 @@ impl Provider {
             Provider::OpenAi => "OpenAI API",
             Provider::ClaudeCode => "Claude Code CLI",
             Provider::Codex => "Codex CLI",
+            Provider::OMlx => "oMLX",
+            Provider::Ollama => "Ollama",
+            Provider::OpenWebUi => "Open WebUI",
+            Provider::OpenAiCompatible => "OpenAI Compatible",
         }
     }
 
@@ -334,6 +373,10 @@ impl Provider {
             Provider::OpenAi => "OpenAI API",
             Provider::ClaudeCode => "Claude Code CLI",
             Provider::Codex => "Codex CLI",
+            Provider::OMlx => "oMLX",
+            Provider::Ollama => "Ollama",
+            Provider::OpenWebUi => "Open WebUI",
+            Provider::OpenAiCompatible => "OpenAI Compatible",
         }
     }
 
@@ -344,6 +387,10 @@ impl Provider {
             Provider::OpenAi => "openai",
             Provider::ClaudeCode => "claude-code",
             Provider::Codex => "codex",
+            Provider::OMlx => "omlx",
+            Provider::Ollama => "ollama",
+            Provider::OpenWebUi => "open-webui",
+            Provider::OpenAiCompatible => "openai-compatible",
         }
     }
 
@@ -367,6 +414,44 @@ impl Provider {
         }
         let _ = std::fs::write(file, self.token());
     }
+}
+
+/// The saved servers of the OpenAI Compatible providers, by provider token. A file written before
+/// there were several servers holds one server, which is the generic one.
+fn read_compat_file(file: &Path) -> BTreeMap<String, OpenAiSettings> {
+    let mut out = BTreeMap::new();
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return out;
+    };
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) else {
+        return out;
+    };
+    let server = |v: &Value| OpenAiSettings {
+        base_url: v.get("base_url").and_then(Value::as_str).unwrap_or_default().trim().to_string(),
+        model: v.get("model").and_then(Value::as_str).unwrap_or_default().trim().to_string(),
+    };
+    if map.contains_key("base_url") {
+        out.insert(Provider::OpenAiCompatible.token().to_string(), server(&Value::Object(map)));
+    } else {
+        for (token, v) in &map {
+            out.insert(token.clone(), server(v));
+        }
+    }
+    out
+}
+
+fn write_compat_file(file: &Path, servers: &BTreeMap<String, OpenAiSettings>) -> std::io::Result<()> {
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let map: serde_json::Map<String, Value> = servers
+        .iter()
+        .map(|(token, s)| (token.clone(), serde_json::json!({ "base_url": s.base_url, "model": s.model })))
+        .collect();
+    std::fs::write(
+        file,
+        serde_json::to_string_pretty(&Value::Object(map)).unwrap_or_default() + "\n",
+    )
 }
 
 /// What is known about the installed Claude Code CLI.
@@ -431,6 +516,9 @@ pub struct Assistant {
     ctx: Option<egui::Context>,
     /// Another API address (tests use a local server).
     pub base_url: Option<String>,
+    /// Another OpenAI API address (tests use a local server); the OpenAI provider uses the official
+    /// one otherwise.
+    pub openai_base_url: Option<String>,
     api_key: Option<ApiKey>,
     keystore: Keystore,
     /// The OpenAI provider: base URL and model in use (saved in `openai_file`), the text
@@ -442,6 +530,19 @@ pub struct Assistant {
     pub openai_file: Option<PathBuf>,
     openai_key: Option<ApiKey>,
     openai_keystore: Keystore,
+    /// The OpenAI Compatible servers: the address and model of the server in use, and the text
+    /// field of its card. The key of the server in use is in `compat_key`.
+    pub compat: OpenAiSettings,
+    pub compat_edit: OpenAiSettings,
+    /// Every server's address and model by provider token (never a key), saved in `compat_file`.
+    pub compat_saved: BTreeMap<String, OpenAiSettings>,
+    /// Where `compat_saved` is remembered; `None` = not remembered (tests).
+    pub compat_file: Option<PathBuf>,
+    /// The key of the server in use, kept in the Keychain under the server's own account.
+    compat_key: Option<ApiKey>,
+    pub compat_key_state: KeyState,
+    /// The Keychain service of the server keys (tests use a throwaway one).
+    pub compat_service: String,
     /// The project overview: index, cache.
     pub project: overview::Project,
     run: Option<Run>,
@@ -485,12 +586,20 @@ impl Default for Assistant {
             backend_writes: false,
             ctx: None,
             base_url: None,
+            openai_base_url: None,
             api_key: None,
             keystore: Keystore::app(),
             openai: OpenAiSettings::default(),
             openai_edit: OpenAiSettings::default(),
             openai_key_state: KeyState::Unchecked,
             openai_file: None,
+            compat: OpenAiSettings::no_server(),
+            compat_edit: OpenAiSettings::no_server(),
+            compat_saved: BTreeMap::new(),
+            compat_file: None,
+            compat_key: None,
+            compat_key_state: KeyState::Unchecked,
+            compat_service: "pascoda".to_string(),
             openai_key: None,
             openai_keystore: Keystore::openai(),
             project: overview::Project::default(),
@@ -521,11 +630,15 @@ impl Assistant {
         match self.provider {
             Provider::Api => self.api_key.is_some(),
             // A local server (Ollama, LM Studio) may work without a key.
-            Provider::OpenAi => self.openai_key.is_some() || !self.openai.needs_key(),
+            // The official endpoint always needs the key (a server of your own is the compatible provider).
+            Provider::OpenAi => self.openai_key.is_some(),
             Provider::ClaudeCode => matches!(&self.cli,
                 CliState::Found(s) if s.logged_in != Some(false)),
             Provider::Codex => matches!(&self.codex,
                 CliState::Found(s) if s.logged_in != Some(false)),
+            // Only an address is needed; whether the server answers shows on the first message.
+            // The key is optional: Ollama and oMLX need none.
+            Provider::OMlx | Provider::Ollama | Provider::OpenWebUi | Provider::OpenAiCompatible => !self.compat.base_url.trim().is_empty(),
         }
     }
 
@@ -534,11 +647,10 @@ impl Assistant {
     pub fn settled(&self) -> bool {
         match self.provider {
             Provider::Api => self.key != KeyState::Unchecked,
-            Provider::OpenAi => {
-                !self.openai.needs_key() || self.openai_key_state != KeyState::Unchecked
-            }
+            Provider::OpenAi => self.openai_key_state != KeyState::Unchecked,
             Provider::ClaudeCode => !matches!(self.cli, CliState::Unchecked | CliState::Checking),
             Provider::Codex => !matches!(self.codex, CliState::Unchecked | CliState::Checking),
+            Provider::OMlx | Provider::Ollama | Provider::OpenWebUi | Provider::OpenAiCompatible => true,
         }
     }
 
@@ -555,15 +667,15 @@ impl Assistant {
         self.key_message = None;
         self.key_input.clear();
         self.openai_edit = self.openai.clone();
+        if p.is_compatible() {
+            self.select_compat(p);
+        }
         if let Some(f) = &self.provider_file {
             p.save(f);
         }
-        if !self.items.is_empty() {
-            self.items.push(Item::Note(format!(
-                "Switched to {}: the conversation starts over.",
-                p.label()
-            )));
-        }
+        // Another agent starts with an empty chat: the messages shown are the old agent's.
+        self.items.clear();
+        self.usage = Usage::default();
         if p == Provider::Api && self.key == KeyState::Unchecked {
             self.refresh_key();
         }
@@ -576,6 +688,7 @@ impl Assistant {
     pub fn current_model(&self) -> &str {
         match self.provider {
             Provider::OpenAi => &self.openai.model,
+            Provider::OMlx | Provider::Ollama | Provider::OpenWebUi | Provider::OpenAiCompatible => &self.compat.model,
             Provider::Codex => &self.codex_model,
             _ => &self.model,
         }
@@ -610,19 +723,92 @@ impl Assistant {
         self.set_openai_key(Some(ApiKey::new(key)), KeyState::Keychain);
     }
 
-    /// Makes the text fields of the OpenAI card the settings in use, and remembers them.
+    /// Makes the address of the OpenAI Compatible card the server in use, and remembers it. The address
+    /// is trimmed; an empty one leaves the provider not ready.
+    pub fn commit_compat(&mut self) {
+        // The model is edited under the message box, so the card keeps the model in use.
+        let edit = OpenAiSettings {
+            base_url: self.compat_edit.base_url.trim().to_string(),
+            model: self.compat.model.clone(),
+        };
+        if edit != self.compat {
+            self.agent = None; // the next message builds a client for the new server
+        }
+        self.compat = edit.clone();
+        self.compat_edit = edit;
+        self.persist_compat();
+    }
+
+    /// Makes `p` (an OpenAI Compatible provider) the server in use: its saved address and model, or its
+    /// usual address when none is saved yet. Its key is looked up in the Keychain.
+    fn select_compat(&mut self, p: Provider) {
+        self.compat = self
+            .compat_saved
+            .get(p.token())
+            .cloned()
+            .unwrap_or_else(|| OpenAiSettings {
+                base_url: p.preset_url().into(),
+                model: String::new(),
+            });
+        self.compat_edit = self.compat.clone();
+        self.refresh_compat_key();
+    }
+
+    /// The Keychain entry of the server in use: one account per provider.
+    fn compat_keystore(&self) -> Keystore {
+        Keystore::new(
+            &self.compat_service,
+            &format!("openai-compatible-{}", self.provider.token()),
+        )
+    }
+
+    /// Looks for the key of the server in use in the Keychain. Only called while a compatible provider
+    /// is chosen.
+    pub fn refresh_compat_key(&mut self) {
+        match self.compat_keystore().load() {
+            Ok(Some(k)) => self.set_compat_key(Some(k), KeyState::Keychain),
+            _ => self.set_compat_key(None, KeyState::Missing),
+        }
+    }
+
+    fn set_compat_key(&mut self, key: Option<ApiKey>, state: KeyState) {
+        self.compat_key = key;
+        self.compat_key_state = state;
+        self.agent = None;
+    }
+
+    /// The key field of the server card: saved to the Keychain under this server's account.
+    pub fn save_compat_key(&mut self) {
+        let typed = ApiKey::new(std::mem::take(&mut self.key_input));
+        if typed.is_empty() {
+            self.key_message = Some("Paste the key first.".into());
+            return;
+        }
+        match self.compat_keystore().save(&typed) {
+            Ok(()) => {
+                self.key_message = None;
+                self.set_compat_key(Some(typed), KeyState::Keychain);
+            }
+            Err(e) => self.key_message = Some(format!("The Keychain refused the key: {e}")),
+        }
+    }
+
+    /// Remove key of the server in use: its Keychain entry goes.
+    pub fn remove_compat_key(&mut self) {
+        if let Err(e) = self.compat_keystore().delete() {
+            self.key_message = Some(format!("Could not remove the key: {e}"));
+            return;
+        }
+        self.key_message = None;
+        self.set_compat_key(None, KeyState::Missing);
+    }
+
+    /// Keeps the model of the OpenAI provider and remembers it. The endpoint is always the official
+    /// one, so only the model is stored.
     pub fn commit_openai(&mut self) {
         let edit = OpenAiSettings {
-            base_url: self.openai_edit.base_url.trim().to_string(),
+            base_url: OpenAiSettings::default().base_url,
             model: self.openai_edit.model.trim().to_string(),
-        };
-        let edit = OpenAiSettings {
-            base_url: if edit.base_url.is_empty() {
-                OpenAiSettings::default().base_url
-            } else {
-                edit.base_url
-            },
-            ..edit
         };
         if edit != self.openai {
             self.agent = None; // the next message builds a client for the new endpoint
@@ -686,6 +872,16 @@ impl Assistant {
     pub fn codex_model_path() -> Option<PathBuf> {
         let home = std::env::var_os("HOME")?;
         Some(Path::new(&home).join("Library/Application Support/Pascoda/codex-model"))
+    }
+
+    /// Writes every saved server's address and model (never a key) when a file is set. The server in
+    /// use is saved with its current values.
+    pub fn persist_compat(&mut self) {
+        self.compat_saved
+            .insert(self.provider.token().to_string(), self.compat.clone());
+        if let Some(f) = &self.compat_file {
+            let _ = write_compat_file(f, &self.compat_saved);
+        }
     }
 
     pub fn persist_codex_model(&self) {
@@ -827,7 +1023,7 @@ impl Assistant {
         let typed = ApiKey::new(std::mem::take(&mut self.key_input));
         self.commit_openai();
         if typed.is_empty() {
-            if self.openai_key.is_none() && self.openai.needs_key() {
+            if self.openai_key.is_none() {
                 self.key_message = Some("Paste your OpenAI API key first.".into());
             } else {
                 self.key_message = None;
@@ -961,8 +1157,13 @@ impl Assistant {
                         self.openai_key = None;
                         self.openai_key_state = KeyState::Missing;
                         self.openai_edit = self.openai.clone();
-                        // A local server that wants a key: open the settings to type it.
-                        self.show_settings = self.ready();
+                        // The key was rejected: the key card comes back to type another.
+                        self.show_settings = true;
+                    } else if self.provider.is_compatible() {
+                        self.compat_key = None;
+                        self.compat_key_state = KeyState::Missing;
+                        self.agent = None;
+                        self.show_settings = true;
                     } else if self.provider == Provider::Api {
                         self.api_key = None;
                         self.key = KeyState::Missing;
@@ -1356,7 +1557,12 @@ impl App {
             self.assistant.model = pascoda_ai::DEFAULT_MODEL.to_string();
         }
         self.assistant.remember_model();
-        if self.assistant.provider == Provider::OpenAi && self.assistant.openai.model.is_empty() {
+        let model_missing = match self.assistant.provider {
+            Provider::OpenAi => self.assistant.openai.model.is_empty(),
+            Provider::OMlx | Provider::Ollama | Provider::OpenWebUi | Provider::OpenAiCompatible => self.assistant.compat.model.is_empty(),
+            _ => false,
+        };
+        if model_missing {
             self.assistant.items.push(Item::Error(
                 "No model is set. Type the model name your endpoint serves into the Model field below the message box, then send again.".into(),
             ));
@@ -1417,11 +1623,16 @@ impl App {
                     Box::new(Agent::new(Client::new(cfg), Box::new(host), sandbox))
                 }
                 Provider::OpenAi => {
-                    let cfg = OpenAiConfig::new(
-                        a.openai_key.clone(),
-                        &a.openai.base_url,
-                        &a.openai.model,
-                    );
+                    let base = a
+                        .openai_base_url
+                        .as_deref()
+                        .unwrap_or(pascoda_ai::openai::DEFAULT_OPENAI_BASE_URL);
+                    let cfg = OpenAiConfig::new(a.openai_key.clone(), base, &a.openai.model);
+                    Box::new(OpenAi::new(cfg, Box::new(host), sandbox))
+                }
+                Provider::OMlx | Provider::Ollama | Provider::OpenWebUi | Provider::OpenAiCompatible => {
+                    // The key is optional: a server on this Mac may need none.
+                    let cfg = OpenAiConfig::new(a.compat_key.clone(), &a.compat.base_url, &a.compat.model);
                     Box::new(OpenAi::new(cfg, Box::new(host), sandbox))
                 }
                 Provider::Codex => {
@@ -2163,6 +2374,18 @@ impl App {
                 self.assistant.openai = OpenAiSettings::load(f);
                 self.assistant.openai_edit = self.assistant.openai.clone();
             }
+        }
+        if self.assistant.open && self.assistant.compat_file.is_none() {
+            self.assistant.compat_file = OpenAiSettings::server_file();
+            if let Some(f) = &self.assistant.compat_file {
+                self.assistant.compat_saved = read_compat_file(f);
+            }
+        }
+        if self.assistant.open
+            && self.assistant.provider.is_compatible()
+            && self.assistant.compat_key_state == KeyState::Unchecked
+        {
+            self.assistant.select_compat(self.assistant.provider);
         }
         if self.assistant.open
             && self.assistant.provider == Provider::Api

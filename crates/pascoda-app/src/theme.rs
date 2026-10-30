@@ -10,6 +10,20 @@ use std::sync::Arc;
 const SF_PRO: &str = "/System/Library/Fonts/SFNS.ttf";
 const SF_MONO: &str = "/System/Library/Fonts/SFNSMono.ttf";
 const MENLO: &str = "/System/Library/Fonts/Menlo.ttc";
+const COURIER: &str = "/System/Library/Fonts/Courier.ttc";
+
+/// The fonts the editor can use: the name shown in Preferences and the file. A font whose file is
+/// missing is left out of the choice's family, so the editor falls back to egui's monospace.
+pub const EDITOR_FONTS: [(&str, &str); 3] = [("SF Mono", SF_MONO), ("Menlo", MENLO), ("Courier", COURIER)];
+
+/// The font family the editor draws with for a choice in `EDITOR_FONTS`. The first choice is the
+/// monospace family itself, so a context without these fonts (tests) still draws the editor.
+pub fn editor_family(index: usize) -> FontFamily {
+    match index {
+        0 => FontFamily::Monospace,
+        _ => FontFamily::Name(EDITOR_FONTS[index.min(EDITOR_FONTS.len() - 1)].0.into()),
+    }
+}
 
 /// Which colour scheme the IDE uses: follow macOS, or force one. Remembered between runs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -115,6 +129,16 @@ fn install_fonts(ctx: &egui::Context) {
     add("SF Pro", SF_PRO, FontFamily::Proportional);
     if !add("SF Mono", SF_MONO, FontFamily::Monospace) {
         add("Menlo", MENLO, FontFamily::Monospace);
+    }
+    // Each editor font is its own family: the chosen one first, then the monospace fonts above it.
+    let monospace = fonts.families.get(&FontFamily::Monospace).cloned().unwrap_or_default();
+    for (name, path) in EDITOR_FONTS {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts.font_data.insert(name.to_string(), Arc::new(FontData::from_owned(bytes)));
+            let mut family = vec![name.to_string()];
+            family.extend(monospace.iter().filter(|n| n.as_str() != name).cloned());
+            fonts.families.insert(FontFamily::Name(name.into()), family);
+        }
     }
     ctx.set_fonts(fonts);
 }

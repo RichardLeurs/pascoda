@@ -66,13 +66,19 @@ impl Bounds {
 pub fn default_size(class: &str) -> (i64, i64) {
     match class.to_ascii_lowercase().as_str() {
         "tbutton" => (75, 25),
-        "tlabel" => (36, 17),
-        "tedit" => (80, 23),
-        "tcheckbox" | "tradiobutton" => (90, 20),
-        "tpanel" | "tgroupbox" | "tradiogroup" | "tcheckgroup" => (185, 105),
-        "tmemo" => (185, 89),
-        "tcombobox" | "tlabelededit" | "tmaskedit" => (100, 23),
-        "tlistbox" => (100, 50),
+        "tdbgrid" => (200, 120),
+        // DBCtrls: TDBNavigator's own size; the others take their base class's.
+        "tdbnavigator" => (241, 25),
+        "tlabel" | "tdbtext" => (36, 17),
+        "tedit" | "tdbedit" => (80, 23),
+        "tcheckbox" | "tradiobutton" | "tdbcheckbox" => (90, 20),
+        "tpanel" | "tgroupbox" | "tradiogroup" | "tcheckgroup" | "tdbradiogroup" => (185, 105),
+        "tmemo" | "tdbmemo" => (185, 89),
+        "tcombobox" | "tlabelededit" | "tmaskedit" | "tdbcombobox" | "tdblookupcombobox" => {
+            (100, 23)
+        }
+        "tlistbox" | "tdblistbox" | "tdblookuplistbox" => (100, 50),
+        "tdbimage" => (105, 105),
         "ttogglebox" | "tbitbtn" => (75, 25),
         "tspeedbutton" => (23, 22),
         "tscrollbar" => (100, 17),

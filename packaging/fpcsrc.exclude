@@ -1,5 +1,7 @@
 # rsync excludes for the bundled FPC sources (see packaging/bundle.sh). The language server only
 # needs Pascal sources for aarch64-darwin: no other targets, no data files, docs or examples.
+# Packages below are left out: none is needed for the LCL and the notes example. univint and
+# cocoaint stay: CodeTools needs univint to resolve the Cocoa types the examples use.
 /rtl/java/
 /rtl/embedded/
 /rtl/android/
@@ -57,6 +59,19 @@
 /packages/gtk2/
 /packages/rtl-unicode/src/collations/
 /packages/winunits-base/
+/packages/rtl-unicode/
+/packages/fcl-report/
+/packages/ptc/
+/packages/graph/
+/packages/amunits/
+/packages/winceunits/
+/packages/palmunits/
+/packages/os4units/
+/packages/morphunits/
+/packages/oracle/
+/packages/gtk1/
+/packages/fv/
+/packages/pastojs/
 docs/
 examples/
 tests/

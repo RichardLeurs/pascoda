@@ -1,5 +1,6 @@
 //! Minimal Pascal syntax highlighting. To be replaced by tree-sitter-pascal.
 
+use crate::prefs;
 use crate::style::Palette;
 use eframe::egui::{Color32, FontId, TextFormat, text::LayoutJob};
 
@@ -60,7 +61,7 @@ const KEYWORDS: &[&str] = &[
 ];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Kind {
+pub enum Kind {
     Plain,
     Keyword,
     String,
@@ -71,7 +72,30 @@ enum Kind {
     Call,
 }
 
+/// The token kinds the Preferences window sets colours for, with their labels. The order is the
+/// order of `prefs::TOKEN_KEYS`.
+pub const TOKENS: [(Kind, &str); prefs::TOKEN_COUNT] = [
+    (Kind::Plain, "Text"),
+    (Kind::Keyword, "Keywords"),
+    (Kind::String, "Strings"),
+    (Kind::Comment, "Comments"),
+    (Kind::Number, "Numbers"),
+    (Kind::UserType, "User types"),
+    (Kind::BuiltinType, "Built-in types"),
+    (Kind::Call, "Calls"),
+];
+
+/// The colour of a token: the user's choice for this appearance, else the palette's.
 fn color(kind: Kind, pal: &Palette) -> Color32 {
+    let slot = TOKENS.iter().position(|(k, _)| *k == kind).unwrap_or(0);
+    match prefs::code_color(pal.dark, slot) {
+        Some([r, g, b]) => Color32::from_rgb(r, g, b),
+        None => default_color(kind, pal),
+    }
+}
+
+/// The palette's colour of a token, before any user choice.
+pub fn default_color(kind: Kind, pal: &Palette) -> Color32 {
     match kind {
         Kind::Plain => pal.code_text,
         Kind::Keyword => pal.keyword,
@@ -204,6 +228,19 @@ pub fn layout(text: &str, pal: &Palette, font: FontId, line_height: f32) -> Layo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_token_colour_from_the_preferences_replaces_the_palette_colour_for_its_appearance() {
+        let _guard = prefs::tests::APPLY.write().unwrap_or_else(|e| e.into_inner());
+        let mut p = prefs::Prefs::default();
+        p.set_color(false, 1, Some([1, 2, 3]));
+        p.apply();
+        assert_eq!(color(Kind::Keyword, &Palette::LIGHT), Color32::from_rgb(1, 2, 3));
+        assert_eq!(color(Kind::Keyword, &Palette::DARK), Palette::DARK.keyword, "the dark colour is not overridden");
+        assert_eq!(color(Kind::String, &Palette::LIGHT), Palette::LIGHT.string);
+        prefs::Prefs::default().apply();
+        assert_eq!(color(Kind::Keyword, &Palette::LIGHT), Palette::LIGHT.keyword);
+    }
 
     fn kinds(src: &str) -> Vec<(Kind, &str)> {
         tokenize(src)
