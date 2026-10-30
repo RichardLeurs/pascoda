@@ -258,17 +258,10 @@ fn the_vlc_demo_builds_with_the_package_and_starts_its_window() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The database components are on the designer's built-in palette, on the Data Controls page, as
+/// non-visual components with the unit a form must use and a Lazarus icon each.
 #[test]
-fn the_pascoda_data_package_offers_the_database_components_on_the_data_page() {
-    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../components/pascoda-data/PascodaData.lpk");
-    let package = pascoda_project::packages::read(&file).expect("the data package reads");
-    let folder = file.parent().unwrap();
-    let dirs = pascoda_project::packages::resolve_with(folder, &[]).unit_paths;
-    let found = crate::designer::imports::entries(std::slice::from_ref(&package), &dirs);
-    if found.is_empty() {
-        return; // the vendored FPC database sources are not checked out
-    }
-    let got: Vec<(&str, &str, &str, bool)> = found.iter().map(|e| (e.page, e.class, e.unit, e.nonvisual)).collect();
+fn the_palette_offers_the_database_components_on_the_data_controls_page() {
     for (class, unit) in [
         ("TSQLConnector", "sqldb"),
         ("TSQLTransaction", "sqldb"),
@@ -277,15 +270,15 @@ fn the_pascoda_data_package_offers_the_database_components_on_the_data_page() {
         ("TDataSource", "db"),
         ("TSQLite3Connection", "sqlite3conn"),
     ] {
-        let entry = got.iter().find(|(_, c, _, _)| *c == class).unwrap_or_else(|| panic!("{class} is offered: {got:?}"));
-        assert_eq!(entry.0, "Data Controls", "{class} is on the Data Controls page");
-        assert_eq!(entry.2, unit, "{class} is declared in {unit}, which a form must use");
-        assert!(entry.3, "{class} is non-visual (it derives from TComponent)");
+        let entry = crate::designer::PALETTE
+            .iter()
+            .find(|e| e.class == class)
+            .unwrap_or_else(|| panic!("{class} is on the palette"));
+        assert_eq!(entry.page, "Data Controls", "{class} is on the Data Controls page");
+        assert_eq!(entry.unit, unit, "{class} is declared in {unit}, which a form must use");
+        assert!(entry.nonvisual, "{class} is non-visual (it derives from TComponent)");
+        assert!(crate::designer::is_nonvisual(class), "{class} goes to the component tray");
     }
-    // Each data component has its Lazarus icon, by class name, in the package folder.
-    let icons = crate::designer::imports::icon_files(std::slice::from_ref(&package), &found);
-    let for_query = icons.iter().find(|(c, _)| c == "TSQLQuery").expect("the query has an icon");
-    assert!(for_query.1.ends_with("tsqlquery.png"), "{:?}", for_query.1);
 }
 
 #[test]
@@ -293,13 +286,9 @@ fn a_program_with_the_database_components_builds_and_runs() {
     let dir = std::env::temp_dir().join(format!("pascoda-data-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let pkg = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../components/pascoda-data");
-    for f in ["RegPascodaData.pas", "PascodaData.lpk"] {
-        std::fs::copy(pkg.join(f), dir.join(f)).unwrap();
-    }
     std::fs::write(
         dir.join("DataCheck.lpr"),
-        "program DataCheck;\n\n{$mode objfpc}{$H+}\n\nuses\n  Classes, SysUtils, db, sqldb, sqlite3conn, RegPascodaData;\n\nvar\n  Conn: TSQLConnector;\n  Trans: TSQLTransaction;\n  Query: TSQLQuery;\n  Source: TDataSource;\n  Lite: TSQLite3Connection;\nbegin\n  Conn := TSQLConnector.Create(nil);\n  Trans := TSQLTransaction.Create(nil);\n  Query := TSQLQuery.Create(nil);\n  Source := TDataSource.Create(nil);\n  Lite := TSQLite3Connection.Create(nil);\n  Query.DataBase := Conn;\n  Source.DataSet := Query;\n  WriteLn('OK');\nend.\n",
+        "program DataCheck;\n\n{$mode objfpc}{$H+}\n\nuses\n  Classes, SysUtils, db, sqldb, sqlite3conn;\n\nvar\n  Conn: TSQLConnector;\n  Trans: TSQLTransaction;\n  Query: TSQLQuery;\n  Source: TDataSource;\n  Lite: TSQLite3Connection;\nbegin\n  Conn := TSQLConnector.Create(nil);\n  Trans := TSQLTransaction.Create(nil);\n  Query := TSQLQuery.Create(nil);\n  Source := TDataSource.Create(nil);\n  Lite := TSQLite3Connection.Create(nil);\n  Query.DataBase := Conn;\n  Source.DataSet := Query;\n  WriteLn('OK');\nend.\n",
     )
     .unwrap();
     let out = build_and_run(&dir, "DataCheck");
@@ -312,11 +301,6 @@ fn the_db_demo_builds_and_its_query_finds_the_ideas() {
     let dir = std::env::temp_dir().join(format!("pascoda-db-demo-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     copy(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/db-demo"), &dir);
-    // The data package is imported: its units join the project, as they do for the user.
-    let pkg = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../components/pascoda-data");
-    for f in ["RegPascodaData.pas", "PascodaData.lpk"] {
-        std::fs::copy(pkg.join(f), dir.join(f)).unwrap();
-    }
     let built = gui_build(&dir, "DbDemo");
     assert!(built.success, "the demo does not build:\n{}", built.raw_output);
     // The self-test prints the status line and the row count, then exits. A window that waits (an

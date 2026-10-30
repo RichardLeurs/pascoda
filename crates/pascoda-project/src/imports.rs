@@ -12,10 +12,11 @@ pub fn default_store() -> Option<PathBuf> {
     Some(PathBuf::from(home).join("Library/Application Support/Pascoda/packages"))
 }
 
-/// The Pascoda components that ship with the app (`components/pascoda-vlc`): their package files,
-/// found next to the app or in the checkout (see `pascoda_fpc::lcl::search_dirs`).
+/// The component packages that ship with the app (`components/pascoda-vlc`): their package files,
+/// found next to the app or in the checkout (see `pascoda_fpc::lcl::search_dirs`). The database
+/// components are not a package: they are on the designer's built-in palette.
 pub fn shipped_packages(start: &Path) -> Vec<PathBuf> {
-    const SHIPPED: &[&str] = &["components/pascoda-vlc/PascodaVlc.lpk", "components/pascoda-data/PascodaData.lpk"];
+    const SHIPPED: &[&str] = &["components/pascoda-vlc/PascodaVlc.lpk"];
     let dirs = pascoda_fpc::lcl::search_dirs(start);
     SHIPPED
         .iter()
@@ -136,8 +137,8 @@ mod tests {
         // A development build finds the checkout's components (see `search_dirs`).
         let shipped = builtin();
         assert!(!shipped.is_empty(), "the checkout's packages are found from a test build");
-        assert!(shipped.iter().any(|p| p.ends_with("components/pascoda-data/PascodaData.lpk")), "{shipped:?}");
         assert!(shipped.iter().any(|p| p.ends_with("components/pascoda-vlc/PascodaVlc.lpk")), "{shipped:?}");
+        assert!(!shipped.iter().any(|p| p.to_string_lossy().contains("pascoda-data")), "the data components are built in: {shipped:?}");
         assert!(list().iter().all(|p| shipped.contains(p) || p.is_file()), "the list is the built-in packages and the imported ones");
     }
 

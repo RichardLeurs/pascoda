@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 /// One tool the IDE looks for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Part {
-    /// The Free Pascal compiler, which is not bundled.
+    /// The Free Pascal compiler: shipped in the app (`bundled`), else one installed on the Mac.
     Fpc,
     /// The Lazarus sources: the LCL (GUI programs) and CodeTools (the language server).
     Lazarus,

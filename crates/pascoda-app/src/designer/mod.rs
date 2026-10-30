@@ -111,6 +111,14 @@ pub const PALETTE: &[Entry] = &[
     e("Data Controls", "TDBCheckBox", "Caption", "DBCtrls"),
     e("Data Controls", "TDBRadioGroup", "Caption", "DBCtrls"),
     e("Data Controls", "TDBGrid", "", "DBGrids"),
+    // The SQLdb components come from FPC's fcl-db, not the LCL. A project that uses them gets the
+    // fcl-db folders on its build path (`packages::needed_vendored`).
+    nv("Data Controls", "TSQLConnector", "sqldb"),
+    nv("Data Controls", "TSQLTransaction", "sqldb"),
+    nv("Data Controls", "TSQLQuery", "sqldb"),
+    nv("Data Controls", "TSQLScript", "sqldb"),
+    nv("Data Controls", "TDataSource", "db"),
+    nv("Data Controls", "TSQLite3Connection", "sqlite3conn"),
 ];
 
 /// Components from imported packages (see `imports`), after the built-in pages. Set when the imports
@@ -3776,6 +3784,28 @@ mod database_form_tests {
         )
         .unwrap();
         dir
+    }
+
+    /// The SQLdb components are on the palette itself: placed from it they go to the component tray (not
+    /// the canvas), and the form's unit uses the units that declare them.
+    #[test]
+    fn placing_the_data_components_from_the_palette_uses_their_units() {
+        let dir = database_form("database-palette");
+        let mut d = Designer::open(&dir.join("unit1.pas")).unwrap();
+        for class in ["TSQLQuery", "TDataSource", "TSQLTransaction"] {
+            d.add_component(class, &[], 0, 0).unwrap();
+        }
+        // The connector was already on the form (its driver unit is `sqlite3conn`).
+        assert_eq!(d.tray().len(), 4, "all four are tray components, none is on the canvas");
+        assert!(d.specs().is_empty(), "no canvas control: {:?}", d.specs());
+        let mut unit = std::fs::read_to_string(dir.join("unit1.pas")).unwrap();
+        d.sync_unit(&mut unit);
+        assert_eq!(d.sync_error, None);
+        let uses = unit.split("interface").nth(1).unwrap().split("type").next().unwrap().to_ascii_lowercase();
+        for needed in ["sqldb", "db", "sqlite3conn"] {
+            assert!(uses.split([',', ';', ' ', '\n']).any(|u| u == needed), "`{needed}` is used: {uses}");
+        }
+        assert!(unit.contains("SQLQuery1: TSQLQuery;") && unit.contains("DataSource1: TDataSource;"), "{unit}");
     }
 
     #[test]

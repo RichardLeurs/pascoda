@@ -366,7 +366,7 @@ mod vendored_tests {
 
     #[test]
     fn the_fcl_db_folders_are_on_the_path_for_a_package_that_requires_fcl_db() {
-        let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../components/pascoda-data");
+        let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../components/pascoda-vlc");
         let dirs = vendored(&project, "fcl-db");
         if dirs.is_empty() {
             return; // the vendored FPC sources are not checked out

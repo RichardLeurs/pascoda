@@ -7,6 +7,12 @@ use eframe::egui;
 const ICONS: &[(&str, &[u8])] = &[
     ("tbutton", include_bytes!("../assets/components/tbutton.png")),
     ("tdbgrid", include_bytes!("../assets/components/tdbgrid.png")),
+    ("tsqlconnector", include_bytes!("../assets/components/tsqlconnector.png")),
+    ("tsqltransaction", include_bytes!("../assets/components/tsqltransaction.png")),
+    ("tsqlquery", include_bytes!("../assets/components/tsqlquery.png")),
+    ("tsqlscript", include_bytes!("../assets/components/tsqlscript.png")),
+    ("tdatasource", include_bytes!("../assets/components/tdatasource.png")),
+    ("tsqlite3connection", include_bytes!("../assets/components/tsqlite3connection.png")),
     ("tdbnavigator", include_bytes!("../assets/components/tdbnavigator.png")),
     ("tdbedit", include_bytes!("../assets/components/tdbedit.png")),
     ("tdbtext", include_bytes!("../assets/components/tdbtext.png")),

@@ -79,19 +79,22 @@ fn clang_rt_in(root: &Path) -> Option<PathBuf> {
     versions.pop()
 }
 
-/// The developer tools' SDK, linker folder and clang runtime.
-pub fn tools() -> Tools {
-    let Some(dev) = developer_dir() else {
-        return Tools::default();
-    };
+/// The SDK, linker folder and clang runtime inside one developer folder (`/Library/Developer/CommandLineTools`
+/// or Xcode's `Contents/Developer`).
+fn tools_in(dev: &Path) -> Tools {
     let sdk = [
         dev.join("SDKs/MacOSX.sdk"),
         dev.join("Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"),
     ]
     .into_iter()
     .find(|p| p.is_dir());
-    let bin = Some(dev.join("usr/bin")).filter(|b| b.join("ld").exists());
-    // The Command Line Tools keep it under usr/lib/clang, Xcode inside its default toolchain.
+    // Xcode keeps its linker in the default toolchain; the Command Line Tools in usr/bin.
+    let bin = [
+        dev.join("Toolchains/XcodeDefault.xctoolchain/usr/bin"),
+        dev.join("usr/bin"),
+    ]
+    .into_iter()
+    .find(|b| b.join("ld").exists());
     let clang_rt = [
         dev.join("usr/lib/clang"),
         dev.join("Toolchains/XcodeDefault.xctoolchain/usr/lib/clang"),
@@ -99,6 +102,22 @@ pub fn tools() -> Tools {
     .iter()
     .find_map(|r| clang_rt_in(r));
     Tools { sdk, bin, clang_rt }
+}
+
+/// The developer tools the linker uses. The Command Line Tools come first when they are installed:
+/// their `ld` honours `-ld_classic`, which the LCL build needs (fpc 3.2.2's Objective-C method lists
+/// are rejected by the current linker), and the Xcode linker that `xcode-select` may point at does not.
+/// Without them, Xcode's tools are used.
+pub fn tools() -> Tools {
+    let mut devs = vec![PathBuf::from("/Library/Developer/CommandLineTools")];
+    devs.extend(developer_dir());
+    let found: Vec<Tools> = devs.iter().filter(|d| d.is_dir()).map(|d| tools_in(d)).collect();
+    found
+        .iter()
+        .find(|t| t.sdk.is_some() && t.bin.is_some())
+        .or_else(|| found.iter().find(|t| t.sdk.is_some()))
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// The text of `fpc.cfg` for the compiler in `prefix`: the unit folders of the bundle, and the macOS SDK
@@ -117,6 +136,9 @@ pub fn config_text(prefix: &Path, version: &str, tools: &Tools) -> String {
     t.push_str(&format!("-Fu{}/$fpctarget/*\n", units.display()));
     t.push_str(&format!("-Fu{}/$fpctarget/rtl\n", units.display()));
     if let Some(sdk) = &tools.sdk {
+        // The SDK is also given to the linker as its root: the `ld` of Xcode, unlike the Command Line
+        // Tools' one, does not find the frameworks (CoreFoundation, Cocoa) by itself.
+        t.push_str(&format!("-XR{}\n", sdk.display()));
         t.push_str(&format!("-Fl{}/usr/lib\n", sdk.display()));
     }
     if let Some(rt) = &tools.clang_rt {
@@ -205,6 +227,7 @@ mod tests {
         );
         assert!(text.contains("-Fu/Apps/Pascoda.app/Contents/Resources/vendor/fpc/lib/fpc/3.2.2/units/$fpctarget/*\n"));
         assert!(text.contains("units/$fpctarget/rtl\n"));
+        assert!(text.contains("-XR/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk\n"), "the linker's SDK root");
         assert!(text.contains("-Fl/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib\n"));
         assert!(text.contains("-Fl/Library/Developer/CommandLineTools/usr/lib/clang/17/lib/darwin\n"), "Cocoa units link libclang_rt");
         assert!(text.contains("-FD/Library/Developer/CommandLineTools/usr/bin\n"));

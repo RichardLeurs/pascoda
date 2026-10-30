@@ -2,6 +2,8 @@
 
 A modern Pascal IDE with coding agents for macOS.
 
+![Pascoda: the code editor, the AI assistant pane with a local Ollama model, and the terminal](pascoda.png)
+
 A modern IDE for Pascal (macOS ARM for now), written in Rust. It wraps the Free Pascal compiler and aims at apps with a macOS-native look and feel.
 
 Supports coding agents (OpenAI API and compatible, OpenAI Codex CLI, Claude Console API, Claude Code CLI for now). 
@@ -14,14 +16,24 @@ Connect local LLM-models using oMLX and Ollama. OpenAI Codex CLI and Claude Code
 | Area | Status | Notes |
 |---|---|---|
 | Debugger | working | lldb through `lldb-dap`: breakpoints, step, call stack, variables; Pascal sets are not shown |
-| Code completion | working | `pasls`: Ctrl+Space and as-you-type completion, hover, F12 and Cmd-click go-to-definition; packages are not on its search path yet |
+| Code completion | working | `pasls`: Ctrl+Space and as-you-type completion, hover, F12 and Cmd-click go-to-definition, parameter hints, outline, find references and rename; the project's required packages are on its search path (a changed project file needs a restart) |
 | Build and run | working | console and GUI programs, progress bar, Problems pane, export to `.app` and `.dmg` |
-| Project files | partly | `.lpi` and `.dproj` give the main program, search paths, defines, target and switches; `.dfm` opens in the designer; `.lpk` and `.dpk` are not read yet |
+| Project files | working | `.lpi` and `.dproj` give the main program, search paths, defines, target and switches; `.lpk` and `.dpk` packages are read and their folders join the builds; `.dfm` opens in the designer; Project Options edits mode, defines, paths, run arguments and Debug or Release |
 | Form designer | working | native controls, palette, menus, action lists, anchors; the project's own components appear on a "Project" palette page |
-| File tree | partly | new file, new folder, rename, delete to the Trash; move is not done |
+| File tree | working | new file, new folder, rename, move by drag and drop, delete to the Trash |
 | Terminal | working | a real login shell in the bottom pane |
-| AI assistant | working | OpenAI-compatible and Anthropic Claude providers, local LLMs |
-| Packaging | partly | `Pascoda.app` and `Pascoda.dmg` build; the notarization path has not been run 
+| AI assistant | working | Claude Console API, Claude Code CLI, OpenAI API, Codex CLI, and OpenAI-compatible servers (oMLX, Ollama, Open WebUI, any other); keys in the Keychain |
+| Packaging | partly | `Pascoda.app` and `Pascoda.dmg` build and ship the language server, the LCL and the FPC sources; the notarization path has not been run |
+
+### Spec progress
+
+`docs/specs.md` is the checklist of what the IDE should do: 53 of its 77 items are done and tested (an item is ticked only when the code does what it says and a test covers it). Most of the open ones are small or later work:
+
+- **Medium (P2):** frames (`TFrame`) in the designer is partly done; property editors for fonts, colours and collections; code formatting (`pasls` format or Jcf); trying a real Lazarus project; in-memory and file datasets (TBufDataset, TMemDataset, TDbf) with data-aware controls.
+- **Later (P3):** bookmarks, snippets, keyboard shortcut customisation, threads, disassembly and memory views, a Tools menu, F1 help lookup, profiling, project groups, designer zoom, localisation of forms.
+- **Much later (P4):** code folding, Git in the IDE, a notarized release, iOS and iPadOS, trying a real Delphi project, an IDE plugin system, a Universal (Intel) export.
+
+Done recently: Find and replace, rename symbol, the Tests pane (FPCUnit), watches, conditional breakpoints, Project Options, Debug and Release builds, inherited forms, data modules, the OpenAI-compatible providers, the missing-tools window that installs the language server, the LCL or the FPC sources from the Terminal, and Free Pascal itself, which now ships inside the app.
 
 ## Requirements
 
@@ -30,7 +42,7 @@ You need an Apple Silicon Mac with macOS 14 Sonoma or later (generated apps targ
 | Tool | Used for | Notes |
 |---|---|---|
 | Rust (stable, tested with 1.98) | building the IDE | edition 2024 features are used |
-| Free Pascal 3.2.2 (`fpc`) | compiling Pascal | `brew install fpc`; expected at `/opt/homebrew/bin/fpc` |
+| Free Pascal 3.2.2 (`fpc`) | compiling Pascal | shipped in `Pascoda.app`; to run from a checkout, `brew install fpc` then `packaging/fpc-bundle.sh vendor/fpc` (an `fpc` on the `PATH` is used when there is no `vendor/fpc`; `PASCODA_FPC` overrides both) |
 | Xcode (Command Line Tools at minimum) | linker, `codesign`, `lldb-dap` | the debugger adapter `lldb-dap` ships only inside Xcode |
 
 ### Vendored sources (in `vendor/`, not committed)
@@ -58,11 +70,11 @@ IDE still works; completion is simply off. Without `vendor/lazarus`, GUI program
 built.
 
 The built app does not need this step: `packaging/bundle.sh` ships the needed parts of `vendor/`
-inside `Pascoda.app` (about 170 MB). A copy that lacks them (a checkout without `vendor/`, a damaged
+inside `Pascoda.app` (about 300 MB, 134 MB of it the Free Pascal compiler and its units). A copy that lacks them (a checkout without `vendor/`, a damaged
 app) opens a "Some tools are missing" window when a feature needs one: its **Install in Terminal**
 button types a pinned install command at the Terminal's prompt, and you press Enter to run it. The
 tools go to `~/Library/Application Support/Pascoda/vendor`, which the IDE searches too; restart
-Pascoda afterwards. Free Pascal itself is not bundled (`brew install fpc`).
+Pascoda afterwards. The app ships Free Pascal itself too (`vendor/fpc`: the compiler as `bin/fpc`, the unit packages, the licences and a source offer in `licenses/`); `packaging/fpc-bundle.sh vendor/fpc` makes the same copy from an installed `fpc` for a checkout. Only the Command Line Tools (linker and macOS SDK) must be installed on the Mac.
 
 ## Build and run
 
@@ -85,8 +97,10 @@ packaging/make-dmg.sh [output-dir]   # runs bundle.sh, then builds Pascoda.dmg (
 Builds `Pascoda.app` (release build, `packaging/Pascoda.icns`, `Info.plist` with version,
 copyright and minimum macOS taken from the sources) and signs it ad hoc, which runs on this Mac only.
 The bundle carries the toolchain sources it needs (`Contents/Resources/vendor`: the LCL, CodeTools,
-FPC sources and the `pasls` binary, about 160 MB), so it does not depend on this checkout. Free Pascal
-itself (`/opt/homebrew/bin/fpc`) and Xcode's `lldb-dap` must be installed on the Mac.
+FPC sources, the `pasls` binary and the Free Pascal compiler with its units, about 300 MB), so it does not
+depend on this checkout. `packaging/bundle.sh` copies the compiler from the `fpc` installed on the build Mac
+(`packaging/fpc-bundle.sh`). The Mac that runs the app needs the Command Line Tools (the linker and the macOS
+SDK) and Xcode's `lldb-dap` for debugging.
 `packaging/make-icon.sh` regenerates the icons (`make-icon.swift`, no dependencies): `Pascoda.icns` is
 the P whose counter is a run triangle (used by the bundle), `Pascoda-classic.icns` is the plain P.
 
@@ -155,8 +169,8 @@ Demo projects in `examples/` (open the main file and use Build & Run; the Tests 
 
 **Build, run and test**
 - Console and GUI programs (the LCL, Cocoa widgetset). GUI programs are packaged as a `.app`, and Build > Export makes a `.app` or `.dmg`. Demos are in `examples/`.
-- Component packages: the Pascoda VLC and Pascoda Data packages are always available. File > Import Component Package... adds any other Lazarus `.lpk`. The Data package puts the database components (SQLdb and SQLite connections, queries, data sources) on a Data page, built from the vendored FPC database sources. Its components appear on palette pages named by the package. VLC: a video and audio player on the VLC library installed in `/Applications/VLC.app`, with a video panel in the form.
-- Unit tests (FPCUnit): Cmd+U runs the project's test units. The **Tests** pane lists each result and its failure message. You can run one test, the failed ones or all of them, and "Go to test" opens the test's method. Runner is generated in `lib/tests/`.
+- Component packages: the Pascoda VLC package is always available. File > Import Component Package... adds any other Lazarus `.lpk`; its components appear on palette pages named by the package. VLC: a video and audio player on the VLC library installed in `/Applications/VLC.app`, with a video panel in the form. The database components (SQLdb and SQLite connections, queries, scripts, data sources) are not a package: they are on the designer's own palette, built from the FPC database sources that ship with the compiler.
+- Unit tests (FPCUnit): Cmd+U runs the project's test units. The **Tests** pane lists each result and its failure message. You can run one test, the failed ones or all of them, and clicking a test opens its method in the editor. Runner is generated in `lib/tests/`.
 - Bottom pane tabs: Problems, Output, Debug, Tests and Terminal. It switches to Output when a build or run starts, to Problems when a build fails, and to Debug at a breakpoint. It leaves your choice alone for a few seconds after you click a tab.
 
 **Debugger** (through `lldb-dap`)
@@ -167,7 +181,7 @@ Demo projects in `examples/` (open the main file and use Build & Run; the Tests 
 - Cmd+C, Cmd+V and Cmd+K work as in Terminal, and Ctrl+C interrupts. Menu shortcuts keep working.
 
 **Form designer** (`File > New GUI Application`, then the `Form` toggle)
-- Native macOS controls. The palette has 43 Lazarus components on four pages, and a tray for non-visual ones (timers, dialogs, menus, action lists).
+- Native macOS controls. The palette has 61 Lazarus components on five pages (Standard, Additional, Common Controls, System, Data Controls), and a tray for non-visual ones (timers, dialogs, menus, action lists, and the SQLdb database components).
 - Select, move, resize and multi-select, with copy and paste, alignment guides, align and spacing commands, and tab order.
 - Database forms: TDBGrid (Data Controls page) and a SQLdb connection editor (Edit Connection... in the inspector for a TSQLConnector: SQLite3 or PostgreSQL, with the driver unit added to uses). The data components come with the app (no import needed).
 - Data modules (File > New Data Module): a window-less unit for non-visual components (timers, dialogs, menus, action lists), used by forms through their unit.

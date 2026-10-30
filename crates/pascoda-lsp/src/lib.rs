@@ -190,8 +190,17 @@ fn nth_line(text: &str, line: u32) -> &str {
 
 /// Compiler switches for the server's CodeTools: the default mode, plus the LCL's defines and
 /// search paths when the Lazarus tree is there, so GUI units resolve.
-fn fpc_options(lazarus: &Path, root: &Path) -> Vec<String> {
+fn fpc_options(fpc: &Path, lazarus: &Path, root: &Path) -> Vec<String> {
     let mut options = vec!["-Mobjfpc".to_string()];
+    // The compiler that ships with Pascoda has no `fpc.cfg` beside it for the server to find (it is
+    // written per location): hand it the generated one, as builds do.
+    if fpc.parent().and_then(Path::parent).is_some_and(pascoda_fpc::bundled::is_bundle) {
+        options.extend(
+            pascoda_fpc::config_args(fpc, root)
+                .into_iter()
+                .map(|a| a.to_string_lossy().into_owned()),
+        );
+    }
     if lazarus.join("lcl").is_dir() {
         options.extend(pascoda_fpc::lcl::pasls_options(lazarus));
     }
@@ -254,7 +263,7 @@ impl Client {
                 "rootUri": uri(root),
                 "workspaceFolders": [{"uri": uri(root), "name": "workspace"}],
                 "capabilities": {"textDocument": {"completion": {"completionItem": {"snippetSupport": false}}}},
-                "initializationOptions": {"fpcOptions": fpc_options(&config.lazarus_src, root)},
+                "initializationOptions": {"fpcOptions": fpc_options(&config.fpc, &config.lazarus_src, root)},
             }),
         )?;
         client.notify("initialized", json!({}))?;

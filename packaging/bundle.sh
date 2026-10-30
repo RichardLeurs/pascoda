@@ -42,6 +42,8 @@ check_vendor() { # <folder that holds the entries of $need> <what it is>
     done
 }
 check_vendor "$root/vendor" "vendor/"
+# The Free Pascal compiler and its units are copied from the installed one (see fpc-bundle.sh).
+command -v fpc >/dev/null 2>&1 || [ -x /opt/homebrew/bin/fpc ] || { echo "bundle.sh: Free Pascal is not installed (brew install fpc); it is copied into the app" >&2; exit 1; }
 
 (cd "$root" && cargo build --release -p pascoda-app)
 # The build directory is set in .cargo/config.toml, so ask cargo where it is.
@@ -55,7 +57,7 @@ cp "$bin" "$app/Contents/MacOS/pascoda-app"
 cp "$root/packaging/Pascoda.icns" "$app/Contents/Resources/Pascoda.icns"
 
 # Toolchain sources the app needs on a Mac without this checkout: the LCL (runs the forms),
-# CodeTools + FPC sources + the pasls binary (completion). Free Pascal itself is not bundled.
+# CodeTools + FPC sources + the pasls binary (completion), and the Free Pascal compiler with its units.
 res="$app/Contents/Resources/vendor"
 mkdir -p "$res/lazarus/components" "$res/pasls/dist/aarch64-darwin"
 lz="$root/vendor/lazarus"
@@ -71,6 +73,11 @@ cp "$root/vendor/pasls/COPYING" "$res/pasls/COPYING"
 # The revisions of what was copied, next to the Lazarus one above.
 git -C "$root/vendor/fpcsrc" describe --tags --always > "$res/fpcsrc/.pascoda-commit" 2>/dev/null || echo bundled > "$res/fpcsrc/.pascoda-commit"
 git -C "$root/vendor/pasls" rev-parse --short HEAD > "$res/pasls/.pascoda-commit" 2>/dev/null || echo bundled > "$res/pasls/.pascoda-commit"
+# The compiler that ships with the app (bin/fpc is the compiler itself, plus the unit packages and licences).
+"$root/packaging/fpc-bundle.sh" "$res/fpc"
+for n in fpc/bin/fpc fpc/.pascoda-fpc fpc/licenses/SOURCE.txt "fpc/lib/fpc/$(cat "$res/fpc/.pascoda-fpc")/units/aarch64-darwin/rtl"; do
+    [ -e "$res/$n" ] || { echo "bundle.sh: $n is missing from the bundle" >&2; exit 1; }
+done
 check_vendor "$res" "the bundle"
 
 # Components that ship with Pascoda (the VLC package; File > Import Component Package... offers it).

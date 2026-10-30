@@ -6,8 +6,8 @@ program DbDemo;
 // parameterised query and see them in a grid. The database is opened read-only in spirit: the demo
 // only reads it.
 //
-// Build & Run needs the Pascoda data package imported (File > Import Component Package... > Add
-// PascodaData): it provides the SQLdb components on the palette.
+// The SQLdb components are on the designer's palette (Data Controls page); no package is needed.
+// A project that uses them gets FPC's database units (fcl-db) on its build path by itself.
 
 uses
   Interfaces, Forms, unit1;

@@ -91,7 +91,7 @@ pub fn credits(fpc: Option<&str>) -> String {
     }
     s += "\nUsed by Pascoda and the programs it builds:\n";
     s += &format!(
-        "\u{2022} Free Pascal {}: the compiler (GPL; runtime library LGPL with linking exception)\n",
+        "\u{2022} Free Pascal {}: the compiler, included in the app with its source offer (GPL; runtime library LGPL with linking exception)\n",
         fpc.unwrap_or("(not found)")
     );
     s += "\u{2022} Lazarus Component Library, Cocoa widgetset: runs the forms you design, and Lazarus's component icons (modified LGPL, closed-source programs allowed)\n";
