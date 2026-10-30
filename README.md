@@ -49,11 +49,13 @@ You need an Apple Silicon Mac with macOS 14 Sonoma or later (generated apps targ
 
 | Folder | What | Source | Used for |
 |---|---|---|---|
+| `vendor/fpc` | the Free Pascal compiler (`bin/fpc`) and its precompiled units, with licences and a source offer | copied from an installed Free Pascal 3.2.2 by `packaging/fpc-bundle.sh` | compiling Pascal; wins over an `fpc` on the `PATH` |
 | `vendor/pasls` | Pascal language server | github.com/genericptr/pascal-language-server | completion, go-to-definition |
 | `vendor/lazarus` | Lazarus source tree (tested at commit `2dbcbed8`) | gitlab.com/freepascal.org/lazarus/lazarus | `pasls` CodeTools backend and the LCL for GUI apps |
-| `vendor/fpcsrc` | FPC 3.2.2 `rtl` and `packages` (tag `release_3_2_2`) | gitlab.com/freepascal.org/fpc/source | lets the language server read standard units |
+| `vendor/fpcsrc` | FPC 3.2.2 `rtl` and `packages` (tag `release_3_2_2`) | gitlab.com/freepascal.org/fpc/source | lets the language server read standard units, and the database and FPCUnit sources |
 
-Set them up from the project root:
+Set them up from the project root. Install Free Pascal first (`brew install fpc`), because `pasls` is built with it
+and `vendor/fpc` is copied from it:
 
 ```sh
 mkdir -p vendor && cd vendor
@@ -63,18 +65,23 @@ git clone --depth 1 --branch release_3_2_2 --filter=blob:none --sparse \
   https://gitlab.com/freepascal.org/fpc/source.git fpcsrc
 (cd fpcsrc && git sparse-checkout set rtl packages)
 (cd pasls/src && LAZARUSDIR="$PWD/../../lazarus" bash build_fpc.sh)
+cd .. && packaging/fpc-bundle.sh vendor/fpc     # after the clones: it takes the licence texts from them
 ```
 
 The language server binary ends up in `vendor/pasls/dist/aarch64-darwin/pasls`. Without it the
 IDE still works; completion is simply off. Without `vendor/lazarus`, GUI programs cannot be
-built.
+built. Without `vendor/fpc` the IDE uses the `fpc` on your `PATH` (or `PASCODA_FPC`), so a checkout also
+works with only `brew install fpc`; `vendor/fpc` makes it use the same compiler and units as the shipped app.
 
 The built app does not need this step: `packaging/bundle.sh` ships the needed parts of `vendor/`
-inside `Pascoda.app` (about 300 MB, 134 MB of it the Free Pascal compiler and its units). A copy that lacks them (a checkout without `vendor/`, a damaged
-app) opens a "Some tools are missing" window when a feature needs one: its **Install in Terminal**
-button types a pinned install command at the Terminal's prompt, and you press Enter to run it. The
-tools go to `~/Library/Application Support/Pascoda/vendor`, which the IDE searches too; restart
-Pascoda afterwards. The app ships Free Pascal itself too (`vendor/fpc`: the compiler as `bin/fpc`, the unit packages, the licences and a source offer in `licenses/`); `packaging/fpc-bundle.sh vendor/fpc` makes the same copy from an installed `fpc` for a checkout. Only the Command Line Tools (linker and macOS SDK) must be installed on the Mac.
+inside `Pascoda.app` (about 300 MB, 134 MB of it the Free Pascal compiler and its units, copied from the
+installed `fpc` by `packaging/fpc-bundle.sh`). Only the Command Line Tools (linker and macOS SDK) must be
+installed on the Mac.
+
+A copy that lacks them (a checkout without `vendor/`, a damaged app) opens a "Some tools are missing"
+window when a feature needs one. Its **Install in Terminal** button types a pinned install command at the
+Terminal's prompt, and you press Enter to run it. The tools go to
+`~/Library/Application Support/Pascoda/vendor`, which the IDE searches too; restart Pascoda afterwards.
 
 ## Build and run
 
